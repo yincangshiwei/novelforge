@@ -1,0 +1,351 @@
+/**
+ * RelationshipGraph — 交互式角色关系图谱 (v7 Obsidian 风格)
+ *
+ * 特性：SVG + React 渲染、拖拽/点击/缩放/筛选、Tier 分级布局、关系类型颜色编码
+ */
+import { useState, useRef, useMemo, useCallback } from 'react'
+import { ZoomIn, ZoomOut, Maximize2 } from 'lucide-react'
+import { useTranslation } from '../../hooks/useTranslation'
+import type { CharacterCard } from '../../stores/character-store'
+
+// ===== 类型 =====
+
+interface GraphNode {
+  name: string
+  role: string
+  tier: number
+  x: number
+  y: number
+}
+
+interface GraphEdge {
+  from: string
+  to: string
+  type: string
+  label: string
+}
+
+// 关系类型颜色 — 全部走主题 CSS 变量（AGENTS.md 约束：禁止硬编码颜色，四主题自适应）
+const RELATION_COLORS: Record<string, string> = {
+  ally: 'var(--color-success)',
+  enemy: 'var(--color-error)',
+  family: 'var(--color-warning)',
+  master_student: 'var(--color-info)',
+  lover: 'var(--color-accent)',
+  rival: 'var(--color-gold)',
+  neutral: 'var(--color-text-muted)',
+  other: 'var(--color-text-secondary)',
+}
+
+const ROLE_SIZES: Record<string, number> = {
+  protagonist: 28,
+  antagonist: 26,
+  supporting: 20,
+  minor: 16,
+}
+
+// ===== 关系解析 =====
+
+function parseRelations(characters: CharacterCard[]): GraphEdge[] {
+  const edges: GraphEdge[] = []
+  const allNames = new Set(characters.map(c => c.name))
+  // 边去重索引（P3 修复：此前 edges.some 线性扫描 O(E²)，大关系网卡顿）
+  const seenEdges = new Set<string>()
+
+  const pushEdge = (from: string, to: string, type: string, label: string) => {
+    const key = [from, to].sort().join('::')
+    if (seenEdges.has(key)) return
+    seenEdges.add(key)
+    edges.push({ from, to, type, label })
+  }
+
+  for (const char of characters) {
+    // 优先解析结构化 relations
+    try {
+      const rels = JSON.parse(char.relations || '[]') as Array<{
+        target: string; type: string; label: string
+      }>
+      for (const r of rels) {
+        if (r.target && allNames.has(r.target)) {
+          // 去重：避免双向关系重复绘制
+          pushEdge(char.name, r.target, r.type || 'other', r.label || '')
+        }
+      }
+      if (rels.length > 0) continue
+    } catch { /* fallback */ }
+
+    // 回退：解析旧版文本 relationships
+    if (!char.relationships) continue
+    try {
+      const parsed = JSON.parse(char.relationships)
+      if (Array.isArray(parsed)) {
+        for (const rel of parsed) {
+          const target = rel.name || rel.target
+          if (target && allNames.has(target)) {
+            pushEdge(char.name, target, rel.type || 'other', rel.relation || rel.label || '')
+          }
+        }
+        continue
+      }
+    } catch { /* text fallback */ }
+
+    const lines = char.relationships.split(/[,;，；\n]/).filter(Boolean)
+    for (const line of lines) {
+      const match = line.match(/(.+?)[：:—-]\s*(.+)/)
+      if (match && allNames.has(match[1].trim())) {
+        pushEdge(char.name, match[1].trim(), 'other', match[2].trim())
+      }
+    }
+  }
+  return edges
+}
+
+// ===== 布局引擎 =====
+
+function computeLayout(characters: CharacterCard[], width: number, height: number): GraphNode[] {
+  const cx = width / 2
+  const cy = height / 2
+
+  // Tier 1 居中，Tier 2 中层环，Tier 3 外层环
+  const tierConfig: Record<number, { radius: number }> = {
+    1: { radius: Math.min(width, height) * 0.12 },
+    2: { radius: Math.min(width, height) * 0.30 },
+    3: { radius: Math.min(width, height) * 0.44 },
+  }
+
+  const grouped: Record<number, CharacterCard[]> = { 1: [], 2: [], 3: [] }
+  for (const c of characters) {
+    // 非法 tier 值归一化到 1-3（此前 tier>=4 静默丢弃，图例/边仍引用，节点消失无日志）
+    const t = (c.tier >= 1 && c.tier <= 3) ? (c.tier || 2) : 2
+    if (c.tier !== undefined && (c.tier < 1 || c.tier > 3)) {
+      console.warn(`[RelationshipGraph] 角色「${c.name}」tier=${c.tier} 非法，已按 2 展示（数据未修正，保存时生效）`)
+    }
+    grouped[t]?.push(c)
+  }
+
+  const nodes: GraphNode[] = []
+  for (const tier of [1, 2, 3]) {
+    const chars = grouped[tier] || []
+    const r = tierConfig[tier].radius
+    chars.forEach((c, i) => {
+      const angle = (i / Math.max(chars.length, 1)) * Math.PI * 2 - Math.PI / 2
+      nodes.push({
+        name: c.name,
+        role: c.role,
+        tier: c.tier || 2,
+        x: cx + r * Math.cos(angle),
+        y: cy + r * Math.sin(angle),
+      })
+    })
+  }
+  return nodes
+}
+
+// ===== 组件 =====
+
+interface Props {
+  characters: CharacterCard[]
+  onSelect?: (name: string) => void
+}
+
+export default function RelationshipGraph({ characters, onSelect }: Props) {
+  const { t } = useTranslation()
+  const svgRef = useRef<SVGSVGElement>(null)
+  const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: 800, h: 600 })
+  const [dragging, setDragging] = useState<{ name: string; sx: number; sy: number } | null>(null)
+  const [tierFilter, setTierFilter] = useState<number | null>(null)
+  const edges = useMemo(() => parseRelations(characters), [characters])
+
+  // 基础布局（memo，避免 effect 中 setState）
+  const baseLayout = useMemo(
+    () => computeLayout(characters, viewBox.w, viewBox.h),
+    [characters, viewBox.w, viewBox.h]
+  )
+  // 可拖拽覆盖的节点位置
+  const [dragOffsets, setDragOffsets] = useState<Record<string, { dx: number; dy: number }>>({})
+  const visibleNodes = useMemo(() => {
+    const filtered = tierFilter ? baseLayout.filter(n => n.tier === tierFilter) : baseLayout
+    return filtered.map(n => {
+      const off = dragOffsets[n.name]
+      return off ? { ...n, x: n.x + off.dx, y: n.y + off.dy } : n
+    })
+  }, [baseLayout, tierFilter, dragOffsets])
+
+  const visibleEdges = useMemo(() => tierFilter
+    ? edges.filter(e => visibleNodes.some(n => n.name === e.from) && visibleNodes.some(n => n.name === e.to))
+    : edges, [edges, tierFilter, visibleNodes])
+
+  // 缩放
+  const zoom = (factor: number) => {
+    setViewBox(vb => {
+      const newW = Math.max(300, Math.min(2000, vb.w * factor))
+      const newH = Math.max(200, Math.min(1500, vb.h * factor))
+      return { ...vb, w: newW, h: newH }
+    })
+  }
+
+  // 重置视图
+  const resetView = () => {
+    setViewBox({ x: 0, y: 0, w: 800, h: 600 })
+    setDragOffsets({})
+  }
+
+  // 拖拽节点（#34 块 D：dragMovedRef 记录是否发生实际位移——拖拽后浏览器仍派发
+  // click，位移超过阈值则抑制随后的选中，防止"摆节点被踢回编辑页"）
+  const dragMovedRef = useRef(false)
+
+  const handleMouseDown = useCallback((name: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    dragMovedRef.current = false
+    setDragging({ name, sx: e.clientX, sy: e.clientY })
+  }, [])
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!dragging) return
+    const dx = (e.clientX - dragging.sx) * (viewBox.w / 800)
+    const dy = (e.clientY - dragging.sy) * (viewBox.h / 600)
+    if (dx !== 0 || dy !== 0) dragMovedRef.current = true
+    setDragOffsets(prev => ({
+      ...prev,
+      [dragging.name]: {
+        dx: (prev[dragging.name]?.dx || 0) + dx,
+        dy: (prev[dragging.name]?.dy || 0) + dy,
+      },
+    }))
+    setDragging({ ...dragging, sx: e.clientX, sy: e.clientY })
+  }, [dragging, viewBox])
+
+  if (characters.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-full text-xs text-[var(--color-text-muted)]">
+        {t('relationshipGraph.empty')}
+      </div>
+    )
+  }
+
+  return (
+    <div className="relative w-full h-full overflow-hidden" style={{ backgroundColor: 'var(--color-editor-bg)' }}>
+      {/* 工具栏 */}
+      <div className="absolute top-2 right-2 z-10 flex items-center gap-1">
+        {/* tier 筛选 */}
+        {([null, 1, 2, 3] as Array<number | null>).map(ti => (
+          <button
+            key={String(ti)}
+            className="text-micro px-1.5 py-0.5 rounded transition-colors border cursor-pointer"
+            style={{
+              backgroundColor: tierFilter === ti ? 'rgba(var(--color-accent-rgb),0.15)' : 'var(--color-bg-elevated)',
+              borderColor: tierFilter === ti ? 'var(--color-accent)' : 'var(--color-border)',
+              color: tierFilter === ti ? 'var(--color-accent)' : 'var(--color-text-muted)',
+            }}
+            onClick={() => setTierFilter(ti)}
+            type="button"
+          >
+            {ti === null ? t('graph.filterAll') : ti === 1 ? t('graph.tierCore') : ti === 2 ? t('graph.tierImportant') : t('graph.tierMinor')}
+          </button>
+        ))}
+        <div className="w-px h-4 mx-1" style={{ backgroundColor: 'var(--color-border)' }} />
+        {/* SVG viewBox 语义：viewBox 宽高增大 → 内容缩小；减小 → 内容放大。
+            因此「缩小」按钮增大 viewBox（factor>1），「放大」按钮减小 viewBox（factor<1）。
+            曾方向写反（0.8/1.25 对调），用户实测报告 #28 */}
+        <button
+          className="p-1 rounded hover:bg-[var(--color-hover)] text-[var(--color-text-muted)] cursor-pointer"
+          onClick={() => zoom(1.25)} title={t('zoom.out')} type="button"
+        >
+          <ZoomOut size={14} />
+        </button>
+        <button
+          className="p-1 rounded hover:bg-[var(--color-hover)] text-[var(--color-text-muted)] cursor-pointer"
+          onClick={() => zoom(0.8)} title={t('zoom.in')} type="button"
+        >
+          <ZoomIn size={14} />
+        </button>
+        <button
+          className="p-1 rounded hover:bg-[var(--color-hover)] text-[var(--color-text-muted)] cursor-pointer"
+          onClick={resetView} title={t('zoom.reset')} type="button"
+        >
+          <Maximize2 size={14} />
+        </button>
+      </div>
+
+      {/* 图例 */}
+      <div className="absolute bottom-2 left-2 z-10 flex items-center gap-2 text-2xs"
+        style={{ color: 'var(--color-text-muted)' }}>
+        {Object.entries(RELATION_COLORS).slice(0, 6).map(([k, v]) => (
+          <span key={k} className="flex items-center gap-0.5">
+            <span className="w-2 h-0.5 rounded" style={{ backgroundColor: v }} />
+            {k === 'ally' ? t('character.relType.ally') : k === 'enemy' ? t('character.relType.enemy') : k === 'family' ? t('character.relType.family') :
+             k === 'master_student' ? t('character.relType.masterStudent') : k === 'lover' ? t('character.relType.lover') : k === 'rival' ? t('character.relType.rival') : t('character.relType.other')}
+          </span>
+        ))}
+      </div>
+
+      {/* SVG 画布 */}
+      <svg
+        ref={svgRef}
+        viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`}
+        className="w-full h-full cursor-grab active:cursor-grabbing"
+        onMouseMove={handleMouseMove}
+        onMouseUp={() => setDragging(null)}
+        onMouseLeave={() => setDragging(null)}
+      >
+        {/* 连线 */}
+        {visibleEdges.map((edge, i) => {
+          const a = visibleNodes.find(n => n.name === edge.from)
+          const b = visibleNodes.find(n => n.name === edge.to)
+          if (!a || !b) return null
+          const mx = (a.x + b.x) / 2
+          const my = (a.y + b.y) / 2
+          return (
+            <g key={i}>
+              <line
+                x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                stroke={RELATION_COLORS[edge.type] || 'var(--color-text-muted)'}
+                strokeOpacity={0.4}
+                strokeWidth={1.5}
+              />
+              {edge.label && (
+                <text x={mx} y={my - 4} textAnchor="middle" fontSize={11}
+                  fill="var(--color-text-muted)" opacity={0.7}
+                >
+                  {edge.label}
+                </text>
+              )}
+            </g>
+          )
+        })}
+
+        {/* 节点 */}
+        {visibleNodes.map(node => {
+          const color = node.role === 'protagonist' ? 'var(--color-success)'
+            : node.role === 'antagonist' ? 'var(--color-error)'
+            : 'var(--color-accent)'
+          const r = ROLE_SIZES[node.role] || 18
+
+          return (
+            <g key={node.name} style={{ cursor: 'pointer' }}>
+              {/* 光晕 */}
+              <circle cx={node.x} cy={node.y} r={r + 8} fill={color} opacity={0.08} />
+              {/* 节点圆 */}
+              <circle
+                cx={node.x} cy={node.y} r={r}
+                fill={color} fillOpacity={0.2}
+                stroke={color} strokeWidth={2}
+                onMouseDown={(e) => handleMouseDown(node.name, e)}
+                onClick={() => { if (dragMovedRef.current) return; onSelect?.(node.name) }}
+              />
+              {/* 名字 */}
+              <text
+                x={node.x} y={node.y + r + 14}
+                textAnchor="middle" fontSize={12}
+                fill={color} fontWeight="bold"
+                style={{ pointerEvents: 'none', userSelect: 'none' }}
+              >
+                {node.name}
+              </text>
+            </g>
+          )
+        })}
+      </svg>
+    </div>
+  )
+}

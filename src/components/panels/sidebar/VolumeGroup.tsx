@@ -1,0 +1,368 @@
+/**
+ * VolumeGroup — 分卷管理组（工作台 / 项目结构共用）
+ *
+ * 标题行：分卷 + 数量 + 新建（+） + 自动划分（Layers）
+ * 卷列表：第N卷「标题」+ 章节范围 + 定稿进度徽标 + 编辑/删除 → 展开卷内章节
+ * 数据：useVolumeStore；卷内章节由调用方注入（工作台用 summary、项目结构用 draftsByChapter）
+ */
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  ChevronRight, ChevronDown, BookMarked, Plus, Pencil, Trash2, Layers,
+  CheckCircle2, Circle,
+} from 'lucide-react'
+import MenuRow from '../../ui/MenuRow'
+import CountBadge from '../../ui/CountBadge'
+import { useVolumeStore } from '../../../stores/volume-store'
+import { globalEventBus } from '../../../shared/event-bus'
+import type { VolumeData } from '../../../../electron/repositories/volume-repository'
+import type { VolumeSplitResult } from '../../../services/volume-utils'
+import VolumeDialog from '../../dialogs/VolumeDialog'
+import AutoSplitDialog from '../../dialogs/AutoSplitDialog'
+import SceneList from './SceneList'
+import { confirm } from '../../ui/Confirm'
+import { toast } from '../../ui/Toast'
+import { useTranslation } from '../../../hooks/useTranslation'
+
+/** 卷内章节统一格式（工作台 summary / 项目结构 drafts 转换后传入） */
+export interface VolumeChapter {
+  chapterNumber: number
+  chapterTitle?: string
+  hasFinalized: boolean
+}
+
+interface VolumeGroupProps {
+  /** 项目路径（分卷数据随项目切换重载） */
+  projectPath?: string
+  /** 注入卷内章节（调用方各自数据源） */
+  chaptersForVolume: (volume: VolumeData) => VolumeChapter[]
+  /** 点击卷内章节（打开草稿） */
+  onOpenDraft: (chapterNumber: number, chapterTitle?: string) => void
+  /** 每卷的已定稿章节数（进度徽标） */
+  finalizedCountForVolume: (volume: VolumeData) => number
+  /** 自动划分的章节总数（0 = 隐藏自动划分按钮） */
+  totalChapters?: number
+  /** 拖拽/键盘重排章节（章节号不变，只改卷成员与顺序） */
+  onReorderChapter?: (chapterNumber: number, toVolumeNumber: number, targetIndex?: number) => void
+}
+
+export default function VolumeGroup({
+  projectPath,
+  chaptersForVolume,
+  onOpenDraft,
+  finalizedCountForVolume,
+  totalChapters = 0,
+  onReorderChapter,
+}: VolumeGroupProps) {
+  const { t } = useTranslation()
+  const volumes = useVolumeStore(s => s.volumes)
+  const loadVolumes = useVolumeStore(s => s.load)
+  const removeVolume = useVolumeStore(s => s.remove)
+  const upsertVolume = useVolumeStore(s => s.upsert)
+  const [open, setOpen] = useState(false)
+  const [volumeDialog, setVolumeDialog] = useState<{ open: boolean; editing: VolumeData | null }>({ open: false, editing: null })
+  const [autoSplitOpen, setAutoSplitOpen] = useState(false)
+
+  // 卷号列表引用稳定（VolumeDialog effect 依赖，防父组件重渲染重置表单）
+  const volumeNumbers = useMemo(() => volumes.map(v => v.volumeNumber), [volumes])
+
+  // 项目切换 + 定稿/资源变化时加载分卷
+  useEffect(() => {
+    loadVolumes()
+  }, [projectPath, loadVolumes])
+  useEffect(() => {
+    const unsub = globalEventBus.on('REFRESH_RESOURCE', (payload: { resources: string[] }) => {
+      if (payload.resources.includes('all') || payload.resources.includes('drafts') || payload.resources.includes('characterCards')) {
+        loadVolumes()
+      }
+    })
+    return () => { unsub() }
+  }, [loadVolumes])
+
+  // 删除分卷（章节数据不受影响）
+  const handleDeleteVolume = useCallback(async (v: VolumeData) => {
+    const ok = await confirm(
+      t('volume.deleteConfirm').replace('{title}', v.title || t('volume.ordinal').replace('{n}', String(v.volumeNumber))),
+      { title: t('volume.title'), confirmText: t('action.delete'), danger: true },
+    )
+    if (ok) await removeVolume(v.volumeNumber)
+  }, [t, removeVolume])
+
+  // 应用自动划分：批量创建缺失卷号（已存在的跳过——upsert 是覆盖语义，不得覆盖手建卷）
+  const handleApplySplit = useCallback(async (splits: VolumeSplitResult[]) => {
+    const existing = new Set(useVolumeStore.getState().volumes.map(v => v.volumeNumber))
+    let created = 0
+    let skipped = 0
+    let failed = 0
+    for (const s of splits) {
+      if (existing.has(s.volumeNumber)) { skipped++; continue }
+      const ok = await upsertVolume({
+        volumeNumber: s.volumeNumber,
+        title: '',
+        description: '',
+        chapterStart: s.chapterStart,
+        chapterEnd: s.chapterEnd,
+      })
+      if (ok) created++
+      else failed++
+    }
+    toast.success(t('volume.splitDone').replace('{n}', String(created)).replace('{skip}', String(skipped)).replace('{fail}', String(failed)))
+  }, [upsertVolume, t])
+
+  return (
+    <section>
+      {/* 头部行片（2026-09-28 批 0）：折叠卡 = MenuRow 主按钮（功能图标悬停置换 ›/⌄、计数在内），
+          操作按钮（自动划分/新建卷）作兄弟；命中区固定 32×32（标准 §5.2） */}
+      <MenuRow
+        icon={<BookMarked size={12} />}
+        title={t('volume.title')}
+        count={<CountBadge value={volumes.length} unit={t('unit.volumes')} />}
+        swap="expand"
+        expanded={open}
+        onPrimary={() => setOpen(v => !v)}
+        actions={
+          <>
+            {totalChapters > 0 && (
+              <button
+                type="button"
+                onClick={() => setAutoSplitOpen(true)}
+                className="flex items-center justify-center rounded hover:bg-[var(--color-hover)] cursor-pointer flex-shrink-0"
+                style={{ width: 32, height: 32, color: 'var(--color-text-muted)' }}
+                title={t('volume.autoSplit')}
+              >
+                <Layers size={12} />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setVolumeDialog({ open: true, editing: null })}
+              className="flex items-center justify-center rounded hover:bg-[var(--color-hover)] cursor-pointer flex-shrink-0"
+              style={{ width: 32, height: 32, color: 'var(--color-text-muted)' }}
+              title={t('volume.newVolume')}
+            >
+              <Plus size={12} />
+            </button>
+          </>
+        }
+      />
+
+      {!open ? null : volumes.length === 0 ? (
+        <div className="text-micro py-1 pl-3 opacity-40" style={{ color: 'var(--color-text-muted)' }}>
+          {t('volume.empty')}
+        </div>
+      ) : (
+        <div>
+          {/* 行间距由片自带的 `margin: 2px 4px` 承担（spec 片间距 2px）——容器不得再加 space-y-*，
+              否则 utilities 层的 margin-top 会盖掉片的竖向 margin（实测间距被顶到 3.5px） */}
+          {volumes.map(v => (
+            <VolumeRow
+              key={v.volumeNumber}
+              volume={v}
+              chapters={chaptersForVolume(v)}
+              doneCount={finalizedCountForVolume(v)}
+              onEdit={() => setVolumeDialog({ open: true, editing: v })}
+              onDelete={() => handleDeleteVolume(v)}
+              onOpenDraft={onOpenDraft}
+              onReorderChapter={onReorderChapter}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* 分卷新建/编辑弹框 */}
+      <VolumeDialog
+        isOpen={volumeDialog.open}
+        onClose={() => setVolumeDialog({ open: false, editing: null })}
+        editing={volumeDialog.editing}
+        existingNumbers={volumeNumbers}
+      />
+
+      {/* 分卷自动划分弹框 */}
+      {totalChapters > 0 && (
+        <AutoSplitDialog
+          isOpen={autoSplitOpen}
+          onClose={() => setAutoSplitOpen(false)}
+          totalChapters={totalChapters}
+          existingNumbers={volumeNumbers}
+          onApply={handleApplySplit}
+        />
+      )}
+    </section>
+  )
+}
+
+// ===== 分卷行 =====
+
+function VolumeRow({
+  volume,
+  chapters,
+  doneCount,
+  onEdit,
+  onDelete,
+  onOpenDraft,
+  onReorderChapter,
+}: {
+  volume: VolumeData
+  chapters: VolumeChapter[]
+  doneCount: number
+  onEdit: () => void
+  onDelete: () => void
+  onOpenDraft: (chapterNumber: number, chapterTitle?: string) => void
+  onReorderChapter?: (chapterNumber: number, toVolumeNumber: number, targetIndex?: number) => void
+}) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  /** 章 → 场景层是否展开（第三层独立于卷折叠状态） */
+  const [openScenes, setOpenScenes] = useState<Record<number, boolean>>({})
+
+  // 进度徽标：卷有明确终点 → done/total；进行中（end=0）→ 仅显示已定稿数
+  const totalCount = volume.chapterEnd > 0
+    ? Math.max(0, volume.chapterEnd - volume.chapterStart + 1)
+    : 0
+  const progressText = totalCount > 0
+    ? t('volume.progress').replace('{done}', String(Math.min(doneCount, totalCount))).replace('{total}', String(totalCount))
+    : t('volume.progress').replace('{done}', String(doneCount)).replace('{total}', '…')
+  const rangeText = volume.chapterEnd === 0
+    ? t('volume.ongoing')
+    : t('volume.chapters').replace('{start}', String(volume.chapterStart)).replace('{end}', String(volume.chapterEnd))
+  const doneAll = totalCount > 0 && doneCount >= totalCount
+
+  return (
+    <div>
+      {/* 2026-09-25 重构：折叠点击此前在 `<div onClick>` 上 —— 键盘完全够不到，
+          而它内部**本来就含**编辑/删除按钮，外层直接换 `<button>` 会 button 嵌 button。
+          做法：折叠箭头 + 卷名 + 区间 + 进度包进主按钮，编辑/删除降为兄弟节点
+          （不再需要 stopPropagation，外层已无点击处理器）。
+          2026-09-28 批 0：卷行容器改「行片」（`.menu-chip`）——去掉卡片边框/底色，悬停底色由片承担。
+          外层 wrapper 无类名：`.menu-chip` 是 `display:flex`，卷内章节子列表必须留在片外
+          （否则会变成与主按钮并排的 flex 项），故用它把「片 + 章节列表」绑成一行。 */}
+      <div
+        className="menu-chip group flex items-center gap-1.5 select-none"
+        title={volume.description || undefined}
+        onDragOver={(e) => { if (onReorderChapter) e.preventDefault() }}
+        onDrop={(e) => {
+          if (!onReorderChapter) return
+          const raw = e.dataTransfer.getData('application/x-novelforge-chapter')
+          if (!raw) return
+          e.preventDefault()
+          onReorderChapter(Number(raw), volume.volumeNumber)
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => setOpen(v => !v)}
+          className="flex items-center gap-1.5 flex-1 min-w-0 h-full px-2 text-left enabled:cursor-pointer"
+        >
+          {open
+            ? <ChevronDown size={10} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+            : <ChevronRight size={10} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />}
+          <span className="text-xs font-medium truncate" style={{ color: 'var(--color-text)' }}>
+            {volume.title
+              ? t('volume.ordinalTitle').replace('{n}', String(volume.volumeNumber)).replace('{title}', volume.title)
+              : t('volume.ordinal').replace('{n}', String(volume.volumeNumber))}
+          </span>
+          <span className="ml-auto text-2xs opacity-50 flex-shrink-0">{rangeText}</span>
+          <CountBadge
+            value={doneCount}
+            total={totalCount > 0 ? totalCount : undefined}
+            progress={totalCount > 0}
+            tone={doneAll ? 'success' : 'muted'}
+            title={progressText}
+          />
+        </button>
+        <button
+          type="button"
+          className="flex items-center justify-center rounded hover:bg-[var(--color-hover)] cursor-pointer flex-shrink-0"
+          style={{ width: 32, height: 32, color: 'var(--color-text-muted)' }}
+          title={t('volume.editVolume')}
+          onClick={() => onEdit()}
+        >
+          <Pencil size={10} />
+        </button>
+        <button
+          type="button"
+          className="flex items-center justify-center rounded hover:bg-[var(--color-hover)] cursor-pointer flex-shrink-0"
+          style={{ width: 32, height: 32, color: 'var(--color-text-muted)' }}
+          title={t('action.delete')}
+          onClick={() => onDelete()}
+        >
+          <Trash2 size={10} />
+        </button>
+      </div>
+
+      {/* 卷内章节（有草稿的章） */}
+      {open && (
+        <div className="pl-6 pr-1.5 pb-1.5 space-y-0.5">
+          {/* pl-6（21px）：父卷行内容起于 11px，章节行缩进需拉出明确层级（去卡片后 pl-2 父子齐平） */}
+          {chapters.length === 0 ? (
+            <div className="text-micro py-1 pl-1.5 opacity-40" style={{ color: 'var(--color-text-muted)' }}>
+              {t('charList.emptyProject')}
+            </div>
+          ) : chapters.map(dc => {
+            const scenesOpen = !!openScenes[dc.chapterNumber]
+            return (
+              <div key={dc.chapterNumber}>
+                <div
+                  className="group flex items-center gap-0.5 rounded-lg transition-colors hover:bg-[var(--color-hover)]"
+                  draggable={!!onReorderChapter}
+                  onDragStart={(e) => {
+                    if (!onReorderChapter) return
+                    e.dataTransfer.setData('application/x-novelforge-chapter', String(dc.chapterNumber))
+                    e.dataTransfer.effectAllowed = 'move'
+                  }}
+                  onDragOver={(e) => { if (onReorderChapter) e.preventDefault() }}
+                  onDrop={(e) => {
+                    if (!onReorderChapter) return
+                    const raw = e.dataTransfer.getData('application/x-novelforge-chapter')
+                    if (!raw) return
+                    e.preventDefault()
+                    e.stopPropagation()
+                    const idx = chapters.findIndex(x => x.chapterNumber === dc.chapterNumber)
+                    onReorderChapter(Number(raw), volume.volumeNumber, idx + 1)
+                  }}
+                >
+                  {/* 场景层展开（第三层：卷 → 章 → 场景） */}
+                  <button
+                    type="button"
+                    onClick={() => setOpenScenes(prev => ({ ...prev, [dc.chapterNumber]: !prev[dc.chapterNumber] }))}
+                    className="flex items-center justify-center rounded cursor-pointer flex-shrink-0 hover:bg-[var(--color-hover)]"
+                    style={{ width: 20, height: 20, color: 'var(--color-text-muted)' }}
+                    aria-expanded={scenesOpen}
+                    aria-label={scenesOpen ? t('scene.collapse') : t('scene.expand')}
+                    title={scenesOpen ? t('scene.collapse') : t('scene.expand')}
+                  >
+                    {scenesOpen
+                      ? <ChevronDown size={9} />
+                      : <ChevronRight size={9} />}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onOpenDraft(dc.chapterNumber, dc.chapterTitle)}
+                    onKeyDown={(e) => {
+                      if (!onReorderChapter || !e.altKey) return
+                      const idx = chapters.findIndex(x => x.chapterNumber === dc.chapterNumber)
+                      if (e.key === 'ArrowUp') { e.preventDefault(); onReorderChapter(dc.chapterNumber, volume.volumeNumber, Math.max(0, idx - 1)) }
+                      if (e.key === 'ArrowDown') { e.preventDefault(); onReorderChapter(dc.chapterNumber, volume.volumeNumber, idx + 1) }
+                    }}
+                    className="flex-1 min-w-0 flex items-center gap-1.5 py-1 px-1 rounded-lg text-micro text-left cursor-pointer"
+                    style={{ color: 'var(--color-text-secondary)' }}
+                    title={t('action.openDraft')}
+                    aria-label={t('chapter.label').replace('{n}', String(dc.chapterNumber)) + (dc.chapterTitle ? ' ' + dc.chapterTitle : '')}
+                  >
+                    {dc.hasFinalized
+                      ? <CheckCircle2 size={10} style={{ color: 'var(--color-success)', flexShrink: 0 }} />
+                      : <Circle size={7} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />}
+                    <span className="truncate">
+                      {t('chapter.label').replace('{n}', String(dc.chapterNumber))}
+                      {dc.chapterTitle ? ` ${dc.chapterTitle}` : ''}
+                    </span>
+                  </button>
+                </div>
+                {scenesOpen && <SceneList chapterNumber={dc.chapterNumber} />}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,490 @@
+import { useState, useRef, useEffect, useCallback } from 'react'
+
+import { useTranslation } from '../../hooks/useTranslation'
+import type { TextKey } from '../../shared/locale'
+import { useProjectStore } from '../../stores/project-store'
+import { useEditorStore } from '../../stores/editor-store'
+import { useWorkflowStore } from '../../stores/workflow-store'
+import CodeMirrorEditor from './CodeMirrorEditor'
+import ThreeWayMerge from './ThreeWayMerge'
+import EditorToolbar from './EditorToolbar'
+import AIActionDialog, { getReviewDims } from './AIActionDialog'
+import { VELA } from '../../services/vela-protocol'
+import { useAutoSave } from '../../hooks/useAutoSave'
+import { useDirtyCheck } from '../../hooks/useDirtyCheck'
+import { toast } from '../ui/Toast'
+import { confirm } from '../ui/Confirm'
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from '../ui/Dialog'
+import {
+  parseDraftMeta,
+  type DraftMeta,
+  type DraftStatus,
+} from '../../services/workflows/chapter-workflow'
+import { getPendingRevisions, getReviewsForVersion, type RevisionEntry } from '../../services/draft-index'
+import { readDraftBody, useDraftStore } from '../../stores/draft-store'
+import { computeTextStats } from '../../services/text-stats'
+import { ipc } from '../../services/ipc-client'
+import { renderLog } from '../../services/render-logger'
+
+import { PostProcessStatusPanel } from '../ui/PostProcessStatusPanel'
+import { getChapterFinalizeScope } from '../../services/workflows/workflow-utils'
+import { guardRepairPostProcess } from '../../services/workflows/workflow-guards'
+
+interface Props {
+  filePath: string
+  content: string
+}
+
+/**
+ * 草稿编辑器 — 编排层
+ * — 子组件：EditorToolbar（工具栏）、AIActionDialog（AI 确认弹窗）
+ * — 正文：CodeMirrorEditor + ThreeWayMerge
+ */
+export default function DraftEditor({ filePath, content }: Props) {
+  const { t } = useTranslation()
+  const [meta, setMeta] = useState<(DraftMeta & { chapterTitle?: string; filePath?: string }) | null>(null)
+  const [pendingRevisions, setPendingRevisions] = useState<RevisionEntry[]>([])
+  const [reviewCount, setReviewCount] = useState(0)
+  const [mergeData, setMergeData] = useState<{
+    originalContent: string
+    modifiedContent: string
+    revisionPath: string
+  } | null>(null)
+  const [hasProcessFailure, setHasProcessFailure] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      const m = await parseDraftMeta(filePath)
+      if (cancelled || !m) return
+      const { ipc } = await import('../../services/ipc-client')
+      const bps = await ipc.invoke('db:blueprint-get-all')
+      if (cancelled) return
+      const bp = Array.isArray(bps) ? bps.find((b: unknown) => (b as { chapterNumber?: number }).chapterNumber === m.chapterNumber) : null
+      setMeta({ ...m, chapterTitle: bp ? (bp as { title?: string }).title : t('editor.unknownTitle'), filePath, fileName: `v${m.version}`, createdAt: m.updatedAt ?? m.createdAt })
+      const chapterDir = `${VELA.DRAFT}ch${m.chapterNumber}`
+      const pending = await getPendingRevisions(chapterDir, m.version)
+      if (!cancelled) setPendingRevisions(pending)
+      const reviews = await getReviewsForVersion(chapterDir, m.version)
+      if (!cancelled) setReviewCount(reviews.length)
+    }
+    load()
+    return () => { cancelled = true }
+  }, [filePath, t])
+
+  const cachedDrafts = useDraftStore(s => s.draftsByChapter)
+  const cachedMeta = meta ? cachedDrafts[meta.chapterNumber]?.find(d => d.id === meta.id) : undefined
+  useEffect(() => {
+    if (cachedMeta) setMeta(prev => prev ? { ...prev, status: cachedMeta.status } : prev)
+  }, [cachedMeta])
+
+  const status: DraftStatus = meta?.status ?? 'draft'
+  const isReadonly = !meta || meta.filePath !== filePath || status === 'finalized' || status === 'archived'
+
+  const activeRuns = useWorkflowStore(s => s.activeRuns)
+  const activeChapterRun = activeRuns.find(r =>
+    r.type === 'chapter_creation' && meta && (r.title.includes(`第${meta.chapterNumber}章`) || r.title.includes(`第 ${meta.chapterNumber} 章`))
+  )
+  const isChapterBusy = !!activeChapterRun
+
+  const [saving, setSaving] = useState(false)
+  const [returningToDraft, setReturningToDraft] = useState(false)
+  const returnPendingRef = useRef(false)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
+  const [confirmAction, setConfirmAction] = useState<'refine' | 'review' | null>(null)
+  const [userRefinePrompt, setUserRefinePrompt] = useState('')
+  const [reviewDims, setReviewDims] = useState<Record<string, boolean>>(
+    Object.fromEntries(getReviewDims(t).map(d => [d.key, true]))
+  )
+  const [charCount, setCharCount] = useState(0)
+  const isDirty = useDirtyCheck(filePath)
+  const currentBodyRef = useRef(content)
+  // 外部（Agent/同步）更新 content 时同步 ref；否则 30s 自动保存会把旧文本写回 DB
+  useEffect(() => { currentBodyRef.current = content }, [content])
+
+  const currentProject = useProjectStore(s => s.currentProject)
+
+  /**
+   * 保存（手动/自动共用）
+   * - 手动：toast 视觉反馈（成功/失败）+ info 日志
+   * - 自动（useAutoSave 30s）：仅 debug 日志（不 toast，避免高频打扰）
+   */
+  const doSave = useCallback(async (text: string, opts?: { manual?: boolean }) => {
+    if (isReadonly || isChapterBusy || saving || returnPendingRef.current) return
+    const manual = opts?.manual ?? false
+    if (!manual && !isDirty) return
+    const t0 = Date.now()
+    setSaving(true)
+    try {
+      if (filePath.startsWith(VELA.DRAFT) || filePath.startsWith(VELA.MANUSCRIPT)) {
+        const prefix = filePath.startsWith(VELA.DRAFT) ? VELA.DRAFT : VELA.MANUSCRIPT
+        const idRaw = filePath.replace(prefix, '')
+        // 非法 id（旧 ch{n} 格式 / 空）不写入 DB，避免 NaN 传入查询
+        if (/^\d+$/.test(idRaw) && Number.isSafeInteger(Number(idRaw)) && Number(idRaw) > 0) {
+          // wordCount 用统一"有效字数"口径（汉字 + 英文单词）
+          // ⚠️ L4 S5：写通道**返回 {success:false} 而不是抛错**（见 fs-controller / db-controller 的
+          //   try→return 形态）。不检查返回值就会在写失败后继续往下走 markTabSaved()——
+          //   用户看到「保存成功」而磁盘/DB 并未写入（静默丢稿）。此处显式抛错，交给既有的
+          //   catch 走 error toast + error 日志，并**跳过** markTabSaved。
+          const res = await ipc.invoke('db:draft-update-content', parseInt(idRaw, 10), text, computeTextStats(text).novelWordCount)
+          if (!res.success) throw new Error(res.error ?? t('status.unknown'))
+          // 通知侧栏/工作台刷新草稿数据（编辑器保存后草稿箱计数/状态陈旧的运行链闭环；
+          // 自动保存默认 30s 间隔，全量 loadAllDrafts 成本可接受）
+          const { globalEventBus } = await import('../../shared/event-bus')
+          globalEventBus.emit('REFRESH_RESOURCE', { resources: ['drafts'] })
+        } else {
+          throw new Error('无效的数据库草稿 ID')
+        }
+      } else {
+        const res = await ipc.invoke('fs:write-file', filePath, text)
+        if (!res.success) throw new Error(res.error ?? t('status.unknown'))
+      }
+      const tabs = useEditorStore.getState().tabs
+      const targetTab = tabs.find(t => t.type === 'chapter' && t.filePath === filePath)
+      if (targetTab && targetTab.content === text) {
+        useEditorStore.getState().markTabSaved(targetTab.id)
+        useEditorStore.getState().syncTabContent(targetTab.id, text)
+      }
+      // 保存行为日志流：手动 info（公测可见）/ 自动 debug（dev 可见）
+      renderLog(manual ? 'info' : 'debug', 'Save:Draft', t('log.render.draftSaveSuccess')
+        .replace('{mode}', () => manual ? t('log.render.modeManual') : t('log.render.modeAuto'))
+        .replace('{path}', () => filePath)
+        .replace('{ms}', String(Date.now() - t0)))
+      if (manual) toast.success(t('save.success'))
+    } catch (e) {
+      // 保存失败不再静默：toast 视觉反馈 + error 日志（含原因）
+      renderLog('error', 'Save:Draft', t('log.render.draftSaveFailed')
+        .replace('{path}', () => filePath)
+        .replace('{error}', () => String(e)))
+      toast.error(t('save.failed').replace('{error}', String(e)))
+    } finally {
+      setSaving(false)
+    }
+  }, [filePath, t, isReadonly, isChapterBusy, saving, isDirty])
+
+  // 自动保存定时器（通过 useAutoSave hook 复用）
+  useAutoSave(filePath, currentBodyRef, doSave)
+
+  /** AI 修稿 */
+  const doRefine = async () => {
+    if (!currentProject || !meta) return
+    try {
+      const { useWorkflowStore } = await import('../../stores/workflow-store')
+      const { createRefineOnlyWorkflow } = await import('../../services/workflows/chapter-workflow')
+      const body = await readDraftBody(filePath)
+      useWorkflowStore.getState().startWorkflow(createRefineOnlyWorkflow({
+        chapterNumber: meta.chapterNumber,
+        chapterTitle: meta.chapterTitle ?? t('editor.unknownTitle'),
+        draftPath: filePath,
+        draftContent: body,
+        userRefinePrompt: userRefinePrompt.trim() || undefined,
+      }), false)
+    } catch (e) {
+      toast.error(t('error.polishFailed').replace('{error}', String(e)))
+    }
+  }
+
+  /** AI 审稿 */
+  const doReview = async () => {
+    if (!currentProject || !meta) return
+    try {
+      const { useWorkflowStore } = await import('../../stores/workflow-store')
+      const { createReviewOnlyWorkflow } = await import('../../services/workflows/chapter-workflow')
+      const body = await readDraftBody(filePath)
+      useWorkflowStore.getState().startWorkflow(createReviewOnlyWorkflow({
+        chapterNumber: meta.chapterNumber,
+        chapterTitle: meta.chapterTitle ?? t('editor.unknownTitle'),
+        draftPath: filePath,
+        draftContent: body,
+        reviewFocus: getReviewDims(t).filter(d => reviewDims[d.key]).map(d => d.label).join('、') || undefined,
+      }), false)
+    } catch (e) {
+      toast.error(t('error.reviewFailed').replace('{error}', String(e)))
+    }
+  }
+
+  /** 定稿 */
+  const doFinalize = useCallback(async () => {
+    if (!meta || isChapterBusy) return
+    const ok = await confirm(
+      t('editor.confirmFinalizeMsg').replace('{n}', String(meta.chapterNumber)),
+      { title: t('dialog.confirmFinalize'), confirmText: t('dialog.confirmFinalize') }
+    )
+    if (!ok) return
+    try {
+      const { useWorkflowStore } = await import('../../stores/workflow-store')
+      const { createFinalizeWorkflow } = await import('../../services/workflows/chapter-workflow')
+      const body = await readDraftBody(filePath)
+      useWorkflowStore.getState().startWorkflow(createFinalizeWorkflow({
+        chapterNumber: meta.chapterNumber,
+        chapterTitle: meta.chapterTitle ?? t('editor.unknownTitle'),
+        draftPath: filePath,
+        draftContent: body,
+      }), false)
+    } catch (e) {
+      toast.error(t('error.finalizeFailed').replace('{error}', String(e)))
+    }
+  }, [meta, isChapterBusy, filePath, t])
+
+  const doReturnToDraft = useCallback(async () => {
+    if (!meta || status !== 'finalized' || saving || returnPendingRef.current || activeRuns.length > 0) return
+    const project = useProjectStore.getState().currentProject
+    returnPendingRef.current = true
+    setReturningToDraft(true)
+    try {
+      const ok = await confirm(
+        `将第 ${meta.chapterNumber} 章 v${meta.version} 退回草稿并恢复编辑？\n\n保留当前正文和版本，以及已生成的章节文件、知识库及其他定稿后处理结果。这不是完整撤销定稿；修改正文后需重新定稿更新相关结果。`,
+        { title: '退回草稿', confirmText: '退回草稿' },
+      )
+      if (!ok || !mountedRef.current || useProjectStore.getState().currentProject !== project) return
+      const result = await useDraftStore.getState().returnToDraft(filePath, meta.chapterNumber)
+      if (!result.success) {
+        toast.error(result.error ?? '退回草稿失败')
+        return
+      }
+      if (mountedRef.current && useProjectStore.getState().currentProject === project) {
+        setMeta(prev => prev ? { ...prev, status: 'draft' } : prev)
+        setHasProcessFailure(false)
+        toast.success('已退回草稿，正文、版本及既有后处理结果已保留')
+      }
+    } catch (e) {
+      toast.error(`退回草稿失败：${String(e)}`)
+    } finally {
+      returnPendingRef.current = false
+      if (mountedRef.current) setReturningToDraft(false)
+    }
+  }, [meta, status, saving, activeRuns.length, filePath])
+
+  /** 修复定稿后处理 */
+  const doRepairFinalize = useCallback(async () => {
+    if (!meta || isChapterBusy || returnPendingRef.current) return
+    try {
+      const guard = await guardRepairPostProcess(meta.chapterNumber)
+      if (!guard.ok) {
+        toast.error(guard.message || t('error.noFixTarget'))
+        return
+      }
+      const { useWorkflowStore } = await import('../../stores/workflow-store')
+      const { createRepairFinalizeWorkflow } = await import('../../services/workflows/chapter-workflow')
+      useWorkflowStore.getState().startWorkflow(createRepairFinalizeWorkflow(meta.chapterNumber), false)
+    } catch (e) {
+      toast.error(t('error.repairFailed').replace('{error}', String(e)))
+    }
+  }, [meta, isChapterBusy, t])
+
+  /** 打开待合并修稿 */
+  const openPendingRevision = useCallback(async (rev: RevisionEntry) => {
+    if (!meta) return
+    const revPath = `${VELA.REVISION}${rev.id}`
+    const [origContent, revContent] = await Promise.all([
+      readDraftBody(filePath),
+      readDraftBody(revPath),
+    ])
+    if (!origContent && !revContent) return
+    setMergeData({ originalContent: origContent, modifiedContent: revContent, revisionPath: revPath })
+  }, [meta, filePath])
+
+  /** 合并完成回调 */
+  const handleMergeComplete = async (mergedText: string) => {
+    if (!meta || !mergeData) return
+    const chapterDir = `${VELA.DRAFT}ch${meta.chapterNumber}`
+    try {
+      const { useDraftStore } = await import('../../stores/draft-store')
+      const result = await useDraftStore.getState().applyMergedRevision(
+        chapterDir, meta.chapterNumber, filePath, mergeData.revisionPath, mergedText
+      )
+      if (result.success) {
+        setMergeData(null)
+        setMeta(prev => prev ? { ...prev, status: 'revised' } : prev)
+        toast.success(t('editor.mergeSuccessToast'))
+        const { getPendingRevisions } = await import('../../services/draft-index')
+        const pending = await getPendingRevisions(chapterDir, meta.version)
+        setPendingRevisions(pending)
+      } else {
+        toast.error(t('error.mergeFailed').replace('{error}', String(result.error)))
+      }
+    } catch (e) {
+      toast.error(t('error.mergeError').replace('{error}', String(e)))
+    }
+  }
+
+  /** 打开最新审稿报告 */
+  const openLatestReview = useCallback(async () => {
+    if (!meta) return
+    const chapterDir = `${VELA.DRAFT}ch${meta.chapterNumber}`
+    const { getLatestReview } = await import('../../services/draft-index')
+    const latest = await getLatestReview(chapterDir, meta.version)
+    if (!latest) return
+    const reportContent = await readDraftBody(`${VELA.REVIEW}${latest.id}`)
+    if (!reportContent) return
+    useEditorStore.getState().openFile({
+      id: `review-report-${meta.chapterNumber}-${latest.id}`,
+      name: t('editor.reviewTab').replace('{version}', String(meta.version)),
+      type: 'review-report',
+      content: reportContent,
+      filePath,
+      reviewReport: reportContent,
+      chapterNumber: meta.chapterNumber,
+      chapterDir,
+    })
+  }, [meta, filePath, t])
+
+  /** 正文翻译：目标语言 → LLM 翻译 → 新建 source='translation' 草稿 → 打开新 Tab（原文保留） */
+  const doTranslate = useCallback(async (lang: 'zh' | 'en' | 'ru') => {
+    const text = currentBodyRef.current
+    if (!text?.trim()) return
+    try {
+      const langLabel = t(`translate.lang.${lang}` as TextKey)
+      const { useLLMStore } = await import('../../stores/llm-store')
+      const res = await useLLMStore.getState().generate(
+        [
+          { role: 'system', content: t('ai.systemPrompt') },
+          { role: 'user', content: t('translate.prompt').replace('{lang}', langLabel).replace('{content}', text.slice(0, 12000)) },
+        ],
+        undefined,
+        { temperature: 0.3 },
+      )
+      if (!res.success || !res.content) throw new Error(res.error || 'empty response')
+      const translated = res.content.trim()
+      if (!meta) throw new Error('no draft meta')
+
+      const created = await ipc.invoke('db:draft-create', {
+        chapterNumber: meta.chapterNumber,
+        version: (meta.version ?? 1) + 1,
+        source: 'translation',
+        content: translated,
+        wordCount: computeTextStats(translated).novelWordCount,
+      })
+      if (!created.success || !created.id) throw new Error(created.error || 'create failed')
+
+      // 打开新 Tab（翻译稿独立于原文，可对比/续用）
+      useEditorStore.getState().openFile({
+        id: `draft-${created.id}-translation`,
+        name: `${t('translate.title')} · ${langLabel}`,
+        type: 'chapter',
+        filePath: `vela://draft/${created.id}`,
+        content: translated,
+      })
+      toast.success(t('translate.success'))
+      // 通知侧栏刷新（草稿箱出现翻译稿）
+      const { globalEventBus } = await import('../../shared/event-bus')
+      globalEventBus.emit('REFRESH_RESOURCE', { resources: ['drafts'] })
+    } catch (e) {
+      toast.error(t('translate.failed').replace('{error}', String(e)))
+    }
+  }, [meta, t])
+
+  // 稳定回调（配合 memo(EditorToolbar) / CodeMirrorEditor 的 handleUpdate 依赖）——
+  // 否则流式期间（activeRuns 每 100ms 变化）内联函数重建，EditorToolbar 的 memo 形同虚设
+  const handleToolbarSave = useCallback(() => doSave(currentBodyRef.current, { manual: true }), [doSave])
+  const handleToolbarRefine = useCallback(() => { setUserRefinePrompt(''); setConfirmAction('refine') }, [])
+  const handleToolbarReview = useCallback(() => setConfirmAction('review'), [])
+  const handleEditorChange = useCallback((text: string) => {
+    currentBodyRef.current = text
+    const editor = useEditorStore.getState()
+    const tab = editor.tabs.find(t => t.type === 'chapter' && t.filePath === filePath)
+    if (tab) editor.updateTabContent(tab.id, text)
+  }, [filePath])
+  const handleEditorSave = useCallback((text: string) => doSave(text, { manual: true }), [doSave])
+
+  return (
+    <div className="h-full flex flex-col overflow-hidden">
+      {/* 工具栏 — 提取到 EditorToolbar */}
+      <EditorToolbar
+        meta={meta}
+        charCount={charCount}
+        isDirty={isDirty}
+        isReadonly={isReadonly}
+        saving={saving}
+        returningToDraft={returningToDraft}
+        isReturnBlocked={activeRuns.length > 0}
+        isChapterBusy={isChapterBusy || returningToDraft}
+        pendingRevisions={pendingRevisions}
+        reviewCount={reviewCount}
+        hasProcessFailure={hasProcessFailure}
+        onSave={handleToolbarSave}
+        onRefine={handleToolbarRefine}
+        onReview={handleToolbarReview}
+        onTranslate={doTranslate}
+        onFinalize={doFinalize}
+        onRepairFinalize={doRepairFinalize}
+        onReturnToDraft={doReturnToDraft}
+        onOpenRevision={openPendingRevision}
+        onOpenReview={openLatestReview}
+      />
+
+      {/* 后处理状态面板 */}
+      {status === 'finalized' && meta && (
+        <div className="px-3 py-1.5" style={{ borderBottom: '1px solid var(--color-border)' }}>
+          <PostProcessStatusPanel
+            scope={getChapterFinalizeScope(meta.chapterNumber)}
+            onRetry={() => doRepairFinalize()}
+            onStatusLoad={setHasProcessFailure}
+          />
+        </div>
+      )}
+
+      {/* 正文区 */}
+      <div className="flex-1 overflow-hidden relative">
+        <CodeMirrorEditor
+          mode="prose"
+          content={content}
+          filePath={filePath}
+          editable={!isReadonly && !isChapterBusy && !returningToDraft}
+          hideStatusBar
+          onCharCountChange={setCharCount}
+          onChange={handleEditorChange}
+          onSave={handleEditorSave}
+        />
+      </div>
+
+      {/* AI 操作确认弹窗 — 提取到 AIActionDialog */}
+      <AIActionDialog
+        action={confirmAction}
+        chapterTitle={meta?.chapterTitle}
+        version={meta?.version}
+        refinePrompt={userRefinePrompt}
+        reviewDims={reviewDims}
+        onClose={() => setConfirmAction(null)}
+        onRefinePromptChange={setUserRefinePrompt}
+        onReviewDimToggle={(key) => setReviewDims(prev => ({ ...prev, [key]: !prev[key] }))}
+        onConfirm={() => {
+          const act = confirmAction
+          setConfirmAction(null)
+          if (act === 'refine') doRefine()
+          else if (act === 'review') doReview()
+        }}
+      />
+
+      {/* 弹出式三栏合并视图 */}
+      <Dialog open={mergeData !== null} onOpenChange={(v) => !v && setMergeData(null)}>
+        <DialogContent preventOutsideClose
+          className="p-0"
+          style={{ width: '90vw', maxWidth: '90vw', height: '85vh', maxHeight: '85vh', overflow: 'hidden' }}
+        >
+          <DialogHeader className="px-4 py-0" style={{ height: 38, display: 'flex', alignItems: 'center' }}>
+            <DialogTitle className="flex items-center gap-2 text-xs">
+              {t('editor.mergeTitle').replace('{n}', String(meta?.chapterNumber)).replace('{title}', meta?.chapterTitle ?? '')}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="flex-1 overflow-hidden" style={{ height: 'calc(85vh - 38px - 1px)' }}>
+            {mergeData && (
+              <ThreeWayMerge
+                originalContent={mergeData.originalContent}
+                modifiedContent={mergeData.modifiedContent}
+                onComplete={handleMergeComplete}
+                onCancel={() => setMergeData(null)}
+              />
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}

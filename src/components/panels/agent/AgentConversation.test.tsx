@@ -1,0 +1,705 @@
+// @vitest-environment jsdom
+/**
+ * AgentConversation — 预算条记忆段数据源测试（F3）
+ *
+ * 验证预算条与真实注入共用 buildAgentSystemSegmentsAsync：
+ * 此前预算条走同步 buildAgentSystemSegments（仅 M1 ~300 tokens），
+ * 实际注入含 M1+M2（~1.1k）——显示与实况不符。修复后 async 拉取
+ * M2 真实值并用于 contextUsage 计算。
+ */
+import { describe, it, expect, beforeEach, beforeAll, vi } from 'vitest'
+import { createRoot, type Root } from 'react-dom/client'
+import { act } from 'react'
+import AgentConversation from './AgentConversation'
+import { useAgentStore, type AgentConversation as AgentConv } from '../../../stores/agent-store'
+import { useLLMStore } from '../../../stores/llm-store'
+import { useProjectStore } from '../../../stores/project-store'
+import { t } from '../../../shared/locale'
+import { RESIDENT_MEMORY_BUDGET_TOKENS } from '../../../services/agent/memory-layers'
+import type { SubAgentSession } from '../../../services/agent/subagent/types'
+
+// jsdom 未实现 scrollTo / ResizeObserver（组件滚动效果与消息卡片依赖）
+beforeAll(() => {
+  (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+  Element.prototype.scrollTo = vi.fn() as never
+  ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+})
+
+function render(ui: React.ReactElement): { container: HTMLElement; root: Root } {
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  act(() => { root.render(ui) })
+  return { container, root }
+}
+
+describe('AgentConversation 预算条记忆段（F3）', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    // M2 有内容：book 文件多段落 ~1600 tokens → 节选到 800 预算
+    // （注意 truncateToTokenBudget 按段落保留：单段落超预算会被整段丢弃，故用多段落）
+    const bookBody = Array.from({ length: 40 }, (_, i) => `第${i + 1}节 ${'详'.repeat(30)}`).join('\n\n')
+    Object.defineProperty(window, 'velaAPI', {
+      value: {
+        invoke: vi.fn(async (ch: string) => {
+          // C 档第一轮：常驻（resident）才是全文注入；auto 只进名字目录
+          if (ch === 'memory:list') return [{ file: 'book-state.md', kind: 'book', loadMode: 'resident', brief: '全书精要', stale: false, mtime: 1 }]
+          if (ch === 'memory:read') return `---\n---\n\n# 全书精要\n\n${bookBody}`
+          return null
+        }),
+      },
+      configurable: true,
+    })
+    useProjectStore.setState({ currentProject: null })
+    // 必须配一个模型：占用条的分母是**上下文窗口**，窗口未知时它整体不渲染
+    // （ContextBudgetBar 在 modelMax <= 0 时 return null）。2026-09-25 拆出 contextWindow 之前，
+    // 这里靠 `?? 131072` 的兜底才渲染得出来 —— 那是个编造的分母，已去掉。
+    // 本组用例断言的是**记忆段的 token 数**（与分母无关），故补一个 mock 模型即可。
+    useLLMStore.setState({
+      models: [{
+        id: 'm-test',
+        name: 'Test Model',
+        provider: 'openai',
+        protocol: 'openai',
+        modelName: 'gpt-4o',
+        baseUrl: 'https://api.example.com',
+        maxTokens: 4096,
+        contextWindow: 128000,
+        purposes: ['generation'],
+      }],
+      defaultModelId: 'm-test',
+    })
+  })
+
+  // 从预算条的 data 属性取四段 token（base,memory,history,current）的第 2 段。
+  // 2026-09-22 UI 重做后，窄面板放不下「记忆 N」这类标签（已挪进 title），
+  // 原本按文案正则匹配的写法会失效 —— 改读 data 属性，与文案解耦。
+  const readMemoryToken = (container: HTMLElement): number => {
+    const raw = container.querySelector('[data-budget-segments]')?.getAttribute('data-budget-segments')
+    if (!raw) return -1
+    const parts = raw.split(',')
+    return parts[1] === undefined ? -1 : Number(parts[1])
+  }
+
+  it('async 加载后记忆段反映 M2 真实值（与注入共用数据源）', async () => {
+    const conv = useAgentStore.getState().createConversation({ title: 'T' })
+    useAgentStore.setState(state => ({
+      conversations: state.conversations.map(c => c.id === conv.id ? {
+        ...c,
+        messages: [{ id: 'm1', role: 'user', content: '你好', createdAt: Date.now() }],
+      } : c),
+    }))
+    const { container, root } = render(<AgentConversation />)
+    // 初始（async 未就绪）：同步 M1-only 兜底——无滚动摘要 → 记忆段 0
+    expect(readMemoryToken(container)).toBe(0)
+    // 等待 async 段加载（microtask + effect 刷新）
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    // 记忆段 = 常驻全文（不节选；分量见 RESIDENT_MEMORY_BUDGET_TOKENS）+ M1（无）→ 应显著大于 0
+    const memoryTokens = readMemoryToken(container)
+    expect(memoryTokens).toBeGreaterThan(100)
+    expect(memoryTokens).toBeLessThanOrEqual(RESIDENT_MEMORY_BUDGET_TOKENS)
+    act(() => { root.unmount() })
+  })
+
+  it('M2 读盘失败降级：记忆段回落同步 M1-only（不阻塞渲染）', async () => {
+    const conv = useAgentStore.getState().createConversation({ title: 'T' })
+    useAgentStore.setState(state => ({
+      conversations: state.conversations.map(c => c.id === conv.id ? {
+        ...c,
+        messages: [{ id: 'm1', role: 'user', content: '你好', createdAt: Date.now() }],
+      } : c),
+    }))
+    ;(window.velaAPI.invoke as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('no project'))
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    expect(readMemoryToken(container)).toBe(0) // 无 M1（无摘要）且 M2 失败 → 0
+    act(() => { root.unmount() })
+  })
+})
+
+describe('RecentConversationItem hover 行为', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    Object.defineProperty(window, 'velaAPI', {
+      value: {
+        invoke: vi.fn(async () => null),
+      },
+      configurable: true,
+    })
+    useProjectStore.setState({ currentProject: null })
+    useLLMStore.setState({ models: [], defaultModelId: null })
+    useAgentStore.setState({ conversations: [], activeConversationId: null, showHistory: false, memoryView: false })
+  })
+
+  /** 构造：一条有消息的会话但当前激活会话为空 → EmptyState 渲染 RecentConversationItem */
+  const makeEmptyStateRow = () => {
+    const conv = useAgentStore.getState().createConversation({ title: 'T' })
+    useAgentStore.setState(state => ({
+      conversations: state.conversations.map(c => c.id === conv.id ? {
+        ...c,
+        messages: [{ id: 'm1', role: 'user', content: '你好', createdAt: Date.now() }],
+      } : c),
+      activeConversationId: null,
+    }))
+    return conv
+  }
+
+  /** 会话行外层（命名 group `group/row`；内层按钮的 group-hover:* 不算）——
+   *  ⚠️ 2026-10-16 起行容器改用**命名** group：行自身要点亮（整行 = 选中范围），
+   *  同时避免误触发外层 EmptyState 的无名 `group`（其 group-hover 用于别处） */
+  const rowOf = (container: HTMLElement, text?: string): HTMLElement => {
+    const rows = Array.from(container.querySelectorAll<HTMLElement>('.group\\/row'))
+    const row = text ? rows.find(r => r.textContent?.includes(text)) : rows[0]
+    expect(row).toBeTruthy()
+    return row!
+  }
+
+  it('整行 = 选中范围：行自身点亮（悬停底），主按钮不再自亮；时间/操作组交叉渐隐 + 键盘等价', () => {
+    makeEmptyStateRow()
+    const { container, root } = render(<AgentConversation />)
+    const row = rowOf(container)
+
+    // 断言 1：不再写死宽度 —— 根因是 88px 容器里塞 5×20 + gap = 107px（已溢出，
+    // hover 亮起的范围里含点不动的按钮）。改为按内容自适应（grid 叠放同一格）。
+    const rightBox = row.lastElementChild as HTMLElement
+    expect(rightBox.style.width).toBe('')
+    expect(rightBox.className).toContain('grid')
+    // 断言 2：时间元素走类而非内联 opacity（内联会压过 group-hover/row:opacity-0，hover 永不淡出）
+    const timeSpan = rightBox.querySelector<HTMLSpanElement>('span[class*="group-hover/row:opacity-0"]')!
+    expect(timeSpan).toBeTruthy()
+    expect(timeSpan.style.opacity).toBe('')
+    expect(timeSpan.className).toContain('opacity-60')
+    // 断言 3：操作组容器做 opacity 淡入，hover 与 focus-within（键盘等价）两半都在
+    const actions = rightBox.querySelector<HTMLElement>('[class*="group-hover/row:opacity-100"]')!
+    expect(actions).toBeTruthy()
+    expect(actions.className).toContain('group-focus-within/row:opacity-100')
+    // 反向的一半：悬停隐藏同样要有键盘等价
+    expect(timeSpan.className).toContain('group-focus-within/row:opacity-0')
+    // 无 display 切换（hidden）——防布局跳动
+    expect(actions.className).not.toContain('hidden')
+    expect(timeSpan.className).not.toContain('hidden')
+
+    // 断言 4（用户 2026-10-16 的核心诉求）：**整行**才是选中范围 ——
+    // 行容器自身带悬停底（此前只有标题那一小块亮，右侧按钮旁是一片「亮了点不动」的空档）
+    expect(row.className).toContain('hover:bg-[var(--color-hover)]')
+    expect(row.className).toContain('group/row')
+    // 主按钮不再自亮（否则出现「主按钮一块 + 行另一块」双底，且两块之间有空档）
+    const mainBtn = row.querySelector<HTMLButtonElement>('button')!
+    expect(mainBtn.className).not.toContain('hover:bg-')
+    // 行容器不挂 cursor-pointer（手型只属于真能点的主按钮 —— §4 光标纪律）
+    expect(row.className).not.toContain('cursor-pointer')
+
+    // 形态 A：外层行是纯视觉 div（无 role / tabIndex / 点击处理器），操作按钮作兄弟
+    expect(row.getAttribute('role')).toBeNull()
+    expect(row.getAttribute('tabindex')).toBeNull()
+    // 嵌套按钮：恒为 0
+    expect(container.querySelectorAll('button button')).toHaveLength(0)
+
+    act(() => { root.unmount() })
+  })
+
+  it('行内图标按钮为原样式 20×20；删除入口收在「更多」菜单内，点击后回调携带该会话 id', async () => {
+    const conv = makeEmptyStateRow()
+    const spy = vi.spyOn(useAgentStore.getState(), 'deleteConversation').mockImplementation(() => {})
+    const { container, root } = render(<AgentConversation />)
+    const row = rowOf(container)
+
+    // 「更多」触发按钮：原样式 20×20（类写 w-[20px] h-[20px]）+ aria-label + aria-haspopup
+    const more = row.querySelector<HTMLButtonElement>(`[title="${t('tip.moreOptions')}"]`)!
+    expect(more).toBeTruthy()
+    expect(more.className).toContain('w-[20px]')
+    expect(more.className).toContain('h-[20px]')
+    expect(more.style.width).toBe('')
+    expect(more.getAttribute('aria-label')).toBe(t('tip.moreOptions'))
+    expect(more.getAttribute('aria-haspopup')).toBe('menu')
+    expect(more.getAttribute('aria-expanded')).toBe('false')
+
+    // 行内不再横排删除入口（旧形态：5 个 20px 按钮挤在 88px 容器里）
+    const deleteIn = (scope: HTMLElement) =>
+      [...scope.querySelectorAll('button')].filter(b => b.textContent?.trim() === t('agent.deleteConversation'))
+    expect(deleteIn(row)).toHaveLength(0)
+
+    // 打开「更多」→ 删除入口出现在菜单里（danger 菜单项）
+    act(() => { more.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect(more.getAttribute('aria-expanded')).toBe('true')
+    expect(deleteIn(row)).toHaveLength(1)
+    // 菜单项是**文字型目标**（§5 文字型下限 20px）：MenuItem = text-xs 行盒 + py-1.5 ≈ 24.5px
+    expect(deleteIn(row)[0].className).toContain('py-1.5')
+
+    // 点击删除 → 走既有的 confirm 二次确认（命令式挂到 body），确认后回调带**该行**会话 id
+    act(() => { deleteIn(row)[0].dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    // 菜单已显式关闭，故此刻 body 上只剩确认框那一个同名按钮
+    const confirmBtns = [...document.body.querySelectorAll('button')]
+      .filter(b => b.textContent?.trim() === t('agent.deleteConversation'))
+    expect(confirmBtns).toHaveLength(1)
+    act(() => { confirmBtns[0].dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 300)) })
+    expect(spy).toHaveBeenCalledWith(conv.id)
+
+    spy.mockRestore()
+    act(() => { root.unmount() })
+  })
+
+  it('Esc 关闭「更多」菜单（通用浮层至少两：Esc + 点击外部 + 显式关闭）', () => {
+    makeEmptyStateRow()
+    const { container, root } = render(<AgentConversation />)
+    const row = rowOf(container)
+    const more = row.querySelector<HTMLButtonElement>(`[title="${t('tip.moreOptions')}"]`)!
+    act(() => { more.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect([...row.querySelectorAll('button')].some(b => b.textContent?.trim() === t('agent.deleteConversation'))).toBe(true)
+    act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })) })
+    expect([...row.querySelectorAll('button')].some(b => b.textContent?.trim() === t('agent.deleteConversation'))).toBe(false)
+    expect(more.getAttribute('aria-expanded')).toBe('false')
+    act(() => { root.unmount() })
+  })
+})
+
+describe('EmptyState 历史条数配置', () => {
+  // 通道路由 mock：EmptyState 读取 config:get 控制最近会话条数；
+  // makeConvs 的 createConversation 会触发 initializeTools → skillRegistry.loadAll（异步先消费 ipc 调用），
+  // 故 mock 必须按通道分流，保证 config:get 精确命中测试值
+  let configValue: unknown = null
+  let configError: Error | null = null
+
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    configValue = null
+    configError = null
+    Object.defineProperty(window, 'velaAPI', {
+      value: {
+        invoke: vi.fn(async (ch: string) => {
+          if (ch === 'config:get') {
+            if (configError) throw configError
+            return configValue
+          }
+          return null
+        }),
+      },
+      configurable: true,
+    })
+    useProjectStore.setState({ currentProject: null })
+    useLLMStore.setState({ models: [], defaultModelId: null })
+    useAgentStore.setState({ conversations: [], activeConversationId: null, showHistory: false, memoryView: false })
+  })
+
+  /** 构造 n 条带消息的会话（最新在前），并置空活跃会话 → 渲染 EmptyState */
+  const makeConvs = (n: number) => {
+    for (let i = 0; i < n; i++) {
+      const conv = useAgentStore.getState().createConversation({ title: `会话${i}` })
+      useAgentStore.setState(state => ({
+        conversations: state.conversations.map(c => c.id === conv.id ? {
+          ...c,
+          messages: [{ id: `m${i}`, role: 'user', content: '你好', createdAt: Date.now() }],
+        } : c),
+      }))
+    }
+    useAgentStore.setState({ activeConversationId: null })
+  }
+
+  /** 统计最近会话行数（RecentConversationItem 外层 = 命名 group `group/row`；2026-10-16 起） */
+  const recentRowCount = (container: HTMLElement) =>
+    container.querySelectorAll('.group\\/row').length
+
+  it('按 config recentConversationCount 显示条数（mock 5 → 显示 5 条）', async () => {
+    configValue = { recentConversationCount: 5 }
+    makeConvs(6)
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    expect(recentRowCount(container)).toBe(5) // slice(0, recentCount)：mock 5 → 显示 5 条
+    expect(container.textContent).toContain('查看全部对话') // 6 > 5 → 「加载更多」出现
+    act(() => { root.unmount() })
+  })
+
+  it('config 读取失败/无配置时默认 3 条', async () => {
+    configError = new Error('no config')
+    makeConvs(4)
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    expect(recentRowCount(container)).toBe(3) // 读取失败 → 默认 3 条
+    expect(container.textContent).toContain('查看全部对话') // 4 > 3 → 「加载更多」仍出现
+    act(() => { root.unmount() })
+  })
+})
+
+describe('AgentHistoryPanel fork 层级', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    Object.defineProperty(window, 'velaAPI', {
+      value: {
+        invoke: vi.fn(async () => null),
+      },
+      configurable: true,
+    })
+    useProjectStore.setState({ currentProject: null })
+    useLLMStore.setState({ models: [], defaultModelId: null })
+    useAgentStore.setState({ conversations: [], activeConversationId: null, showHistory: false, memoryView: false })
+  })
+
+  /** 构造根会话 R + fork 子会话 C（parentId=R, forkMessageId='m1'），并打开历史面板 */
+  const makeForkState = () => {
+    const now = Date.now()
+    const rootConv: AgentConv = {
+      id: 'conv-root',
+      title: '父会话A',
+      messages: [{ id: 'm1', role: 'user', content: '你好', createdAt: now }],
+      createdAt: now,
+      updatedAt: now,
+      mode: 'balanced',
+      modelId: null,
+    }
+    const childConv: AgentConv = {
+      ...rootConv,
+      id: 'conv-fork',
+      title: '子会话B',
+      createdAt: now + 1,
+      updatedAt: now + 1, // fork 后创建 → 排序更靠前
+      parentId: rootConv.id,
+      forkMessageId: 'm1',
+    }
+    useAgentStore.setState({ conversations: [childConv, rootConv], activeConversationId: null, showHistory: true })
+    return { rootConv, childConv }
+  }
+
+  /** RecentConversationItem 外层行（命名 group `group/row`；2026-10-16 起）。
+   *  外层是普通 div，主区域/工具条按钮是其子节点 */
+  const historyRows = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll<HTMLElement>('.group\\/row'))
+
+  it('fork 子会话缩进显示 + GitFork 图标 + 父会话标注', () => {
+    const { rootConv, childConv } = makeForkState()
+    const { container, root } = render(<AgentConversation />)
+    const rows = historyRows(container)
+    expect(rows).toHaveLength(2)
+    const rowC = rows.find(r => r.textContent?.includes(childConv.title))!
+    expect(rowC).toBeTruthy()
+    // 缩进：固定 pl-5（C1 教训——固定缩进无布局跳动）
+    expect(rowC.className).toContain('pl-5')
+    // 分支图标：lucide-react 1.8.0 无 ForkRight（B2 实测核验）→ GitFork
+    expect(rowC.querySelector('svg.lucide-git-fork')).toBeTruthy()
+    // 父会话标注：与组件同源 t() 计算期望值（B3 评审 Minor③ 防同源遮蔽——下方另补字面量断言）
+    const expectedLabel = t('agent.forkedFrom').replace('{title}', rootConv.title)
+    expect(rowC.textContent).toContain(expectedLabel)
+    // 真实渲染断言（B4 收尾，B3 评审 Minor③）：zh-CN 模板「来自「{title}」」的实际求值
+    // 「来自「父会话A」」——字面量断言验证模板占位符 {title} 已被正确替换；
+    // 若替换失败（如组件 .replace('{xx}') 不匹配），同源 t() 期望值仍通过而此断言失败（假绿反制）
+    expect(rowC.textContent).toContain('来自「父会话A」')
+    act(() => { root.unmount() })
+  })
+
+  it('根会话无标注', () => {
+    const { rootConv, childConv } = makeForkState()
+    const { container, root } = render(<AgentConversation />)
+    // B4 收尾修正：fork 子会话标注包含父标题文本——单按 rootConv.title 匹配会误中
+    // 子会话行（其「来自『父会话A』」标注含该文本），须排除子会话标题作双重区分
+    const rowR = historyRows(container).find(r =>
+      r.textContent?.includes(rootConv.title) && !r.textContent?.includes(childConv.title)
+    )!
+    expect(rowR).toBeTruthy()
+    // 根会话：无缩进、无**标注**、无标注文本。
+    // ⚠️ 2026-10-13 起「分叉」入口收进「更多」菜单（默认不渲染）——根会话行内已无 GitFork 图标，
+    // 数量锁定改为 0（子会话行仍有标注用的 1 个，见上一条用例）
+    expect(rowR.className).not.toContain('pl-5')
+    expect(rowR.querySelectorAll('svg.lucide-git-fork')).toHaveLength(0)
+    expect(rowR.textContent).not.toContain('agent.forkedFrom')
+    expect(rowR.textContent).not.toContain('来自')
+    act(() => { root.unmount() })
+  })
+
+  it('会话行：置顶/重命名作兄弟按钮（原样式 20×20），分叉/归档/删除在「更多」菜单内', () => {
+    makeForkState()
+    const { container, root } = render(<AgentConversation />)
+    const row = historyRows(container).find(r => r.textContent?.includes('父会话A'))!
+
+    // 兄弟按钮：置顶 + 重命名 + 更多 —— 20×20 原生 px（`w-[20px] h-[20px]`，2026-10-16 用户裁决回退）
+    const siblings = ['置顶', '重命名', t('tip.moreOptions')]
+    for (const title of siblings) {
+      const btn = row.querySelector<HTMLButtonElement>(`[title="${title}"]`)
+      expect(btn, `缺少按钮：${title}`).toBeTruthy()
+      // ⚠️ 尺寸走类（w-[20px]）而非内联 style；不要再写成 w-5 h-5（那是 17.5px 的历史坑）
+      expect(btn!.className).toContain('w-[20px]')
+      expect(btn!.className).toContain('h-[20px]')
+      expect(btn!.style.width).toBe('')
+      expect(btn!.getAttribute('aria-label')).toBe(title)
+    }
+    // 行内不再横排 5 个按钮（5 个按钮横排在窄面板里会溢出，故分叉/归档/删除收进「更多」菜单）
+    expect(row.querySelectorAll('button[title]')).toHaveLength(3)
+    expect(container.querySelectorAll('button button')).toHaveLength(0)
+
+    // 打开「更多」：分叉 / 归档 / 删除 三项都在菜单内（菜单项为文字型目标，MenuItem py-1.5）
+    act(() => { row.querySelector<HTMLButtonElement>(`[title="${t('tip.moreOptions')}"]`)!.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    const labels = [...row.querySelectorAll('button')].map(b => b.textContent?.trim())
+    expect(labels).toContain(t('agent.duplicateConversation'))
+    expect(labels).toContain(t('agent.archiveConversation'))
+    expect(labels).toContain(t('agent.deleteConversation'))
+    act(() => { root.unmount() })
+  })
+
+  it('同一列表内「更多」菜单互斥：打开 A 行会关掉 B 行（§1.2 第 4 条）', () => {
+    makeForkState()
+    const { container, root } = render(<AgentConversation />)
+    const rowR = historyRows(container).find(r => r.textContent?.includes('父会话A') && !r.textContent?.includes('子会话B'))!
+    const rowC = historyRows(container).find(r => r.textContent?.includes('子会话B'))!
+    const moreOf = (r: HTMLElement) => r.querySelector<HTMLButtonElement>(`[title="${t('tip.moreOptions')}"]`)!
+    const menuOpenIn = (r: HTMLElement) =>
+      [...r.querySelectorAll('button')].some(b => b.textContent?.trim() === t('agent.deleteConversation'))
+
+    act(() => { moreOf(rowR).dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect(menuOpenIn(rowR)).toBe(true)
+    expect(menuOpenIn(rowC)).toBe(false)
+
+    act(() => { moreOf(rowC).dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect(menuOpenIn(rowR)).toBe(false)
+    expect(menuOpenIn(rowC)).toBe(true)
+
+    // Esc 一并收起（useEscapeKey）
+    act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })) })
+    expect(menuOpenIn(rowC)).toBe(false)
+    act(() => { root.unmount() })
+  })
+})
+
+describe('AgentConversation 末条消息 rewind 禁用（D1/F6）', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    Object.defineProperty(window, 'velaAPI', {
+      value: {
+        invoke: vi.fn(async () => null),
+      },
+      configurable: true,
+    })
+    useProjectStore.setState({ currentProject: null })
+    useLLMStore.setState({ models: [], defaultModelId: null })
+    useAgentStore.setState({ conversations: [], activeConversationId: null, showHistory: false, memoryView: false })
+  })
+
+  /** 构造带 4 条可见消息的活跃会话（user/assistant 交替，无 system——显示即物理序） */
+  const makeActiveConv = () => {
+    const conv = useAgentStore.getState().createConversation({ title: 'T' })
+    useAgentStore.setState(state => ({
+      conversations: state.conversations.map(c => c.id === conv.id ? {
+        ...c,
+        mode: 'balanced',
+        messages: [
+          { id: 'm1', role: 'user', content: '你好', createdAt: Date.now() },
+          { id: 'm2', role: 'assistant', content: '你好呀', createdAt: Date.now() + 1 },
+          { id: 'm3', role: 'user', content: '继续', createdAt: Date.now() + 2 },
+          { id: 'm4', role: 'assistant', content: '好的', createdAt: Date.now() + 3 },
+        ],
+      } : c),
+    }))
+    return conv
+  }
+
+  it('末条消息 rewind 按钮 disabled（解释性 tooltip），其余消息保持可点（F6 静默 no-op 消除）', () => {
+    makeActiveConv()
+    const { container, root } = render(<AgentConversation />)
+
+    // rewind 按钮：正常态 title=agent.rewindToHere；禁用态 title=agent.rewindLastMessage（二选一匹配）
+    const rewindBtns = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
+      .filter(b => b.title === t('agent.rewindToHere') || b.title === t('agent.rewindLastMessage'))
+    // 2026-09-22：分支 / 回退只在**模型回复**下方渲染，用户消息不再有 ——
+    // 本 fixture 是 2 条用户 + 2 条助手，所以只剩 2 个
+    expect(rewindBtns).toHaveLength(2)
+    // 末条助手消息（DOM 序最后一个）禁用 + 解释性 tooltip
+    const last = rewindBtns[rewindBtns.length - 1]!
+    expect(last.disabled).toBe(true)
+    expect(last.title).toBe(t('agent.rewindLastMessage'))
+    // 另一条助手消息可点且 tooltip 不变
+    expect(rewindBtns[0]!.disabled).toBe(false)
+    expect(rewindBtns[0]!.title).toBe(t('agent.rewindToHere'))
+    // 禁用不影响 fork 入口（两条助手消息均可见 GitFork 按钮）
+    expect(container.querySelectorAll('svg.lucide-git-fork')).toHaveLength(2)
+
+    act(() => { root.unmount() })
+  })
+})
+
+describe('ContextBudgetBar 常驻告警标记（C 档第一轮 T6）', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    // 常驻合计超硬上限 → 该段以 tokens=0 + warning 进明细（不静默截断的可见面）
+    Object.defineProperty(window, 'velaAPI', {
+      value: {
+        invoke: vi.fn(async (ch: string) => {
+          if (ch === 'memory:list') return [{ file: 'book-state.md', kind: 'book', loadMode: 'resident', brief: '全书精要', stale: false, mtime: 1 }]
+          if (ch === 'memory:read') return `---\nload_mode: resident\n---\n${'详'.repeat(6000)}`
+          return null
+        }),
+      },
+      configurable: true,
+    })
+    useProjectStore.setState({ currentProject: null })
+    useLLMStore.setState({
+      models: [{
+        id: 'm-test', name: 'Test Model', provider: 'openai', protocol: 'openai', modelName: 'gpt-4o',
+        baseUrl: 'https://api.example.com', maxTokens: 4096,
+        contextWindow: 128000, purposes: ['generation'],
+      }],
+      defaultModelId: 'm-test',
+    })
+  })
+
+  it('常驻超上限：明细面板给出 ⚠ 标记与告警文案（title 含上限值）', async () => {
+    const conv = useAgentStore.getState().createConversation({ title: 'T' })
+    useAgentStore.setState(state => ({
+      conversations: state.conversations.map(c => c.id === conv.id ? {
+        ...c,
+        messages: [{ id: 'm1', role: 'user', content: '你好', createdAt: Date.now() }],
+      } : c),
+    }))
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+
+    const ring = [...container.querySelectorAll('button')].find(b => b.title === t('ccr.clickForDetail')) as HTMLButtonElement
+    expect(ring).toBeTruthy()
+    act(() => { ring.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+
+    const panel = document.body.textContent ?? ''
+    expect(panel).toContain(t('context.seg.memory-resident'))   // 段仍在明细里（要知道它被跳过了）
+    expect(panel).toContain('⚠')
+    const warn = [...document.body.querySelectorAll('[title]')]
+      .find(el => (el.getAttribute('title') ?? '').includes('4000'))
+    expect(warn).toBeTruthy()
+    act(() => { root.unmount() })
+  })
+})
+
+describe('SubAgentSessionCard / SubAgentConfirmCard（C 档第二轮 T7）', () => {
+  const session = (over: Partial<SubAgentSession> = {}): SubAgentSession => ({
+    id: 's1', taskId: 's1', description: '查玉佩伏笔', prompt: 'p', allowedTools: ['read_drafts'],
+    status: 'completed',
+    messages: [
+      { id: 'm1', role: 'user', content: '查玉佩伏笔', createdAt: 0 },
+      { id: 'm2', role: 'assistant', content: '玉佩在第 3 章首次出现。', createdAt: 1 },
+    ],
+    toolCalls: [{ id: 'tc1', toolName: 'read_drafts', arguments: {}, status: 'completed' }],
+    artifacts: [], result: '玉佩在第 3 章首次出现。', startedAt: 0, endedAt: 1000, ...over,
+  })
+
+  /** 构造活跃会话：一条助手消息带 task 工具调用（description 与子会话对应）+ subSessions */
+  const withSession = (s: SubAgentSession, toolDescription = '查玉佩伏笔'): void => {
+    useAgentStore.setState({
+      conversations: [{
+        id: 'c1', title: 'T', createdAt: 0, updatedAt: 0, mode: 'quick', modelId: 'm',
+        messages: [
+          { id: 'u1', role: 'user', content: '帮我查伏笔', createdAt: 0 },
+          {
+            id: 'a1', role: 'assistant', content: '我派一个子 agent 去查。', createdAt: 1,
+            toolCalls: [{
+              id: 'tc-task', toolName: 'task', status: 'completed',
+              arguments: { description: toolDescription },
+            }],
+          },
+        ],
+        subSessions: [s],
+      }],
+      activeConversationId: 'c1',
+      pendingSubAgentConfirmation: null,
+    } as never)
+  }
+
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    Object.defineProperty(window, 'velaAPI', { value: { invoke: vi.fn(async () => null) }, configurable: true })
+    useProjectStore.setState({ currentProject: null })
+    useLLMStore.setState({ models: [], defaultModelId: null })
+  })
+
+  it('父时间线内渲染子会话卡（挂在触发派发的助手消息处）：描述 + 状态 + 工具数', async () => {
+    withSession(session())
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    expect(container.textContent).toContain('查玉佩伏笔')
+    expect(container.textContent).toContain(t('subagent.cardStatusCompleted'))
+    expect(container.textContent).toContain('1')            // 工具数
+    expect(container.textContent).not.toContain('玉佩在第 3 章首次出现。')
+    act(() => { root.unmount() })
+  })
+
+  it('展开显示子转录（默认收起）', async () => {
+    withSession(session())
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    // 2026-09-27 起：头部整行是主按钮（chevron 内置、无独立显隐按钮）——按描述文本定位
+    const show = [...container.querySelectorAll('button')].find(b => b.textContent?.includes('查玉佩伏笔'))!
+    expect(show).toBeTruthy()
+    act(() => { show.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect(container.textContent).toContain('玉佩在第 3 章首次出现。')
+    act(() => { root.unmount() })
+  })
+
+  it('运行中卡片有取消入口，点击调 cancelSubAgent(该子会话)（只中止它）', async () => {
+    withSession(session({ status: 'running', endedAt: undefined }))
+    const spy = vi.spyOn(useAgentStore.getState(), 'cancelSubAgent').mockImplementation(() => {})
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const cancel = [...container.querySelectorAll('button')].find(b => b.title === t('subagent.cardCancel'))!
+    expect(cancel).toBeTruthy()
+    act(() => { cancel.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect(spy).toHaveBeenCalledWith('s1')
+    spy.mockRestore()
+    act(() => { root.unmount() })
+  })
+
+  it('失败卡片显示原因（不静默）', async () => {
+    withSession(session({ status: 'failed', error: 'model down' }))
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    expect(container.textContent).toContain('model down')
+    act(() => { root.unmount() })
+  })
+
+  it('description 不匹配的消息不渲染卡片（不做假关联）', async () => {
+    withSession(session(), '另一个任务')
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    expect(container.textContent).not.toContain(t('subagent.cardStatusCompleted'))
+    act(() => { root.unmount() })
+  })
+
+  it('子确认卡：来源标签（子 agent 描述 + 工具 + 目标），按钮恰为 允许/拒绝（**无**「始终允许」）', async () => {
+    useAgentStore.setState({
+      conversations: [{ id: 'c1', title: 'T', messages: [{ id: 'u1', role: 'user', content: '你好', createdAt: 0 }], createdAt: 0, updatedAt: 0, mode: 'quick', modelId: 'm' }],
+      activeConversationId: 'c1',
+      pendingSubAgentConfirmation: {
+        sessionId: 's1', description: '查玉佩伏笔',
+        toolCall: { id: 'tc1', toolName: 'write_file', arguments: { file_path: 'drafts/c30.md' }, status: 'waiting_confirm' },
+      },
+    } as never)
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    expect(container.textContent).toContain('查玉佩伏笔')
+    expect(container.textContent).toContain('write_file')
+    expect(container.textContent).toContain('drafts/c30.md')
+    const labels = [...container.querySelectorAll('button')].map(b => b.textContent?.trim())
+    expect(labels).toContain(t('subagent.confirmAllow'))
+    expect(labels).toContain(t('subagent.confirmDeny'))
+    expect(container.textContent).not.toContain(t('agentConfirm.alwaysAllow'))
+    act(() => { root.unmount() })
+  })
+
+  it('点允许 → resolveSubAgentConfirmation(true)', async () => {
+    useAgentStore.setState({
+      conversations: [{ id: 'c1', title: 'T', messages: [{ id: 'u1', role: 'user', content: '你好', createdAt: 0 }], createdAt: 0, updatedAt: 0, mode: 'quick', modelId: 'm' }],
+      activeConversationId: 'c1',
+      pendingSubAgentConfirmation: {
+        sessionId: 's1', description: '查玉佩伏笔',
+        toolCall: { id: 'tc1', toolName: 'write_file', arguments: { file_path: 'drafts/c30.md' }, status: 'waiting_confirm' },
+      },
+    } as never)
+    const spy = vi.spyOn(useAgentStore.getState(), 'resolveSubAgentConfirmation').mockImplementation(() => {})
+    const { container, root } = render(<AgentConversation />)
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const allow = [...container.querySelectorAll('button')].find(b => b.textContent?.trim() === t('subagent.confirmAllow'))!
+    act(() => { allow.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect(spy).toHaveBeenCalledWith(true)
+    spy.mockRestore()
+    act(() => { root.unmount() })
+  })
+})

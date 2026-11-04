@@ -1,0 +1,121 @@
+// @see - https://www.electron.build/configuration/configuration
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "com.novelforge.ide",
+  "asar": true,
+  // INTEGRITY 由 builder 先写入；此 hook 随后补齐 Windows EXE 图标与版本。
+  "afterPack": "./scripts/after-pack-win-resources.cjs",
+  "asarUnpack": [
+    "node_modules/better-sqlite3/**/*",
+    "node_modules/@lancedb/lancedb/**/*",
+    "node_modules/apache-arrow/**/*",
+    "node_modules/@lancedb/lancedb-darwin-*/**/*",
+    "node_modules/@lancedb/lancedb-linux-*/**/*",
+    "node_modules/@lancedb/lancedb-win32-*/**/*",
+    // jieba-wasm：nodejs target 在模块加载期同步读 pkg/nodejs/*.wasm，asar 内路径不可 fs 读
+    "node_modules/jieba-wasm/**/*",
+    // 开发者控制台 CLI：ELECTRON_RUN_AS_NODE 下从真实磁盘执行，必须解包
+    "scripts/dev-instance.mjs",
+    "scripts/dev-instance-lib.mjs"
+  ],
+  // 覆盖根 package.json 的 "type":"module"，确保主进程以 CommonJS 运行
+  // Electron 主进程使用 CJS require，ESM 模式会导致 Rolldown CJS shim 崩溃
+  "extraMetadata": {
+    "main": "dist-electron/main.js",
+    "type": "commonjs"
+  },
+  "productName": "NovelForge",
+  "directories": {
+    "output": "release/${version}"
+  },
+  // files 白名单 — electron-builder 按顺序评估，先排除后回加
+  "files": [
+    "dist/**/*",
+    "dist-electron/**/*",
+    "build/**/*",
+    "index.html",
+    // 开发者控制台 CLI（由主进程以 ELECTRON_RUN_AS_NODE 调用；同时 asarUnpack）
+    "scripts/dev-instance.mjs",
+    "scripts/dev-instance-lib.mjs",
+    // 排除项
+    "!src",
+    "!electron",
+    "!.git",
+    "!.github",
+    "!.storybook",
+    "!.vscode",
+    "!.idea",
+    "!.claude",
+    "!.codewhale-plans",
+    "!tests",
+    "!docs",
+    "!release",
+    "!*.md",
+    "!tsconfig.json",
+    "!tsconfig.node.json",
+    "!vite.config.ts",
+    "!pnpm-lock.yaml",
+    "!pnpm-workspace.yaml",
+    "!.gitignore",
+    "!.npmignore",
+    "!.npmrc",
+    "!package.json",
+    "!node_modules/.cache",
+    "!node_modules/**",
+    // 回加：external 依赖（Rolldown 无法打包的原生模块 + 其 JS 入口）
+    "node_modules/better-sqlite3/**",
+    "node_modules/bindings/**",
+    "node_modules/file-uri-to-path/**",
+    "node_modules/@lancedb/lancedb/**",
+    "node_modules/@lancedb/lancedb-win32-*/**",
+    "node_modules/@lancedb/lancedb-darwin-*/**",
+    "node_modules/@lancedb/lancedb-linux-*/**",
+    "node_modules/apache-arrow/**",
+    "node_modules/flatbuffers/**",
+    "node_modules/tslib/**",
+    "node_modules/reflect-metadata/**",
+    // jieba-wasm：external 依赖（中文分词 .wasm + JS 入口）
+    "node_modules/jieba-wasm/**"
+  ],
+  "mac": {
+    "target": ["dmg"],
+    "artifactName": "${productName}-${version}-macOS.${ext}",
+    "category": "public.app-category.productivity"
+  },
+  "win": {
+    // 跳过失败的自动 rcedit，图标及版本由 afterPack 的 resedit hook 补齐。
+    // 此选项也跳过应用 EXE 自动签名；NSIS 安装器签名流程仍独立保留。
+    "signAndEditExecutable": false,
+    "icon": "build/icon.ico",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ]
+  },
+  "nsis": {
+    "artifactName": "${productName}-${version}-Installer/${productName}-${version}-Installer.${ext}",
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false,
+    // 点击「完成」后不自动运行应用（避免 ExecShellAsUser 启动阻塞导致安装程序窗口无响应）
+    "runAfterFinish": false,
+    // 品牌化：安装程序图标 / 完成页头部图标（复用应用图标）
+    "installerIcon": "build/icon.ico",
+    "installerHeaderIcon": "build/icon.ico",
+    // 自定义 NSIS 脚本（字体/DPI 优化）
+    "include": "build/installer.nsh"
+  },
+  "linux": {
+    "target": ["AppImage"],
+    "artifactName": "${productName}-${version}-linux.${ext}",
+    "category": "Office"
+  },
+  "publish": {
+    "provider": "github",
+    "owner": "LunaRime",
+    "repo": "novelforge"
+  }
+}

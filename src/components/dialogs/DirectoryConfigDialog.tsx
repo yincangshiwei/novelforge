@@ -1,0 +1,353 @@
+import { useEffect, useState } from 'react'
+import { FileText } from 'lucide-react'
+import { useTranslation } from '../../hooks/useTranslation'
+import { useProjectStore } from '../../stores/project-store'
+import { useWorkflowStore } from '../../stores/workflow-store'
+import { useVolumeStore } from '../../stores/volume-store'
+import { toast } from '../ui/Toast'
+import {
+  Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle, DialogDescription,
+} from '../ui/Dialog'
+import { Button } from '../ui/Button'
+import { Input } from '../ui/Input'
+import { Label } from '../ui/Label'
+import { Textarea } from '../ui/Textarea'
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '../ui/Select'
+import type { DirectoryWorkflowParams } from '../../services/workflows/directory-workflow'
+
+interface Props {
+  isOpen: boolean
+  onClose: () => void
+  /** 已有蓝图章节数（影响「追加」模式的默认值） */
+  existingCount: number
+  onConfirm: (params: DirectoryWorkflowParams) => void
+}
+
+/** 蓝图生成配置弹框 — 选择生成范围和模式 */
+export default function DirectoryConfigDialog({ isOpen, onClose, existingCount, onConfirm }: Props) {
+  const { t } = useTranslation()
+  const currentProject = useProjectStore(s => s.currentProject)
+
+  // 范围选择（front/range/volume/full）
+  const [rangeMode, setRangeMode] = useState<'front' | 'range' | 'volume' | 'full'>('front')
+  // 覆盖/追加模式选择 (仅当 existingCount > 0 时有效)
+  const [overwriteMode, setOverwriteMode] = useState<'append' | 'full'>('append')
+
+  const [frontN, setFrontN] = useState<number | ''>(50)
+  const [rangeStart, setRangeStart] = useState<number | ''>(existingCount + 1)
+  const [rangeEnd, setRangeEnd] = useState<number | ''>(existingCount + 50)
+  const [volumeNumber, setVolumeNumber] = useState<number | ''>('')
+  // 生成方式：single = 一次对话生成全部（默认）；batch = 分批生成（质量优先）
+  const [generationMode, setGenerationMode] = useState<'single' | 'batch'>('single')
+  const [batchChapterCount, setBatchChapterCount] = useState<number | ''>(10)
+  // 节奏指导
+  const [pacingGuidance, setPacingGuidance] = useState('')
+
+  const isBatchRunning = useWorkflowStore(s => s.isTypeRunning('batch_generate'))
+  const volumes = useVolumeStore(s => s.volumes)
+  const loadVolumes = useVolumeStore(s => s.load)
+
+  // 打开时加载分卷（微任务惯例，供「按卷」模式选择）
+  useEffect(() => {
+    let mounted = true
+    if (isOpen) {
+      Promise.resolve().then(() => { if (mounted) loadVolumes() })
+    }
+    return () => { mounted = false }
+  }, [isOpen, loadVolumes])
+
+  if (!currentProject) return null
+  const total = currentProject.novelConfig.totalChapters
+
+  const handleConfirm = () => {
+    // 防重复：同类型工作流正在运行
+    if (isBatchRunning) {
+      toast.warning(t('blueprintGen.taskInProgress'))
+      return
+    }
+
+    let params: DirectoryWorkflowParams
+
+    if (rangeMode === 'full') {
+      params = { mode: overwriteMode === 'full' ? 'full' : 'append', count: 0 }
+    } else if (rangeMode === 'front') {
+      if (existingCount > 0 && overwriteMode === 'append') {
+        params = { mode: 'append', startChapter: existingCount + 1, count: Number(frontN) || 50 }
+      } else {
+        params = { mode: 'full', count: Number(frontN) || 50 }
+      }
+    } else if (rangeMode === 'volume') {
+      // 按卷生成：卷范围内全量生成（已有蓝图会被重生成）
+      const v = volumes.find(x => x.volumeNumber === Number(volumeNumber))
+      if (!v) {
+        toast.warning(t('volume.batchGenNeedVolume'))
+        return
+      }
+      const start = v.chapterStart
+      const count = v.chapterEnd > 0
+        ? v.chapterEnd - start + 1
+        : Math.max(1, total - start + 1) // 进行中卷 → 至全书末尾
+      params = { mode: 'append', startChapter: start, count }
+    } else {
+      const start = Number(rangeStart) || 1
+      const end = Math.max(start, Number(rangeEnd) || start)
+      params = { mode: 'append', startChapter: start, count: Math.max(1, end - start + 1) }
+    }
+
+    onConfirm({
+      ...params,
+      pacingGuidance: pacingGuidance.trim() || undefined,
+      generationMode,
+      batchChapterCount: generationMode === 'batch' ? (Number(batchChapterCount) || 10) : undefined,
+    })
+    onClose()
+    toast.info(t('blueprintGen.submitted'))
+  }
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent preventOutsideClose className="max-w-[480px]">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <FileText size={16} className="text-[var(--color-accent)]" />
+            {t('blueprintGen.title')}
+          </DialogTitle>
+          <DialogDescription>
+            {existingCount > 0
+              ? t('blueprintGen.hasExisting').replace('{n}', String(existingCount))
+              : t('blueprintGen.noExisting').replace('{n}', String(total))}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="px-5 py-4 space-y-4">
+          <div>
+            <Label className="text-xs font-semibold mb-2 block" style={{ color: 'var(--color-text)' }}>
+              {t('blueprintGen.range')}
+            </Label>
+            <div className="space-y-3 mt-2">
+              <RadioOption
+                checked={rangeMode === 'front'}
+                onChange={() => setRangeMode('front')}
+                label={
+                  <span className="flex items-center gap-2">
+                    {t('blueprintGen.batch')}
+                    <Input
+                      type="number"
+                      value={frontN}
+                      onChange={e => setFrontN(e.target.value === '' ? '' : parseInt(e.target.value))}
+                      onBlur={() => {
+                        const v = Number(frontN)
+                        if (!v || v < 1) setFrontN(50)
+                        else setFrontN(Math.min(total, v))
+                      }}
+                      className="w-16"
+                      onClick={e => e.stopPropagation()}
+                    />
+                    {t('unit.chapters')}
+                  </span>
+                }
+              />
+              <RadioOption
+                checked={rangeMode === 'volume'}
+                onChange={() => setRangeMode('volume')}
+                label={
+                  <span className="flex items-center gap-2">
+                    {t('volume.batchGen')}
+                    <Select
+                      value={String(volumeNumber)}
+                      onValueChange={(v) => setVolumeNumber(parseInt(v))}
+                    >
+                      <SelectTrigger
+                        className="w-44 text-xs"
+                        onClick={e => e.stopPropagation()}
+                      >
+                        <SelectValue placeholder={t('volume.batchGenSelect')} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {volumes.length === 0 ? (
+                          <SelectItem value="__none" disabled>
+                            {t('volume.empty')}
+                          </SelectItem>
+                        ) : volumes.map(v => (
+                          <SelectItem key={v.volumeNumber} value={String(v.volumeNumber)}>
+                            {v.title
+                              ? t('volume.ordinalTitle').replace('{n}', String(v.volumeNumber)).replace('{title}', v.title)
+                              : t('volume.ordinal').replace('{n}', String(v.volumeNumber))}
+                            {' '}
+                            {v.chapterEnd > 0
+                              ? t('volume.chapters').replace('{start}', String(v.chapterStart)).replace('{end}', String(v.chapterEnd))
+                              : `${t('volume.chapters').replace('{start}', String(v.chapterStart)).replace('{end}', '…')}`}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </span>
+                }
+              />
+              <RadioOption
+                checked={rangeMode === 'range'}
+                onChange={() => setRangeMode('range')}
+                label={
+                  <span className="flex items-center gap-2">
+                    {t('blueprintGen.specifyRange')}
+                    <Input
+                      type="number"
+                      value={rangeStart}
+                      onChange={e => setRangeStart(e.target.value === '' ? '' : parseInt(e.target.value))}
+                      onBlur={() => {
+                        const v = Number(rangeStart)
+                        if (!v || v < 1) setRangeStart(1)
+                        else if (v > existingCount + 1) setRangeStart(existingCount + 1)
+                      }}
+                      className="w-16"
+                      onClick={e => e.stopPropagation()}
+                    />
+                    {t('blueprintGen.to')}
+                    <Input
+                      type="number"
+                      value={rangeEnd}
+                      onChange={e => setRangeEnd(e.target.value === '' ? '' : parseInt(e.target.value))}
+                      onBlur={() => {
+                        const v = Number(rangeEnd)
+                        const start = Number(rangeStart) || 1
+                        if (!v || v < start) setRangeEnd(start)
+                      }}
+                      className="w-16"
+                      onClick={e => e.stopPropagation()}
+                    />
+                    {t('unit.chapters')}
+                  </span>
+                }
+              />
+              <RadioOption
+                checked={rangeMode === 'full'}
+                onChange={() => setRangeMode('full')}
+                label={t('blueprintGen.full').replace('{n}', String(total))}
+              />
+            </div>
+          </div>
+
+          {existingCount > 0 && (
+            <div
+              className="rounded-lg p-3 space-y-2 mt-4"
+              style={{ backgroundColor: 'var(--color-panel)', border: '1px solid var(--color-border)' }}
+            >
+              <p className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+                {t('blueprintGen.existingData')}
+              </p>
+              <div className="space-y-3 mt-2">
+                <RadioOption
+                  checked={overwriteMode === 'append'}
+                  onChange={() => setOverwriteMode('append')}
+                  label={t('blueprintGen.append').replace('{n}', String(existingCount + 1))}
+                />
+                <RadioOption
+                  checked={overwriteMode === 'full'}
+                  onChange={() => setOverwriteMode('full')}
+                  label={t('blueprintGen.overwrite')}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* 生成方式：单次 vs 分批（长范围质量/费用权衡，由用户选择） */}
+          <div
+            className="rounded-lg p-3 space-y-2"
+            style={{ backgroundColor: 'var(--color-panel)', border: '1px solid var(--color-border)' }}
+          >
+            <p className="text-xs font-medium" style={{ color: 'var(--color-text-muted)' }}>
+              {t('blueprintGen.generationMode')}
+            </p>
+            <div className="space-y-3 mt-2">
+              <RadioOption
+                checked={generationMode === 'single'}
+                onChange={() => setGenerationMode('single')}
+                label={t('blueprintGen.singlePass')}
+              />
+              <p className="text-micro pl-6 -mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                {t('blueprintGen.singlePassHint')}
+              </p>
+              <RadioOption
+                checked={generationMode === 'batch'}
+                onChange={() => setGenerationMode('batch')}
+                label={
+                  <span className="flex items-center gap-2">
+                    {t('blueprintGen.batched')}
+                    <Input
+                      type="number"
+                      value={batchChapterCount}
+                      onChange={e => setBatchChapterCount(e.target.value === '' ? '' : parseInt(e.target.value))}
+                      onBlur={() => {
+                        const v = Number(batchChapterCount)
+                        if (!v || v < 1) setBatchChapterCount(10)
+                        else setBatchChapterCount(Math.min(50, v))
+                      }}
+                      className="w-16"
+                      onClick={e => e.stopPropagation()}
+                    />
+                    {t('unit.chapters')}{t('blueprintGen.perBatch')}
+                  </span>
+                }
+              />
+              <p className="text-micro pl-6 -mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                {t('blueprintGen.batchedHint')}
+              </p>
+            </div>
+          </div>
+
+          {/* 节奏/风格指导（可选） */}
+          <div>
+            <Label className="text-xs font-semibold mb-2 block" style={{ color: 'var(--color-text)' }}>
+              {t('blueprintGen.styleGuide')}
+            </Label>
+            <Textarea
+              value={pacingGuidance}
+              onChange={e => setPacingGuidance(e.target.value)}
+              placeholder={t('blueprintGen.stylePlaceholder')}
+              rows={2}
+              className="text-xs"
+            />
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>{t('action.cancel')}</Button>
+          <Button variant="default" onClick={handleConfirm}>
+            <FileText size={13} />
+            {t('blueprintGen.startBtn')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/** 单选按钮选项 */
+function RadioOption({
+  checked,
+  onChange,
+  label,
+}: {
+  checked: boolean
+  onChange: () => void
+  label: React.ReactNode
+}) {
+  return (
+    <label
+      className="flex items-center gap-2 text-xs cursor-pointer select-none"
+      style={{ color: 'var(--color-text-secondary)' }}
+      onClick={onChange}
+    >
+      <div
+        className="w-3.5 h-3.5 rounded-full border flex items-center justify-center flex-shrink-0 transition-colors"
+        style={{
+          borderColor: checked ? 'var(--color-accent)' : 'var(--color-border)',
+          backgroundColor: checked ? 'var(--color-accent)' : 'transparent',
+        }}
+      >
+        {checked && <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--color-text)' }} />}
+      </div>
+      {label}
+    </label>
+  )
+}

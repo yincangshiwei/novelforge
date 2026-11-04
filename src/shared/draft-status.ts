@@ -1,0 +1,34 @@
+/**
+ * 草稿状态共享常量与类型
+ * — 统一 Sidebar、DraftEditor 等多处的状态标签和颜色显示，避免重复定义和不一致
+ */
+
+/** 草稿状态类型 */
+export type DraftStatus = 'draft' | 'revised' | 'reviewed' | 'finalized' | 'archived'
+
+/** 草稿状态 → i18n key（组件渲染时用 t() 取当前 locale 文案） */
+export const DRAFT_STATUS_LABEL_KEY: Record<string, string> = {
+  draft:     'version.draft',
+  revised:   'draftStatus.revised',
+  reviewed:  'draftStatus.reviewed',
+  finalized: 'draftStatus.finalized',
+  archived:  'draftStatus.archived',
+}
+
+/** 草稿状态 → 中文标签（兼容旧代码/fallback，新代码请用 DRAFT_STATUS_LABEL_KEY + t()） */
+export const DRAFT_STATUS_LABEL: Record<string, string> = {
+  draft:     '草稿',
+  revised:   '已修稿',
+  reviewed:  '已审稿',
+  finalized: '已定稿',
+  archived:  '已归档',
+}
+
+/** 草稿状态 → 显示颜色（使用 CSS 变量保证主题适配） */
+export const DRAFT_STATUS_COLOR: Record<string, string> = {
+  draft:     'var(--color-text-muted)',
+  revised:   'var(--color-info)',  /* 蓝色 — 表示已有改进 */
+  reviewed:  '#a78bfa',           /* 紫色 — 表示已审核（无紫色 token，暂留字面值，见审计报告） */
+  finalized: 'var(--color-success)',
+  archived:  'var(--color-text-muted)',
+}

@@ -1,0 +1,129 @@
+/**
+ * 意图预路由（阶段 A）——本地零 LLM 成本的自然语言意图识别。
+ * 判定原则：只识别「执行成本/破坏性」高的意图（写稿/修稿/角色/大纲）。
+ * ⚠️ 方案 B（2026-10-02 拍板）：本模块**不再直接触发任何执行**——chapter_creation / refine /
+ *    architecture 三类仅作解析（执行已退役，落 ReAct，由模型经 start_workflow 工具 + 确认执行）；
+ *    本地保留的无动作产出只有两类：ambiguous → 澄清、character → 内容增强。
+ * 查询类（文风/设定/聊天）不预路由，留给 ReAct 兜底。
+ */
+
+// kind 保留完整分类：三类执行意图的解析仍会返回（当前消费方将其落回 ReAct；留作澄清/提示/未来复用）
+export type WritingIntent =
+  | { kind: 'chapter_creation'; chapter: number | { from: number; to: number } | null }
+  | { kind: 'refine'; chapter: number | null }
+  | { kind: 'character'; name: string; action: 'create' | 'update' }
+  | { kind: 'architecture'; target: 'blueprint' | 'architecture' }
+  | { kind: 'ambiguous'; hint: string }
+  | { kind: 'none' }
+
+/** 章节号：阿拉伯/中文数字「第3章」「第三章」；支持 1-99（十位组合——评审覆盖缺口修订：原 1-10 与十一~十九，10-99 全缺） */
+const CN_DIGIT: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 }
+const CN_TENS: Record<string, number> = { 十: 10, 二十: 20, 三十: 30, 四十: 40, 五十: 50, 六十: 60, 七十: 70, 八十: 80, 九十: 90 }
+function parseChapterNum(s: string): number | null {
+  const a = parseInt(s, 10)
+  if (!Number.isNaN(a) && a > 0) return a
+  if (s in CN_DIGIT) return CN_DIGIT[s]               // 一~九
+  if (s in CN_TENS) return CN_TENS[s]                 // 十/二十~九十
+  const m = s.match(/^([一二三四五六七八九]?)(十)([一二三四五六七八九]?)$/)
+  if (m) {
+    const tens = m[1] ? CN_DIGIT[m[1]] : 0            // 十一~十九（无十位）→ 10 + 个位；二十一~九十九 → 十位×10 + 个位
+    return (tens ? tens * 10 : 10) + (m[3] ? CN_DIGIT[m[3]] : 0)
+  }
+  return null
+}
+
+/**
+ * 只读查询动词（真机 bug 修复 2026-09-13）。
+ *
+ * 这些词表明用户要「看/列」，不是要「做」，一律不预路由（交给 ReAct）。
+ * 背景：`列出小说大纲` 曾被「大纲」判定命中并启动架构工作流 → 前置条件不满足而失败。
+ * 与文件开头「查询类（文风/设定/聊天）不预路由」的原则一致。
+ */
+const QUERY_VERB = /(列出|列举|罗列|查看|看看|看一下|显示|展示|给我看|有哪些|有什么|是什么|在哪|多少)/
+
+export function detectWritingIntent(input: string): WritingIntent {
+  // @提及由既有链路处理（parseMentions），预路由不抢
+  if (input.includes('@')) return { kind: 'none' }
+
+  // ==== 角色（先判定——角色名可能与写稿动词共现） ====
+  // 评审覆盖缺口修订：「创建角色」无名字（原名捕获组需 1-10 字）→ ambiguous 澄清，不再静默 none
+  // brief 修订：捕获组排除「的」（原「创建一个叫苏晚晴的角色」贪心误捕获「苏晚晴的」）
+  const charCreate = input.match(/(?:创建|新建|添加|新增)(?:一个|一位|个)?(?:叫|名为|叫做)?\s*([^\s，。！？；：、（）《》【】·—""''的]{1,10})\s*(?:的)?角色/)
+  if (charCreate) return { kind: 'character', name: charCreate[1].trim(), action: 'create' }
+  if (/(?:创建|新建|添加|新增).{0,4}角色/.test(input)) return { kind: 'ambiguous', hint: 'character' }
+  // brief 修订：补 character/update 分支（spec §4.2「新建 vs 修改分支」；brief 遗漏，plan 文档含此行）
+  // 评审二次修订：动词组 `(?:下|一下)?` 消费助词 + 捕获组负向前瞻——名与「角色/人设/设定」后缀间有前缀助词或空名时绝不命中。
+  //   前置守护前瞻 (?!下|一下…后缀) 闭合并回溯孔（助词组回溯为空的二次尝试仍会以「一下」开头捕获），
+  //   且保留「的」排除（否则贪心捕获吞入后缀导致 name=「苏晚晴的角色」）。
+  // 评审修复（M1）：守卫前瞻内先行 `\s?` 容忍「修改 一下角色设定」空格变体——空格使原前瞻与助词组
+  //   错位，捕获组会以「一下」开头误命 name（实测 name=「一下角色」）。
+  const charUpdate = input.match(/(?:修改|更新|调整|改)(?!\s?(?:下|一下)\s*(?:的)?\s*(?:角色|人设|设定))(?:下|一下)?\s*(?!角色|人设|设定)([^\s，。！？；：、（）《》【】·—""''的]{1,10})\s*(?:的)?(?:角色|人设|设定)/)
+  if (charUpdate) return { kind: 'character', name: charUpdate[1].trim(), action: 'update' }
+
+  // ==== 大纲/架构 ====
+  // ⚠️ 真机 bug 修复（2026-09-13）：原正则的动词组是 `(?:生成|重新|创建|帮我)?`——**可选**，
+  //   于是只要文本里出现「大纲/蓝图」就命中。用户说「列出小说大纲」被当成「生成大纲」，
+  //   直接启动架构工作流，随后因前置条件不满足报「前置条件未满足，无法开始」。
+  //   「列出/查看/显示/有哪些…」是**只读查询**，按本文件开头「查询类不预路由」的原则必须交给 ReAct。
+  if (!QUERY_VERB.test(input)
+    && /(?:生成|重新|创建|帮我)?\s*(?:大纲|蓝图)/.test(input)) return { kind: 'architecture', target: 'blueprint' }
+  if (/(?:重新)?\s*(?:规划|设计|搭建|写)\s*(?:剧情|架构|世界观|剧情架构)/.test(input)) return { kind: 'architecture', target: 'architecture' }
+
+  // ==== 无名字角色操作（M3，评审裁定） ====
+  // 「修改/更新/调整/改 + 角色/人设/设定」无名字 → ambiguous('character')——与「创建角色」落点一致；
+  // 此前回落 refine(null) 会误触发润色工作流。放在架构判定之后（「帮我修改大纲」→ blueprint 先返回，
+  // M3 不与其竞争）、修稿判定之前（角色操作不喂给 refine）。只匹配 角色/人设/设定 目标词，与大纲
+  // 「蓝图/大纲」目标词正交——无角色目标词的输入不受影响。
+  // 排除「改写」：改(?!写)——改写是文本改写动词（「改写这段…」落 refine），非角色操作。
+  if (/(?:修改|更新|调整|改(?!写)).{0,4}(?:角色|人设|设定)/.test(input)) return { kind: 'ambiguous', hint: 'character' }
+
+  // ==== 修稿 ====
+  // 第 与 数字 之间允许空格（评审覆盖缺口修订：「润色第 2 章」此前退化成 refine(null)）
+  // brief 修订：章号可位于动词之前（「把第2章润色一下」），原正则只跟动词后会把「一下」的「一」误当章号
+  // 评审二次修订：数字分支 `章?` → `章`——「润色一下/修改一下/优化一下」不得把「一下」的「一」当章号（refine(1) 误触发）
+  // M6（评审覆盖缺口修订）：动词后容忍空格——「润色 第2章」（空格在动词与章号间）此前退化成 refine(null)；
+  //   `\s*` 只影响空格，不吞「一下」：空格后单数字后无 章 时（「润色 一下」）数字分支仍失败 → null
+  const refinePreM = input.match(/第?\s*(\d+|[一二三四五六七八九十]+)\s*章\s*(?:的)?\s*(?:润色|修改|改写|打磨|优化|修(?:一下|改)?)/)
+  const refineM = input.match(/(?:润色|修改|改写|打磨|优化|修(?:一下|改)?)\s*(?:第?\s*(\d+|[一二三四五六七八九十]+)\s*章|这段|这段文字|这一段)?/)
+  if (/(?:润色|修改|改写|打磨|优化|修(?:一下|改)?)/.test(input)) {
+    const chapRaw = refinePreM?.[1] ?? refineM?.[1]
+    const chap = chapRaw ? parseChapterNum(chapRaw) : null
+    return { kind: 'refine', chapter: chap }
+  }
+
+  // ==== 写稿（最后判定——「写」是最宽动词） ====
+  const writeVerb = /(?:写|创作|生成|起草|接着写|继续写|产出)/
+  if (writeVerb.test(input)) {
+    // M7（评审覆盖缺口修订）：中文数字 range——「五到八章」「第五到八章」此前不命中（仅阿拉伯数字 `-`/`至`）；
+    //   两段均经 parseChapterNum 解析（与单章一致），阿拉伯数字行为不变
+    const range = input.match(/(\d+|[一二三四五六七八九十]+)\s*[-–至到]\s*(\d+|[一二三四五六七八九十]+)\s*章/)
+    if (range) {
+      const from = parseChapterNum(range[1]), to = parseChapterNum(range[2])
+      if (from !== null && to !== null && from > 0 && to >= from) return { kind: 'chapter_creation', chapter: { from, to } }
+    }
+    // \s* 支持「第 3 章」带空格（评审覆盖缺口修订：`第?(\d+)` 后无空格容忍时「第 3 章」匹配失败）
+    const single = input.match(/第?\s*(\d+|[一二三四五六七八九十]+)\s*章/)
+    if (single) {
+      const n = parseChapterNum(single[1])
+      if (n !== null) return { kind: 'chapter_creation', chapter: n }
+    }
+    // 评审修复（I3）查询护栏：宽「写」动词命中后、ambiguous 返回前——查询/聊天类不预路由
+    //（「写作风格是什么」「怎么写出更精彩的对话」此前被永久拦截为 ambiguous，无 ReAct 兜底）。
+    //   写作/写法/写得/写好/写作风格 形态 或 含疑问词（什么/怎么/如何/？/?）→ 查询类留给 ReAct；
+    //   祈使句「帮我写」不含这些形态 → 仍 ambiguous；带章号「写第3章」已先于护栏返回。
+    // I3 扩展（deferred 评审裁决）：负向白名单——邮件/报告/文案/代码/方案/简历等明确非小说写作目标 → none；
+    //   误伤面：目标词判定在章号判定（range/单章）之后——「帮我写第三章」先命中章号不受影响。
+    // ⚠️ 真机 bug 修复（2026-09-13）：补 **配置/参数** —— 用户说「对这本小说重新生成配置」时，
+    //   裸「生成」动词命中本分支，被当成「要写稿但没说章节号」→ 连续追问「你想写第几章？」，
+    //   连问两次都答非所问。配置重新生成是**设置类**意图（有 config_generation 工作流/工具），
+    //   不该由写稿预路由拦截；这里放行给 ReAct，由 LLM 选正确工具。
+    if (/(写作|写法|写得|写好|写作风格|怎么写)/.test(input)
+      || /(什么|怎么|如何|？|\?)/.test(input)
+      || /(邮件|报告|文案|代码|方案|简历|配置|参数)/.test(input)) {
+      return { kind: 'none' }
+    }
+    return { kind: 'ambiguous', hint: 'chapter' }
+  }
+
+  return { kind: 'none' }
+}

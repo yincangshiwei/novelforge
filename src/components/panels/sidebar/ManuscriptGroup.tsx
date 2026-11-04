@@ -1,0 +1,262 @@
+/* eslint-disable react-refresh/only-export-components */
+/**
+ * ManuscriptGroup — 正文章节折叠组（已定稿章节列表）
+ */
+
+import { useState, useEffect, useRef } from 'react'
+import { FileText, FolderOpen, Copy, PenTool, Download, Archive } from 'lucide-react'
+import type { FileNode } from '../../../shared/ipc-channels'
+import { ipc } from '../../../services/ipc-client'
+import { useProjectStore } from '../../../stores/project-store'
+import { t } from '../../../shared/locale'
+import { useTranslation } from '../../../hooks/useTranslation'
+
+import { showSidebarMenu, openChapterFile } from './SidebarShared'
+import ChapterExportDialog from '../../dialogs/ChapterExportDialog'
+import SidebarGroup from './SidebarGroup'
+import CountBadge from '../../ui/CountBadge'
+
+// ===== 章节标题缓存 =====
+
+/** 章节标题内存缓存：path → 显示名（进程内常驻，避免大量重复 IPC 读取） */
+export const chapterTitleCache = new Map<string, string>()
+
+/** 清除特定文件的章节标题缓存 */
+export function clearChapterTitleCache(filePath?: string) {
+  if (filePath) {
+    chapterTitleCache.delete(filePath)
+  } else {
+    chapterTitleCache.clear()
+  }
+}
+
+/**
+ * 优先从蓝图 JSON 读取章节标题，fallback 到文件首行
+ *
+ * @param filePath    manuscript 文件路径
+ * @param fallback    兜底显示名（如 "第1章"）
+ * @param chapterNumber 章节号（用于定位蓝图文件）
+ */
+async function readChapterTitle(filePath: string, fallback: string, chapterNumber?: number): Promise<string> {
+  if (chapterTitleCache.has(filePath)) return chapterTitleCache.get(filePath)!
+
+  // 优先从蓝图 JSON 读取标题
+  if (chapterNumber) {
+    try {
+      const project = useProjectStore.getState().currentProject
+      if (project) {
+        const bpResult = await ipc.invoke('db:blueprint-get', chapterNumber)
+        if (bpResult) {
+          const display = `${t('chapter.label').replace('{n}', String(chapterNumber))} ${bpResult.title}`
+          chapterTitleCache.set(filePath, display)
+          return display
+        }
+      }
+    } catch { /* 蓝图读取失败时 fallback 到文件首行 */ }
+  }
+
+  // fallback: 读取正文首行
+  let fileContent = ''
+  if (filePath.startsWith('vela://')) {
+    const { readVelaContent } = await import('../../../services/vela-protocol')
+    fileContent = await readVelaContent(filePath)
+  } else {
+    const result = await ipc.invoke('fs:read-file', filePath)
+    if (result.success) fileContent = result.content
+  }
+
+  if (!fileContent) return fallback
+  const firstLine = fileContent.split('\n').find((l: string) => l.trim())
+  if (!firstLine) return fallback
+  const title = firstLine.replace(/^#+\s*/, '').trim()
+  const display = title || fallback
+  chapterTitleCache.set(filePath, display)
+  return display
+}
+
+// ===== 正文章节组件 =====
+
+export default function ManuscriptGroup({ files }: { files: FileNode[]; projectPath: string }) {
+  const { t, locale } = useTranslation()
+  const [titleMap, setTitleMap] = useState<Record<string, string>>({})
+  // 导出状态
+  const [exportOpen, setExportOpen] = useState(false)
+  const [exportChapters, setExportChapters] = useState<number[]>([])
+  const [exportTitleMap, setExportTitleMap] = useState<Record<number, string>>({})
+
+  // files 变化时增量补齐标题（readChapterTitle 内部有缓存命中，已读过的 path 不再发 IPC）；
+  // 仅语言切换时清空缓存全量重建（缓存值含旧语言 t() 文本）
+  const prevLocaleRef = useRef(locale)
+  const filesDep = files.map(f => f.path).join(',')
+  useEffect(() => {
+    if (files.length === 0) return
+    let cancelled = false
+    const load = async () => {
+      if (prevLocaleRef.current !== locale) {
+        prevLocaleRef.current = locale
+        clearChapterTitleCache()
+      }
+      const entries: Record<string, string> = {}
+      await Promise.all(
+        files.map(async (f) => {
+          if (f.name.includes('_notes')) return
+          const rawName = f.name.replace(/\.[^.]+$/, '')
+          const chMatch = rawName.match(/^chapter_(\d+)$/)
+          const fallback = chMatch ? t('chapter.label').replace('{n}', String(parseInt(chMatch[1], 10))) : rawName
+          const chNum = chMatch ? parseInt(chMatch[1], 10) : undefined
+          entries[f.path] = await readChapterTitle(f.path, fallback, chNum)
+        })
+      )
+      if (!cancelled) setTitleMap(entries)
+    }
+    load()
+    return () => { cancelled = true }
+  }, [files, filesDep, t, locale])
+
+  const getDisplay = (f: FileNode) => {
+    if (titleMap[f.path]) return titleMap[f.path]
+    const rawName = f.name.replace(/\.[^.]+$/, '')
+    const chMatch = rawName.match(/^chapter_(\d+)$/)
+    return chMatch ? t('chapter.label').replace('{n}', String(parseInt(chMatch[1], 10))) : rawName
+  }
+
+  // 导出处理
+  const openSingleExport = (chapterNumber: number) => {
+    setExportChapters([chapterNumber])
+    setExportTitleMap(prev => ({ ...prev, [chapterNumber]: getTitleFromMap(chapterNumber) }))
+    setExportOpen(true)
+  }
+
+  const openBatchExport = () => {
+    const allChapters = chapterFiles.map(f => extractChapterNumber(f))
+    setExportChapters(allChapters)
+    const titles: Record<number, string> = {}
+    for (const cn of allChapters) {
+      titles[cn] = getTitleFromMap(cn)
+    }
+    setExportTitleMap(titles)
+    setExportOpen(true)
+  }
+
+  const getTitleFromMap = (chapterNumber: number): string => {
+    // 从 titleMap 中找到对应章节的标题
+    for (const [path, title] of Object.entries(titleMap)) {
+      const chMatch = path.match(/chapter_(\d+)/)
+      if (chMatch && parseInt(chMatch[1]) === chapterNumber) {
+        return title
+      }
+    }
+    return t('chapter.label').replace('{n}', String(chapterNumber))
+  }
+
+  /** 从文件名提取章节号 */
+  const extractChapterNumber = (f: FileNode): number => {
+    const rawName = f.name.replace(/\.[^.]+$/, '')
+    const chMatch = rawName.match(/^chapter_(\d+)$/)
+    return chMatch ? parseInt(chMatch[1], 10) : 0
+  }
+
+  // 只显示正文章节（过滤掉旧的 _notes 文件）
+  const chapterFiles = files.filter(f => !f.name.includes('_notes'))
+
+  return (
+    <>
+    <SidebarGroup
+      icon={<PenTool size={12} />}
+      title={t('manuscript.title')}
+      defaultOpen={false}
+      count={chapterFiles.length > 0
+        ? <CountBadge value={chapterFiles.length} unit={t('unit.chapters')} />
+        : undefined}
+      actions={chapterFiles.length > 0 && (
+        <button
+          type="button"
+          className="flex items-center justify-center rounded hover:bg-[var(--color-hover)] cursor-pointer flex-shrink-0"
+          style={{ width: 32, height: 32, color: 'var(--color-text-muted)' }}
+          title={t('export.batchExportTip')}
+          onClick={() => openBatchExport()}
+        >
+          <Archive size={12} />
+        </button>
+      )}
+    >
+      {chapterFiles.length === 0 ? (
+        <div className="text-xs py-1" style={{ paddingLeft: 24, color: 'var(--color-text-muted)' }}>
+          {t('manuscript.empty')}
+        </div>
+      ) : (
+        chapterFiles.map(f => {
+              const displayName = getDisplay(f)
+              const chapterNum = extractChapterNumber(f)
+              return (
+                <div
+                  key={f.path}
+                  className="tree-item gap-1.5 group"
+                  // 左缩进交给主按钮：手型光标与真实可点区重合，缩进区仍可点；右侧留 8px 防贴边
+                  style={{ paddingLeft: 0, paddingRight: 8 }}
+                  onContextMenu={e => showSidebarMenu([
+                    {
+                      key: 'open',
+                      label: t('action.openChapter'),
+                      icon: <FolderOpen size={13} />,
+                      onClick: () => openChapterFile(f.path, displayName),
+                    },
+                    {
+                      key: 'export-single',
+                      label: t('action.export'),
+                      icon: <Download size={13} />,
+                      onClick: () => openSingleExport(chapterNum),
+                    },
+                    { key: 'div1', type: 'divider' as const },
+                    {
+                      key: 'copy-path',
+                      label: t('action.copyPath'),
+                      icon: <Copy size={13} />,
+                      onClick: () => navigator.clipboard.writeText(f.path).catch(() => { }),
+                    },
+                  ], e)}
+                  title={t('manuscript.tooltip').replace('{name}', displayName)}
+                >
+                  {/* 2026-09-25 重构：章节点开此前在 `<div onClick>` 上 —— 键盘完全够不到，
+                      而它内部**本来就含**单章导出按钮，外层直接换 `<button>` 会 button 嵌 button。
+                      做法：文件图标 + 章节名包进主按钮，导出按钮降为兄弟节点
+                      （不再需要 stopPropagation，外层已无点击处理器）。 */}
+                  <button
+                    type="button"
+                    onClick={() => openChapterFile(f.path, displayName)}
+                    className="flex items-center gap-1.5 flex-1 min-w-0 h-full text-left enabled:cursor-pointer"
+                    style={{ paddingLeft: 30 }}
+                  >
+                    <FileText size={11} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+                    <span className="text-sm truncate flex-1" style={{ color: 'var(--color-text-secondary)' }}>
+                      {displayName}
+                    </span>
+                  </button>
+                  {/* 单章导出按钮 — hover/focus-within 时显示（主按钮获得焦点同样能唤出） */}
+                  <button
+                    className="flex items-center justify-center rounded transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-[var(--color-hover)]"
+                    style={{ width: 32, height: 32, flexShrink: 0, color: 'var(--color-text-muted)' }}
+                    title={t('export.singleExportTip')}
+                    onClick={() => openSingleExport(chapterNum)}
+                    type="button"
+                  >
+                    <Download size={12} />
+                  </button>
+                </div>
+              )
+            })
+          )}
+
+    </SidebarGroup>
+    {/* 章节导出对话框 — 2026-09-27 修复 RM-SB-01：必须挂在折叠门之外。
+        此前它在 SidebarGroup 的 children 里，收起态 `open ? children : null` 不渲染 →
+        收起态点导出零响应、exportOpen 静默置位，之后展开时弹窗"报复性"自行出现（真机 S8 实锤）。 */}
+    <ChapterExportDialog
+      chapterNumbers={exportChapters}
+      chapterTitles={exportTitleMap}
+      open={exportOpen}
+      onClose={() => setExportOpen(false)}
+    />
+    </>
+  )
+}

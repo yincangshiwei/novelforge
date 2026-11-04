@@ -1,0 +1,361 @@
+import { useState, useEffect, useCallback } from 'react'
+import { Sparkles, Play, AlertCircle } from 'lucide-react'
+import { Spinner } from '../ui/Spinner'
+import { Badge } from '../ui/Badge'
+import { useProjectStore } from '../../stores/project-store'
+import { useLLMStore } from '../../stores/llm-store'
+import { useWorkflowStore } from '../../stores/workflow-store'
+import { t } from '../../shared/locale'
+import { DIR_VELA_INTERNAL } from '../../shared/project-paths'
+
+import { createChapterWorkflow } from '../../services/workflows/chapter-workflow'
+import { guardChapterWriting } from '../../services/workflows/workflow-guards'
+import { normalizeBlueprintRole } from '../../services/blueprint-role'
+import { DEFAULT_WORDS_PER_CHAPTER } from '../../shared/constants'
+import { ipc } from '../../services/ipc-client'
+import { toast } from '../ui/Toast'
+import {
+  Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle, DialogDescription,
+} from '../ui/Dialog'
+import { Button } from '../ui/Button'
+import { Input } from '../ui/Input'
+import { Textarea } from '../ui/Textarea'
+import { Label } from '../ui/Label'
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from '../ui/Select'
+
+interface Props {
+  isOpen: boolean
+  onClose: () => void
+  /** 从章节蓝图「写作此章」传入的预填参数，优先级高于历史记录 */
+  prefill?: Record<string, unknown> | null
+}
+
+/** 章节角色规范值 — 与模板枚举/目录编辑器值域统一（建置系，P2 修复 '开篇' 历史变体） */
+const ROLE_VALUES = ['建置', '铺垫', '发展', '冲突', '高潮', '转折', '收尾']
+
+/** 章节创作参数持久化路径（相对于项目路径） */
+const CREATION_LOG_REL = `${DIR_VELA_INTERNAL}/chapter_creation_log.json`
+
+/** 章节创作对话框 — 配置并启动章节创作工作流（步进式，每步等待用户确认） */
+export default function ChapterCreationDialog({ isOpen, onClose, prefill }: Props) {
+  const currentProject = useProjectStore(s => s.currentProject)
+  const defaultModelId = useLLMStore(s => s.defaultModelId)
+  // ✅ action 用 getState() 获取，不订阅 workflow store 高频更新
+  const startWorkflow = useWorkflowStore.getState().startWorkflow
+  const addLog = useWorkflowStore.getState().addLog
+  const [chapterNumber, setChapterNumber] = useState<number | ''>(1)
+  const [title, setTitle] = useState('')
+  const [role, setRole] = useState('发展')
+  const [purpose, setPurpose] = useState('')
+  const [keyEvents, setKeyEvents] = useState('')
+  const [characters, setCharacters] = useState('')
+  const [userGuidance, setUserGuidance] = useState('')
+  const [knowledgeHint, setKnowledgeHint] = useState('')
+  const [wordsTarget, setWordsTarget] = useState<number | ''>(DEFAULT_WORDS_PER_CHAPTER)
+  const [loadedFromHistory, setLoadedFromHistory] = useState(false)
+  const [loadedFromBlueprint, setLoadedFromBlueprint] = useState(false)
+  const [guardError, setGuardError] = useState<string | null>(null)
+  const isChapterRunning = useWorkflowStore(s => s.isTypeRunning('chapter_creation'))
+
+
+  // 如果是在这弹窗里发起的任务，一旦跑完，isChapterRunning 会变成 false，此时自动关闭弹窗
+  useEffect(() => {
+    let prevRunning = false
+    const unsub = useWorkflowStore.subscribe((state) => {
+      const running = state.isTypeRunning('chapter_creation')
+      if (prevRunning && !running && isOpen) {
+        onClose()
+      }
+      prevRunning = running
+    })
+    return unsub
+  }, [isOpen, onClose])
+
+  /** 从项目本地 .novelforge/chapter_creation_log.json 读取上次参数 */
+  const loadLastParams = useCallback(async () => {
+    if (!currentProject) return
+    try {
+      const result = await ipc.invoke('fs:read-json', `${currentProject.path}/${CREATION_LOG_REL}`)
+      if (result.success && result.data) {
+        const log = result.data as {
+          lastUsed?: {
+            chapterNumber: number; title?: string; role: string
+            purpose?: string; keyEvents?: string; characters?: string
+            userGuidance?: string; wordsTarget?: number
+          }
+        }
+        if (log.lastUsed) {
+          const last = log.lastUsed
+          // 章节号自动 +1
+          setChapterNumber((last.chapterNumber || 0) + 1)
+          setTitle('') // 标题不继承，让用户自填
+          setRole(normalizeBlueprintRole(last.role))
+          setPurpose(last.purpose || '')
+          setKeyEvents(last.keyEvents || '')
+          setCharacters(last.characters || '')
+          setUserGuidance(last.userGuidance || '')
+          setWordsTarget(last.wordsTarget || currentProject.novelConfig.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER)
+          setLoadedFromHistory(true)
+          return
+        }
+      }
+    } catch { /* 文件不存在，使用默认值 */ }
+    // 默认值：根据已有稿件数量推断下一章节号
+    setWordsTarget(currentProject.novelConfig.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER)
+    setChapterNumber(1)
+    setLoadedFromHistory(false)
+  }, [currentProject])
+
+  // 每次打开时：prefill 优先，其次尝试从历史恢复
+  useEffect(() => {
+    if (!isOpen || !currentProject) return
+    let mounted = true
+    Promise.resolve().then(() => {
+      if (!mounted) return
+      if (prefill) {
+        // 使用章节蓝图预填数据
+        setChapterNumber(Number(prefill.chapterNumber) || 1)
+        setTitle(String(prefill.title || ''))
+        // 归一化：蓝图历史值可能为英文/旧变体（'开篇'），统一到下拉规范值防空白
+        setRole(normalizeBlueprintRole(String(prefill.role || '')))
+        setPurpose(String(prefill.purpose || ''))
+        setKeyEvents(String(prefill.keyEvents || ''))
+        setCharacters(String(prefill.characters || ''))
+        setUserGuidance(String(prefill.userGuidance || ''))
+        setWordsTarget(currentProject.novelConfig.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER)
+        setLoadedFromBlueprint(true)
+        setLoadedFromHistory(false)
+      } else {
+        setLoadedFromBlueprint(false)
+        loadLastParams()
+      }
+    })
+    return () => { mounted = false }
+  }, [isOpen, currentProject, prefill, loadLastParams])
+
+
+
+  /** 保存当前参数到持久化文件 */
+  const saveParams = async () => {
+    if (!currentProject) return
+    try {
+      // 读取已有 log
+      let log: { lastUsed?: object; history?: object[] } = {}
+      const existing = await ipc.invoke('fs:read-json', `${currentProject.path}/${CREATION_LOG_REL}`)
+      if (existing.success && existing.data) {
+        log = existing.data as typeof log
+      }
+
+      const params = { chapterNumber, title, role, purpose, keyEvents, characters, userGuidance, wordsTarget }
+      log.lastUsed = params
+      log.history = [
+        { ...params, createdAt: new Date().toISOString() },
+        ...((log.history || []) as object[]).slice(0, 49), // 最多保留 50 条历史
+      ]
+
+      await ipc.invoke('fs:write-json', `${currentProject.path}/${CREATION_LOG_REL}`, log)
+    } catch (e) {
+      console.warn('[ChapterCreation] 参数持久化失败:', e)
+    }
+  }
+
+  const handleStart = async () => {
+    if (!defaultModelId) {
+      addLog('error', '⚠️ ' + t('chapter.pleaseConfigModel'))
+      return
+    }
+    if (!currentProject) return
+
+    // 防重复：同类型工作流正在运行
+    if (isChapterRunning) {
+      toast.warning(t('error.chapterInProgress'))
+      return
+    }
+
+    // 前置校验：章节蓝图是否已生成，以及（若篇章>1）前一章是否已定稿
+    const targetChapter = Number(chapterNumber) || 1
+    const guard = await guardChapterWriting(targetChapter)
+    if (!guard.ok) {
+      setGuardError(guard.message || t('error.prereqNotMet'))
+      return
+    }
+    setGuardError(null)
+
+    // 持久化本次参数
+    await saveParams()
+
+    const workflow = createChapterWorkflow({
+      chapterNumber: Number(chapterNumber) || 1,
+      title: title || t('chapter.label').replace('{n}', String(chapterNumber || 1)),
+      role,
+      purpose,
+      characters: characters.split(/[、,，]/).map(s => s.trim()).filter(Boolean),
+      keyEvents,
+      userGuidance,
+      knowledgeQueryHint: knowledgeHint.trim() || undefined,
+    })
+
+    // 启动任务后关闭设定弹窗，由全局 Overlay 接管展示
+    startWorkflow(workflow, false)
+    onClose()
+  }
+
+  const handleOpenChange = (open: boolean) => {
+    // 如果正在生成中，禁止通过点击外部或 ESC 关闭
+    if (!open && !isChapterRunning) onClose()
+  }
+
+  return (
+    <Dialog open={isOpen} onOpenChange={handleOpenChange}>
+      <DialogContent preventOutsideClose className="max-w-[540px]">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Sparkles size={16} className="text-[var(--color-accent)]" />
+            {t('dialog.createChapter')}
+          </DialogTitle>
+          <DialogDescription>
+            {t('chapter.configDialogDesc')}
+            {loadedFromBlueprint && (
+              <Badge variant="success" className="ml-2 px-1.5 font-normal">
+                {t('chapter.prefilled')}
+              </Badge>
+            )}
+            {loadedFromHistory && !loadedFromBlueprint && (
+              <Badge variant="accent" className="ml-2 px-1.5 font-normal">
+                {t('chapter.autoFilled')}
+              </Badge>
+            )}
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* 表单 */}
+        <div className="px-5 py-4 space-y-3">
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <Label>{t('chapter.number')}</Label>
+                  <Input
+                    type="number"
+                    value={chapterNumber}
+                    onChange={(e) => setChapterNumber(e.target.value === '' ? '' : parseInt(e.target.value))}
+                    onBlur={() => {
+                      const v = Number(chapterNumber)
+                      if (!v || v < 1) setChapterNumber(1)
+                    }}
+                    placeholder="1"
+                    min={1}
+                  />
+                </div>
+                <div>
+                  <Label>{t('chapter.title')}</Label>
+                  <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder={t('chapter.autoGenerate')} />
+                </div>
+                <div>
+                  <Label>{t('chapter.wordTarget')}</Label>
+                  <Input
+                    type="number"
+                    value={wordsTarget}
+                    onChange={(e) => setWordsTarget(e.target.value === '' ? '' : parseInt(e.target.value))}
+                    onBlur={() => {
+                      const v = Number(wordsTarget)
+                      if (!v || v < 100) setWordsTarget(DEFAULT_WORDS_PER_CHAPTER)
+                    }}
+                    placeholder="DEFAULT_WORDS_PER_CHAPTER"
+                    min={100}
+                    step={500}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label>{t('chapter.role')}</Label>
+                  <Select value={role} onValueChange={setRole}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {(() => {
+                        const labels = t('chapter.roles').split(', ')
+                        return ROLE_VALUES.map((val, i) => (
+                          <SelectItem key={val} value={val}>{labels[i] || val}</SelectItem>
+                        ))
+                      })()}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label>{t('chapter.characters')}</Label>
+                  <Input value={characters} onChange={(e) => setCharacters(e.target.value)} placeholder={t('chapter.roleSeparator')} />
+                </div>
+              </div>
+
+              <div>
+                <Label>{t('chapter.purpose')}</Label>
+                <Textarea
+                  value={purpose}
+                  onChange={(e) => setPurpose(e.target.value)}
+                  placeholder={t('chapter.purposePlaceholder')}
+                  rows={2}
+                />
+              </div>
+
+              <div>
+                <Label>{t('chapter.keyEvents')}</Label>
+                <Textarea
+                  value={keyEvents}
+                  onChange={(e) => setKeyEvents(e.target.value)}
+                  placeholder={t('chapter.eventsPlaceholder')}
+                  rows={2}
+                />
+              </div>
+
+              <div>
+                <Label>{t('chapter.authorGuidance')} <span className="text-micro opacity-50">{t('chapter.authorGuidanceHint').replace('{optional}', t('chapter.optional'))}</span></Label>
+                <Textarea
+                  value={userGuidance}
+                  onChange={(e) => setUserGuidance(e.target.value)}
+                  placeholder={t('chapter.guidancePlaceholder')}
+                  rows={2}
+                />
+              </div>
+
+              <div>
+                <Label>{t('chapter.kbKeywords')} <span className="text-micro opacity-50">{t('chapter.kbKeywordsHint').replace('{optional}', t('chapter.optional'))}</span></Label>
+                <Input
+                  value={knowledgeHint}
+                  onChange={(e) => setKnowledgeHint(e.target.value)}
+                  placeholder={t('chapter.kbPlaceholder')}
+                />
+              </div>
+            </div>
+
+            <DialogFooter className="sm:justify-between items-center">
+              <span className="text-xs mt-2 sm:mt-0" style={{ color: 'var(--color-text-muted)' }}>
+                {t('tip.chapterCreationFlow')}
+              </span>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" onClick={onClose}>{t('action.cancel')}</Button>
+                <Button variant="ai" size="lg" onClick={handleStart} disabled={isChapterRunning}>
+                  {isChapterRunning ? (
+                    <span className="flex items-center gap-2">
+                      <Spinner size={14} />
+                      {t('chapter.creating')}
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-2">
+                      <Play size={13} />
+                      {t('chapter.startCreate')}
+                    </span>
+                  )}
+                </Button>
+              </div>
+            </DialogFooter>
+            {/* 前置校验失败提示（呈现在 Footer 下方） */}
+            {guardError && (
+              <div className="mx-5 mb-4 flex items-start gap-2 px-3 py-2.5 rounded-md text-xs" style={{ backgroundColor: 'rgba(var(--color-warning-rgb), 0.1)', borderColor: 'rgba(var(--color-warning-rgb), 0.3)', borderWidth: 1, color: 'var(--color-warning)' }}>
+                <AlertCircle size={13} className="flex-shrink-0 mt-0.5" style={{ color: 'var(--color-warning)' }} />
+                <span className="whitespace-pre-line">{guardError}</span>
+              </div>
+            )}
+      </DialogContent>
+    </Dialog>
+  )
+}

@@ -1,0 +1,951 @@
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
+import { GitFork, Trash2, Pin, Pencil, Archive, Plus, ChevronRight, MoreHorizontal } from 'lucide-react'
+import { useAgentStore } from '../../../stores/agent-store'
+import { useLayoutStore } from '../../../stores/layout-store'
+import { useLLMStore } from '../../../stores/llm-store'
+import { useProjectStore } from '../../../stores/project-store'
+import { useThinkingStore } from '../../../stores/thinking-store'
+import { thinkingLevelSpec } from '../../../shared/thinking-level'
+import AgentMessage from './AgentMessage'
+import AgentInputBox from './AgentInputBox'
+import AgentMemoryView from './AgentMemoryView'
+import CompressedBatchCard from './CompressedBatchCard'
+import ContextBudgetBar from './ContextBudgetBar'
+import SubAgentSessionCard from './SubAgentSessionCard'
+import SubAgentConfirmCard from './SubAgentConfirmCard'
+import RunningStatus from './RunningStatus'
+import PendingToolConfirmation from './PendingToolConfirmation'
+import WorkflowProgressEntry from './WorkflowProgressEntry'
+import type { SubAgentSession } from '../../../services/agent/subagent/types'
+import { computeContextUsage, type ContextSegment } from '../../../services/agent/context-usage'
+import { buildAgentSystemSegments, buildAgentSystemSegmentsAsync } from '../../../services/agent/context-builder'
+import { resolveContextPolicyFor } from '../../../services/agent/context-policy'
+import { ipc } from '../../../services/ipc-client'
+import { formatRelativeTime } from '../../../utils/time'
+import { useTranslation } from '../../../hooks/useTranslation'
+import { confirm } from '../../ui/Confirm'
+import { Button } from '../../ui/Button'
+import { MenuItem } from '../../ui/MenuItem'
+import { PopoverSurface } from '../../ui/PopoverSurface'
+import { useOutsideClick } from '../../../hooks/useOutsideClick'
+import { useEscapeKey } from '../../../hooks/useEscapeKey'
+import { useFloatingPosition } from '../../../hooks/useFloatingPosition'
+
+/**
+ * 对话区域主组件
+ * - 空状态：居中显示欢迎词 + 输入框 + 最近会话（参考 agent1.html pt-[30vh] 设计）
+ * - 有会话：消息列表 + 底部固定输入框
+ */
+export default function AgentConversation() {
+  // 原子 selector：仅订阅本组件渲染依赖的三项（原始布尔），流式期间值稳定不重渲染
+  const showHistory = useAgentStore(s => s.showHistory)
+  const memoryView = useAgentStore(s => s.memoryView)
+  const hasActiveMessages = useAgentStore(s => {
+    const conv = s.conversations.find(c => c.id === s.activeConversationId)
+    return !!conv && conv.messages.length > 0
+  })
+
+  // 历史面板模式
+  if (showHistory) {
+    return <AgentHistoryPanel />
+  }
+
+  // 记忆查看器模式（AgentHeader「记忆」按钮 → AgentMemoryView）
+  if (memoryView) {
+    return <AgentMemoryView />
+  }
+
+  // 空状态（无活跃会话）
+  if (!hasActiveMessages) {
+    return <EmptyState />
+  }
+
+  // 有消息的对话视图
+  return <ActiveConversation />
+}
+
+// ===== 空状态视图 =====
+
+function EmptyState() {
+  // 原子 selector：仅订阅列表与切换 action，不随 generating/showHistory 等无关字段重渲染
+  const conversations = useAgentStore(s => s.conversations)
+  const selectConversation = useAgentStore(s => s.selectConversation)
+  const { t } = useTranslation()
+  // 最近会话条数默认 3，可通过全局配置 recentConversationCount 覆盖（读取失败/非法值静默降级为 3）
+  const [recentCount, setRecentCount] = useState(3)
+  // 「更多」菜单互斥：同一列表里只有一行的菜单能打开（card-affordance-standard §1.2 第 4 条）
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    ipc.invoke('config:get')
+      .then(cfg => {
+        if (!cancelled && typeof cfg?.recentConversationCount === 'number' && cfg.recentConversationCount > 0) {
+          setRecentCount(cfg.recentConversationCount)
+        }
+      })
+      .catch(() => { /* config:get 读取失败保持默认 3 */ })
+    return () => { cancelled = true }
+  }, [])
+  // 取最近 recentCount 条历史会话（不包含当前空会话）
+  const recentConvs = conversations
+    .filter(c => c && c.messages.length > 0)
+    .slice(0, recentCount)
+
+
+
+  return (
+    <div className="h-full flex flex-col overflow-hidden">
+      {/* 内容区（滚动）——输入框已移至面板下部固定，此处仅保留引导内容。
+          2026-09-22 UI 重做：改成 flex-col + 顶部对齐（原 paddingTop max(8vh,32px) 把内容
+          往下推、下方留一大片空白）+ 披露声明 mt-auto 压到底部，避免它夹在内容中间。 */}
+      <div className="flex-1 overflow-y-auto flex flex-col">
+      <div
+        className="px-4 flex-1 flex flex-col"
+        style={{ paddingTop: 16, paddingBottom: 16 }}
+      >
+        {/* 标题（紧凑：text-sm，与 IDE 工具面板风格一致） */}
+        <div className="mb-1 pl-1 text-sm font-semibold" style={{ color: 'var(--color-text)' }}>
+          NovelForge
+        </div>
+        {/* 副标题 */}
+        <div className="mb-3 pl-1 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+          {(() => {
+            const text = t('agent.subtitle')
+            const parts: React.ReactNode[] = []
+            let last = 0
+            const re = /([/@])/g
+            let m: RegExpExecArray | null
+            while ((m = re.exec(text)) !== null) {
+              if (m.index > last) parts.push(text.slice(last, m.index))
+              parts.push(<code key={m.index} className="px-1 py-0.5 rounded text-micro" style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-accent)' }}>{m[1]}</code>)
+              last = m.index + 1
+            }
+            if (last < text.length) parts.push(text.slice(last))
+            return <>{parts}</>
+          })()}
+        </div>
+
+        {/* 最近会话（如有） */}
+        {recentConvs.length > 0 && (
+          <div className="mt-4">
+            <div className="flex flex-col gap-0">
+              {recentConvs.map(conv => (
+                <RecentConversationItem
+                  key={conv.id}
+                  title={conv.title}
+                  updatedAt={conv.updatedAt}
+                  onClick={() => selectConversation(conv.id)}
+                  menuOpen={openMenuId === conv.id}
+                  onMenuOpenChange={open => setOpenMenuId(cur => (open ? conv.id : cur === conv.id ? null : cur))}
+                  onDelete={async () => {
+                    const ok = await confirm(
+                      t('agent.confirmDeleteConversation').replace('{title}', conv.title),
+                      { danger: true, confirmText: t('agent.deleteConversation') },
+                    )
+                    if (ok) useAgentStore.getState().deleteConversation(conv.id)
+                  }}
+                />
+              ))}
+            </div>
+            {conversations.filter(c => c.messages.length > 0).length > recentCount && (
+              <button
+                type="button"
+                onClick={() => useAgentStore.getState().setShowHistory(true)}
+                className="mt-1 w-full flex items-center justify-between rounded px-2 py-1.5 text-left transition-colors hover:bg-[var(--color-hover)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--color-accent)]"
+                title={t('action.loadMore')}
+              >
+                <span className="truncate text-xs" style={{ color: 'var(--color-text)', opacity: 0.65 }}>
+                  {t('action.loadMore')}
+                </span>
+                <span className="flex items-center gap-1 flex-shrink-0">
+                  <span className="text-micro tabular-nums" style={{ color: 'var(--color-text-muted)' }}>
+                    {conversations.filter(c => c.messages.length > 0).length}
+                  </span>
+                  <ChevronRight size={12} style={{ color: 'var(--color-text-muted)' }} />
+                </span>
+              </button>
+            )}
+          </div>
+        )}
+
+      </div>
+      </div>
+
+      {/* 输入框固定于面板下部。
+          2026-09-22：去掉 borderTop —— 与对话视图同步，输入框上方不再有分隔线；
+          披露声明也从内容区底部移到**这里**（紧贴输入框上方，用户指定） */}
+      <div className="flex-shrink-0 px-3 pb-3 pt-2">
+        <div className="mb-1 px-1 text-center text-2xs leading-relaxed" style={{ color: 'var(--color-text-muted)' }}>
+          {t('agent.disclaimer')}
+        </div>
+        <AgentInputBox />
+      </div>
+    </div>
+  )
+}
+
+// ===== 活跃对话视图 =====
+
+/**
+ * 预算条记忆段数据源（F3）：与真实注入共用 buildAgentSystemSegmentsAsync——
+ * 注入实际含 M1+M2（~1.1k tokens），此前预算条走同步 M1-only（~300）显示与实况不符。
+ * 竞态/卸载安全：cancelled 标志丢弃过期响应；loaded 携带 key（会话/思考等级/项目），
+ * 过期响应即使已 setState 也在渲染时按 key 丢弃——避免 effect 内同步 setState 级联渲染。
+ */
+type AsyncSegments = {
+  base: string
+  memoryM1: string
+  memoryM2: string
+  /** C 档第一轮：常驻记忆段（独立预算，须计入记忆段总量） */
+  memoryResident: string
+  /** C 档第一轮：逐段明细（含常驻/目录/手动三段） */
+  segments: ContextSegment[]
+}
+
+function useAsyncSegments(activeConv: { id?: string; modelId?: string | null } | null): AsyncSegments | null {
+  const [loaded, setLoaded] = useState<{ key: string; segments: AsyncSegments } | null>(null)
+  const projectPath = useProjectStore.getState().currentProject?.path ?? null
+  const convId = activeConv?.id ?? ''
+  // 运行时口径：思考等级（全局）→ Agent 模式；会话自身的 mode 不再参与（仅归档兼容）
+  const level = useThinkingStore(s => s.level)
+  const mode = thinkingLevelSpec(level).agentMode
+  // W1 批 2：面板预览与真实发送**同口径**（按模型档位取段预算）；否则强档面板显示 M1 300、
+  // 实发却是 400（弱档反之），用户看到的分段数字会与真实请求不符
+  const modelId = activeConv?.modelId ?? useLLMStore.getState().defaultModelId ?? undefined
+  const key = `${convId}|${level}|${modelId ?? ''}|${projectPath}`
+
+  useEffect(() => {
+    if (!convId) return
+    let cancelled = false
+    const policy = resolveContextPolicyFor(modelId)
+    buildAgentSystemSegmentsAsync(mode, '', {
+      toolBudgetTokens: policy.toolBudgetTokens,
+      m1BudgetTokens: policy.m1BudgetTokens,
+      l1BudgetTokens: policy.l1BudgetTokens,
+      autoRecall: policy.autoRecall,
+    })
+      .then(segments => { if (!cancelled) setLoaded({ key, segments }) })
+      .catch(() => { /* M2 读盘失败降级：保持同步兜底 */ })
+    return () => { cancelled = true }
+  }, [convId, level, mode, modelId, projectPath, key])
+
+  return loaded && loaded.key === key ? loaded.segments : null
+}
+
+function ActiveConversation() {
+  // 原子 selector：generating 为原始布尔；activeConv 订阅活跃会话对象（流式期间消息变化需重渲染）
+  const generating = useAgentStore(s => s.generating)
+  const activeConv = useAgentStore(s => s.conversations.find(c => c.id === s.activeConversationId) ?? null)
+  const { t } = useTranslation()
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const [isAtBottom, setIsAtBottom] = useState(true)
+  const [currentInput, setCurrentInput] = useState('')
+  const asyncSegments = useAsyncSegments(activeConv)
+
+  // 输入框内容追踪（AgentInputBox 内部状态，通过冒泡 input 事件捕获——预算条 current 段用，P0 近似）
+  useEffect(() => {
+    const onInput = (e: Event) => {
+      const el = e.target as HTMLElement | null
+      if (el && el.tagName === 'TEXTAREA' && rootRef.current?.contains(el)) {
+        setCurrentInput((el as HTMLTextAreaElement).value)
+      }
+    }
+    document.addEventListener('input', onInput)
+    return () => document.removeEventListener('input', onInput)
+  }, [])
+
+  // 消息变化时自动滚动到底部
+  useEffect(() => {
+    if (isAtBottom && scrollRef.current) {
+      scrollRef.current.scrollTo({
+        top: scrollRef.current.scrollHeight,
+        behavior: 'smooth',
+      })
+    }
+  }, [activeConv?.messages, generating, isAtBottom])
+
+  // 监听滚动位置判断是否在底部
+  const handleScroll = () => {
+    const el = scrollRef.current
+    if (!el) return
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    setIsAtBottom(distanceFromBottom < 60)
+  }
+
+  /** 跳转到底部 */
+  const scrollToBottom = () => {
+    scrollRef.current?.scrollTo({
+      top: scrollRef.current.scrollHeight,
+      behavior: 'smooth',
+    })
+  }
+
+  /** 分支：从指定消息 fork 新会话（B1 数据层：复制起点含历史，自动激活）
+   *  useCallback：稳定引用，配合 AgentMessage 的 memo —— 流式输出时历史消息不重渲染 */
+  const handleFork = useCallback((messageId: string) => {
+    useAgentStore.getState().forkFromMessage(messageId)
+    // 自动滚动到新会话底部
+    requestAnimationFrame(() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }))
+  }, [])
+
+  /** 回退：确认后截断到指定消息（可恢复）。useCallback 理由同上（t 为稳定引用） */
+  const handleRewind = useCallback(async (messageId: string) => {
+    const ok = await confirm(t('agent.confirmRewind'), {
+      title: t('agent.confirmRewindTitle'),
+      confirmText: t('dialog.confirmRewind'),
+      danger: true,
+    })
+    if (ok) useAgentStore.getState().rewindToMessage(messageId)
+  }, [t])
+
+  // ⚠️ 两个 hook 必须放在 `if (!activeConv) return null` **之前**（条件调用 useMemo 会被
+  //    react-hooks/rules-of-hooks 拦下）；故此处对 activeConv 做可空处理
+  const subSessions = activeConv?.subSessions
+  // P0-1：本轮实发口径（发送后写入；未发送过/历史变更后被清空 → undefined，保持旧行为）
+  const sendObs = useAgentStore(s => (activeConv ? s.sendObservations[activeConv.id] : undefined))
+  /** S1：token 引擎降级标记（预算偏保守，需在面板可见） */
+  const tokenEngineDegraded = useAgentStore(s => s.tokenEngineDegraded)
+  /** 约束③：引擎实时进度（阶段 + 工具轮次），此前引擎在发、store 未接、UI 无消费 */
+  const agentProgress = useAgentStore(s => s.agentProgress)
+  // 可见消息列表（过滤 system——显示层与 store 层独立：store 按物理序截断，展示按可见序）
+  const visibleMessages = useMemo(() => (activeConv?.messages ?? []).filter(m => m.role !== 'system'), [activeConv?.messages])
+  // C 档第二轮：子会话卡的消息归属——按 task 工具调用的 description 匹配（同一子会话只挂一次：
+  // 从最早的匹配消息认领，后续重复出现的同描述调用不再重复挂）
+  const subAgentCards = useMemo(() => {
+    const map = new Map<string, SubAgentSession[]>()
+    const claimed = new Set<string>()
+    for (const msg of visibleMessages) {
+      const tasks = (msg.toolCalls ?? []).filter(tc => tc.toolName === 'task')
+      if (tasks.length === 0) continue
+      for (const tc of tasks) {
+        const description = typeof tc.arguments?.description === 'string' ? tc.arguments.description : ''
+        if (!description) continue
+        // 评审 M3：与 store 侧同口径——description 存的是 trim 过的，比对也要 trim
+        // （否则模型在描述前后带空格/换行时，跑完了却没有卡片）
+        const wanted = description.trim()
+        for (const s of subSessions ?? []) {
+          if (claimed.has(s.id) || s.description !== wanted) continue
+          claimed.add(s.id)
+          map.set(msg.id, [...(map.get(msg.id) ?? []), s])
+        }
+      }
+    }
+    return map
+  }, [visibleMessages, subSessions])
+
+  // 面板预算/模型信息改响应式订阅（供 syncSegments useMemo 作稳定依赖；此前 getState() 靠频繁重渲染兜底）
+  const defaultModelId = useLLMStore(s => s.defaultModelId)
+  const projectPath = useProjectStore(s => s.currentProject?.path ?? null)
+  // 全局思考等级：同步兜底与异步分段同源（会话 mode 不再参与运行时）
+  const thinkingLevel = useThinkingStore(s => s.level)
+  // 同步分段兜底（P0 近似）：档位/modelId 稳定时复用上次结果——buildAgentSystemSegments 含
+  // L0 项目上下文 + L1 编辑上下文 + 工具提示词截断（estimateTokens 编码），流式每 50ms 重算开销大
+  const syncSegments = useMemo(() => {
+    if (!activeConv) return null
+    const mid = activeConv.modelId ?? defaultModelId
+    const policy = resolveContextPolicyFor(mid ?? undefined)
+    return buildAgentSystemSegments(thinkingLevelSpec(thinkingLevel).agentMode, {
+      toolBudgetTokens: policy.toolBudgetTokens,
+      m1BudgetTokens: policy.m1BudgetTokens,
+      l1BudgetTokens: policy.l1BudgetTokens,
+      autoRecall: policy.autoRecall,
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thinkingLevel, activeConv?.modelId, defaultModelId, projectPath])
+
+  if (!activeConv) return null
+
+  /** 末条可见消息 id（F6/D1）：rewind 到末条无内容可截断（store 静默 no-op）——按钮禁用 + 解释性 tooltip */
+  const lastVisibleId = visibleMessages.length > 0 ? visibleMessages[visibleMessages.length - 1].id : null
+
+  // 上下文占用分段（P0 近似：history 用当前 messages 估算，非实际发送副本）
+  // F3：与注入共用 async 数据源（M1+M2 真实值）；async 未就绪时同步 M1-only 兜底，避免闪烁
+  // W1 批 2：同步兜底同样按档位取段预算（与 useAsyncSegments / 真实发送同口径）
+  const modelId = activeConv.modelId ?? defaultModelId
+  // syncSegments 见上方 useMemo（流式期间 mode/modelId 稳定，复用缓存结果）
+  const usageSegments: AsyncSegments = asyncSegments ?? {
+    base: syncSegments!.base, memoryM1: syncSegments!.memory, memoryM2: '', memoryResident: '', segments: syncSegments!.segments,
+  }
+  const currentProjectName = useProjectStore.getState().currentProject?.name ?? null
+  // 占用条的分母是**上下文窗口**，不是最大输出（2026-09-25 拆字段前二者混用同一个 maxTokens）。
+  // contextWindow 由 llm-store.loadModels 的归一化保证存在，故不再需要 ?? 兜底。
+  const modelMax = useLLMStore.getState().models.find(m => m.id === modelId)?.contextWindow ?? 0
+  const contextUsage = computeContextUsage({
+    base: usageSegments.base,
+    // 记忆段 = 常驻 + 名字目录 + 本轮手动 + M1（与 assembleFinalPrompt 的拼装口径一致）
+    memory: [usageSegments.memoryResident, usageSegments.memoryM2, usageSegments.memoryM1].filter(Boolean).join('\n\n---\n\n'),
+    historyMessages: activeConv.messages
+      .filter(m => m.role !== 'system' && !m.error)
+      .map(m => ({ role: m.role, content: m.content })),
+    currentContent: currentInput,
+    modelMax,
+    // B6 明细：改取 async 段（含常驻/目录/手动三段；此前只有同步段，M2 缺席）
+    segments: usageSegments.segments,
+    // P0-1：实发口径 + 前缀状态（两者都来自最近一次发送的观测快照；无记录时不传 → 不渲染）
+    historySentTokens: sendObs?.historySentTokens,
+    historyPanelTokens: sendObs?.panelHistoryTokens,
+    prefix: sendObs?.prefix,
+  })
+
+  return (
+    <div ref={rootRef} className="flex flex-col h-full relative">
+      {/* 消息列表滚动区 */}
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto px-4 py-4"
+      >
+        <div className="flex flex-col">
+          {/* 恢复提示：会话基于快照项目，与当前打开项目不一致（P0 仅提示，不静默切换） */}
+          {activeConv.projectName && currentProjectName && activeConv.projectName !== currentProjectName && (
+            <div className="mx-2 my-2 rounded-lg px-3 py-1.5 text-xs" style={{ backgroundColor: 'var(--color-hover)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}>
+              {t('ccr.restoreProjectHint').replace('{name}', activeConv.projectName).replace('{current}', currentProjectName)}
+            </div>
+          )}
+          {/* CCR 压缩事件卡片：已折叠批次（按 batch 序，早的在前）；
+              P1-3：会话级摘要失效时各卡片给出「重生成摘要」修复入口 */}
+          {(activeConv.compressed ?? [])
+            .slice()
+            .sort((a, b) => a.batch - b.batch)
+            .filter(b => b.summary)
+            .map(b => (
+              <CompressedBatchCard key={b.batch} batch={b} summaryStale={activeConv.rollingSummaryInvalidated === true} />
+            ))}
+          {visibleMessages.map(msg => (
+            <div key={msg.id}>
+              <AgentMessage
+                message={msg}
+                onFork={handleFork}
+                onRewind={handleRewind}
+                // 末条：不可回退（F6 store 已 no-op）——禁用 + 解释性 tooltip 消除无声失败
+                rewindDisabled={msg.id === lastVisibleId}
+              />
+              {/* C 档第二轮：挂在触发派发的助手消息下（按 task 调用的 description 关联——
+                  不做假关联：description 不匹配就不渲染） */}
+              {(subAgentCards.get(msg.id) ?? []).map(s => (
+                <SubAgentSessionCard key={s.id} session={s} />
+              ))}
+            </div>
+          ))}
+          {/* 元信息层①（线②）：流内实时计时行——最后一条 assistant 消息生成中时显示「生成中，用时 x」 */}
+          {(() => {
+            const lastAssistant = [...visibleMessages].reverse().find(m => m.role === 'assistant')
+            if (!lastAssistant || !generating || !lastAssistant.streaming) return null
+            return <RunningStatus startTime={lastAssistant.createdAt} running progress={agentProgress} />
+          })()}
+          {/* 线② 2b：对话内工作流进度入口（单行折叠组，详情在底部任务面板） */}
+          <div className="mt-2">
+            <WorkflowProgressEntry />
+          </div>
+        </div>
+        {/* 底部空间 */}
+        <div className="h-4" />
+      </div>
+
+      {/* 跳到底部浮动按钮 */}
+      {!isAtBottom && (
+        <button
+          onClick={scrollToBottom}
+          className="absolute z-10 flex items-center justify-center w-7 h-7 rounded-full shadow-[var(--shadow-md)] transition-all"
+          style={{
+            right: 16,
+            bottom: 100,
+            backgroundColor: 'var(--color-sidebar)',
+            border: '1px solid var(--color-border)',
+            color: 'var(--color-text-secondary)',
+          }}
+          title={t('tip.scrollBottom')}
+          onMouseEnter={e => {
+            e.currentTarget.style.borderColor = 'var(--color-accent)'
+            e.currentTarget.style.color = 'var(--color-accent)'
+          }}
+          onMouseLeave={e => {
+            e.currentTarget.style.borderColor = 'var(--color-border)'
+            e.currentTarget.style.color = 'var(--color-text-secondary)'
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 5v14M19 12l-7 7-7-7" />
+          </svg>
+        </button>
+      )}
+
+      {/* 底部：输入区 + 下方信息行
+          2026-09-22：上下文圆环与「工作流输出」移到输入框**下方**，
+          并去掉输入框上方那条分隔线（borderTop）—— 底栏与对话区改由留白分隔 */}
+      <div className="flex-shrink-0 px-3 pb-2 pt-2">
+        {/* C 档第二轮：子 agent 写操作的父方审批卡（与父自己的确认卡不同渲染面——父卡在消息内） */}
+        <SubAgentConfirmCard />
+        {/* 线②：父 agent 审批接管输入区（dsh composer takeover；流内不双渲染） */}
+        <PendingToolConfirmation />
+        <AgentInputBox />
+        <div className="mt-1.5 flex items-center justify-between gap-2 px-0.5">
+          <ContextBudgetBar usage={contextUsage} tokenEngineDegraded={tokenEngineDegraded} />
+          <AgentToolbar />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ===== Agent 底部工具栏（小说创作场景） =====
+
+/**
+ * 重构后的工具栏：贴合小说创作场景
+ * 左侧：快速引用按钮（架构、角色、蓝图）
+ * 右侧：打开 AI 输出面板按钮
+ */
+function AgentToolbar() {
+  const openRightPanel = useLayoutStore(s => s.openRightPanel)
+  const { t } = useTranslation()
+
+  return (
+    <div className="flex items-center justify-end">
+
+      {/* 右侧：打开 AI 输出面板 */}
+      <button
+        onClick={() => openRightPanel('ai-output')}
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all select-none"
+        style={{
+          color: 'var(--color-text-muted)',
+          border: '1px solid var(--color-border)',
+        }}
+        title={t('tip.switchAIOutput')}
+        onMouseEnter={e => {
+          e.currentTarget.style.backgroundColor = 'var(--color-hover)'
+          e.currentTarget.style.color = 'var(--color-text)'
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.backgroundColor = 'transparent'
+          e.currentTarget.style.color = 'var(--color-text-muted)'
+        }}
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+        </svg>
+        {t('agent.aiWorkflow')}
+      </button>
+    </div>
+  )
+}
+
+// ===== 历史面板 =====
+
+function AgentHistoryPanel() {
+  const {
+    conversations, activeConversationId, selectConversation, deleteConversation, setShowHistory,
+    renameConversation, archiveConversation, pinConversation, duplicateConversation,
+    createConversation, renameWorkspace, deleteWorkspace,
+  } = useAgentStore()
+  const { t } = useTranslation()
+  // 归档默认隐藏（2026-09-22）
+  const [showArchived, setShowArchived] = useState(false)
+  // 工作区：折叠态（默认全展开）与重命名态（2026-09-22）
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+  const [renamingWs, setRenamingWs] = useState<string | null>(null)
+  const [wsDraft, setWsDraft] = useState('')
+  // 「更多」菜单互斥：同一列表里只有一行的菜单能打开（card-affordance-standard §1.2 第 4 条）
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null)
+
+  // title 查找表：fork 子会话标注父会话标题（父会话已被删除时 get 返回 undefined → 不标注，静默降级）
+  const titleById = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const c of conversations) m.set(c.id, c.title)
+    return m
+  }, [conversations])
+
+  /** 按**小说项目**分组（每个项目 = 一个工作区）：置顶优先、组内按更新时间倒序；
+   *  组间按「该组最近一条的更新时间」倒序 —— 活跃工作区浮到最上面。 */
+  const groups = useMemo(() => {
+    const byProject = new Map<string, { name: string; items: typeof conversations }>()
+    for (const c of conversations) {
+      if (c.archived && !showArchived) continue
+      const key = c.projectPath || '__none__'
+      if (!byProject.has(key)) byProject.set(key, { name: c.projectName || t('agent.noWorkspace'), items: [] })
+      byProject.get(key)!.items.push(c)
+    }
+    const arr = [...byProject.entries()].map(([key, g]) => ({ key, ...g }))
+    for (const g of arr) {
+      g.items.sort((a, b) => (Number(b.pinned ?? false) - Number(a.pinned ?? false)) || b.updatedAt - a.updatedAt)
+    }
+    return arr.sort((a, b) => (b.items[0]?.updatedAt ?? 0) - (a.items[0]?.updatedAt ?? 0))
+  }, [conversations, showArchived, t])
+
+  const archivedCount = conversations.filter(c => c.archived).length
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* 面板标题 */}
+      <div
+        className="flex items-center justify-between px-3 py-2 flex-shrink-0"
+        style={{ borderBottom: '1px solid var(--color-border)' }}
+      >
+        <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+          {t('agent.allConversations')}
+        </span>
+        <div className="flex items-center gap-1">
+          {/* 归档开关（有归档项时才出现，2026-09-22） */}
+          {archivedCount > 0 && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowArchived(v => !v)}
+              className={showArchived ? 'text-xs text-[var(--color-accent)]' : 'text-xs text-[var(--color-text-muted)]'}
+            >
+              {t('agent.showArchived')} ({archivedCount})
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => setShowHistory(false)}
+            className="text-xs text-[var(--color-text-muted)]"
+          >
+            {t('action.close')}
+          </Button>
+        </div>
+      </div>
+
+      {/* 会话列表：按**工作区**（小说项目）分组 */}
+      <div className="flex-1 overflow-y-auto px-2 py-2">
+        {groups.length === 0 ? (
+          <div className="flex items-center justify-center h-24 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+            {t('agent.noConversations')}
+          </div>
+        ) : (
+          groups.map(g => (
+            <div key={g.key} className="mb-2">
+              {renamingWs === g.key ? (
+                /* 工作区重命名（内联输入；只改显示名，不动磁盘上的实际项目） */
+                <div className="flex items-center px-2 py-1 rounded" style={{ backgroundColor: 'var(--color-hover)' }}>
+                  <input
+                    autoFocus
+                    value={wsDraft}
+                    onChange={e => setWsDraft(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') { renameWorkspace(g.key, wsDraft); setRenamingWs(null) }
+                      if (e.key === 'Escape') setRenamingWs(null)
+                    }}
+                    onBlur={() => { renameWorkspace(g.key, wsDraft); setRenamingWs(null) }}
+                    className="flex-1 min-w-0 text-micro bg-transparent outline-none"
+                    style={{ color: 'var(--color-text)' }}
+                  />
+                </div>
+              ) : (
+                <div className="group/ws flex items-center gap-0.5 px-2 py-1">
+                  {/* 折叠箭头 + 工作区名 + 会话数（点整行切换折叠） */}
+                  <button
+                    onClick={() => setCollapsed(c => ({ ...c, [g.key]: !c[g.key] }))}
+                    className="flex items-center gap-1 flex-1 min-w-0 cursor-pointer text-micro font-medium"
+                    style={{ color: 'var(--color-text-muted)' }}
+                    title={g.name}
+                  >
+                    <ChevronRight
+                      size={10}
+                      className={collapsed[g.key] ? '' : 'rotate-90'}
+                      style={{ transition: 'transform 0.15s', flexShrink: 0 }}
+                    />
+                    <span className="truncate">{g.name}</span>
+                    <span className="flex-shrink-0 opacity-60">({g.items.length})</span>
+                  </button>
+                  {/* 工作区操作：新建对话 / 重命名 / 删除（hover 显示；尺寸与间距同会话行 —— 2026-10-16 回退到 20×20 + gap-0.5） */}
+                  <div
+                    className={`${ACT_BAR} flex-shrink-0 opacity-0 group-hover/ws:opacity-100 group-focus-within/ws:opacity-100 transition-opacity duration-150`}
+                    style={{ color: 'var(--color-text-secondary)' }}
+                  >
+                    <button
+                      type="button"
+                      className={ACT_BTN}
+                      title={t('agent.newChatInWorkspace')}
+                      aria-label={t('agent.newChatInWorkspace')}
+                      onClick={() => createConversation({
+                        // 空串 = 不关联项目（未关联项目组）；传 undefined 会回落到「当前项目」而非留空
+                        projectPath: g.key === '__none__' ? '' : g.key,
+                        projectName: g.name,
+                      })}
+                    >
+                      <Plus size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      className={ACT_BTN}
+                      title={t('agent.renameWorkspace')}
+                      aria-label={t('agent.renameWorkspace')}
+                      onClick={() => { setWsDraft(g.name); setRenamingWs(g.key) }}
+                    >
+                      <Pencil size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      className={ACT_BTN}
+                      title={t('agent.deleteWorkspace')}
+                      aria-label={t('agent.deleteWorkspace')}
+                      onClick={async () => {
+                        const ok = await confirm(
+                          t('agent.deleteWorkspaceConfirm')
+                            .replace('{name}', g.name)
+                            .replace('{count}', String(g.items.length)),
+                          { danger: true, confirmText: t('agent.deleteWorkspace') },
+                        )
+                        if (ok) deleteWorkspace(g.key)
+                      }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                </div>
+              )}
+              {!collapsed[g.key] && g.items.map(conv => (
+                <RecentConversationItem
+                  key={conv.id}
+                  title={conv.title}
+                  updatedAt={conv.updatedAt}
+                  parentTitle={conv.parentId ? titleById.get(conv.parentId) : undefined}
+                  isActive={conv.id === activeConversationId}
+                  pinned={conv.pinned}
+                  archived={conv.archived}
+                  onClick={() => selectConversation(conv.id)}
+                  menuOpen={openMenuId === conv.id}
+                  onMenuOpenChange={open => setOpenMenuId(cur => (open ? conv.id : cur === conv.id ? null : cur))}
+                  onDelete={async () => {
+                    const ok = await confirm(
+                      t('agent.confirmDeleteConversation').replace('{title}', conv.title),
+                      { danger: true, confirmText: t('agent.deleteConversation') },
+                    )
+                    if (ok) deleteConversation(conv.id)
+                  }}
+                  onRename={title => renameConversation(conv.id, title)}
+                  onTogglePin={() => pinConversation(conv.id, !conv.pinned)}
+                  onToggleArchive={() => archiveConversation(conv.id, !conv.archived)}
+                  onDuplicate={() => duplicateConversation(conv.id)}
+                />
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ===== 最近会话列表项 =====
+
+/**
+ * 会话列表行内的小图标按钮统一样式。
+ * ⚠️ 2026-09-27：原写 `w-5 h-5`（rem 制）在本仓 `html{font-size:14px}` 下实渲染 17.5px，
+ * 低于 20×20 底线——旧注释写了「16×16 → 20×20」但数值没改对（标准 §5 的 rem 陷阱）。
+ * ⚠️ 2026-10-16 用户裁决：本轮 32×32 的改动**全部回退**到 20×20（近 4 周里第三次试改这一处）。
+ * 用户要动的是**行的选中范围**，不是按钮尺寸；按「用户的裁决 > 通用标准」处理。
+ * 尺寸走 `w-[20px] h-[20px]` 原生 px 任意值（**不要**写 `w-5 h-5`：那是 17.5px 的历史坑）。
+ * **不要再按标准把它改成 32×32**，除非用户再次提出。
+ */
+const ACT_BTN = 'flex items-center justify-center w-[20px] h-[20px] rounded cursor-pointer hover:opacity-70 focus-visible:outline-2 focus-visible:outline-[var(--color-accent)]'
+/** 操作组排布：`gap-0.5`——原样（与 20px 按钮同批） */
+const ACT_BAR = 'flex items-center gap-0.5'
+
+function RecentConversationItem({
+  title,
+  updatedAt,
+  isActive,
+  parentTitle,
+  pinned,
+  archived,
+  onClick,
+  onDelete,
+  menuOpen,
+  onMenuOpenChange,
+  onRename,
+  onTogglePin,
+  onToggleArchive,
+  onDuplicate,
+}: {
+  title: string
+  updatedAt: number
+  isActive?: boolean
+  /** 父会话标题（有值 = fork 子会话——缩进 + 分支图标 + 标注） */
+  parentTitle?: string
+  pinned?: boolean
+  archived?: boolean
+  onClick: () => void
+  onDelete: () => void
+  /** 「更多」菜单开关：状态由调用方持有 —— 同一列表内互斥（打开 A 行强制关闭 B 行） */
+  menuOpen: boolean
+  onMenuOpenChange: (open: boolean) => void
+  /** 以下四项可选：空状态里的「最近会话」列表不提供这些管理操作 */
+  onRename?: (title: string) => void
+  onTogglePin?: () => void
+  onToggleArchive?: () => void
+  onDuplicate?: () => void
+}) {
+  const { t } = useTranslation()
+  // 内联重命名（2026-09-22）：外层不能是 <button>（里面塞 input 非法），
+  // 因此编辑态走**独立渲染分支**（下方 if (editing) return，input 不进主按钮）。
+  // 2026-09-27 可供性修复：非编辑态由 role="button" 的 div 改为「主按钮 + 工具条兄弟」——
+  // 原形态 onKeyDown 只判 Enter（缺 Space）、且容器内含 5 个真按钮（button 角色不得有交互后代）。
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(title)
+  // 「更多」菜单锚点 = 触发按钮所在的容器（useFloatingPosition 用容器算 fixed 坐标，
+  // 不受列表 overflow 裁剪；264px 面板里绝对定位会被裁掉）
+  const moreAnchorRef = useRef<HTMLDivElement>(null)
+  const moreMenuRef = useFloatingPosition<HTMLDivElement>(moreAnchorRef, menuOpen, { placement: 'below', align: 'end' })
+  // 通用浮层三件套（ui-interaction-standard §1）：Esc + 点击外部 + 菜单项点击时显式关闭。
+  // 「点击外部」的检测范围 = 右侧整块（含触发按钮与菜单本体）——若只包触发按钮，
+  // mousedown 会先把菜单判成外部并卸载，click 永远落不到菜单项上。
+  const rightRef = useRef<HTMLDivElement>(null)
+  useOutsideClick(rightRef, () => onMenuOpenChange(false), menuOpen)
+  useEscapeKey(() => onMenuOpenChange(false), menuOpen)
+
+  if (editing) {
+    return (
+      <div className={`w-full flex items-center rounded px-2 py-1 box-border${parentTitle ? ' pl-5' : ''}`} style={{ backgroundColor: 'var(--color-hover)' }}>
+        <input
+          autoFocus
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') { onRename?.(draft); setEditing(false) }
+            if (e.key === 'Escape') { setDraft(title); setEditing(false) }
+          }}
+          onBlur={() => { onRename?.(draft); setEditing(false) }}
+          className="flex-1 min-w-0 text-xs bg-transparent outline-none"
+          style={{ color: 'var(--color-text)' }}
+        />
+      </div>
+    )
+  }
+
+  return (
+    /* ⚠️ 命名 group（`group/row`）：本行**自身**点亮 —— 悬停/键盘聚焦时整行出 `--color-hover` 底，
+       这就是「选中历史对话的范围」= 整行（此前只有标题那一小块亮，右侧按钮旁边是一片
+       「亮了却点不动」的空档 —— 用户 2026-10-16 明确指出的问题）。
+       ⚠️ 不能用无名 `group`：外层 `EmptyState` 的最近会话列表也带无名 group（`group-hover` 用于
+       别处），同名会互相触发。 */
+    <div
+      className={`group/row w-full flex flex-row items-center justify-between overflow-hidden rounded py-1.5 text-left px-2 box-border transition-colors hover:bg-[var(--color-hover)]${parentTitle ? ' pl-5' : ''}`}
+      style={{ backgroundColor: isActive ? 'var(--color-hover)' : undefined }}
+    >
+      {/* 主区域 = 原生 button（键盘 Tab/Enter/Space 可达）。**自身不再点亮**：整行的悬停底由上面的
+          行容器承担 —— 否则会出现「主按钮一块亮 + 行另一块亮」的双底，且两者之间有空档。
+          点击面 = 这一块 + 右侧操作按钮之外的整行；行内没有别的可点元素，故不存在死带。 */}
+      <button
+        type="button"
+        onClick={onClick}
+        className="flex items-center gap-x-1 overflow-hidden flex-1 min-w-0 text-left cursor-pointer"
+      >
+        {pinned && <Pin size={10} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />}
+        <span
+          className="truncate text-xs"
+          style={{ color: 'var(--color-text)', opacity: isActive ? 1 : 0.65 }}
+        >
+          {title}
+        </span>
+        {/* fork 子会话标注：分支图标 + 「来自『父标题』」（固定 pl-5 缩进，无布局跳动） */}
+        {parentTitle && (
+          <span className="flex items-center gap-1 min-w-0">
+            <GitFork size={10} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+            <span className="text-micro truncate" style={{ color: 'var(--color-text-muted)' }}>
+              {t('agent.forkedFrom').replace('{title}', parentTitle)}
+            </span>
+          </span>
+        )}
+      </button>
+
+      {/* 右侧：**按内容自适应**（不再写死 88px —— 那正是「hover 亮起却点不动」的根因：
+          5×20 + 4×gap = 107px 已溢出容器）。时间与操作组用 grid 叠在同一格做 opacity 交叉渐隐，
+          hover/focus 时**零布局跳动**。
+          ⚠️ 2026-10-16 用户裁决：**要修的是「这一行的选中范围」** —— 行的悬停/点击必须覆盖整行，
+          不能只有标题那一小块亮、右侧按钮旁边却是一片「亮了点不动」的空档。做法是让悬停底色
+          与点击面都落在**整行**上（行容器 `group` + 覆盖整行的主按钮），操作按钮作覆盖其上的兄弟，
+          只有按钮自己那一小块拦截点击。按钮尺寸回退到 20×20（用户要求改回原样式）。 */}
+      <div ref={rightRef} className="flex-shrink-0 ml-1 grid items-center justify-items-end" style={{ minHeight: 20 }}>
+        <span
+          className={`col-start-1 row-start-1 text-micro whitespace-nowrap transition-opacity duration-150 ${
+            menuOpen ? 'opacity-0' : 'opacity-60 group-hover/row:opacity-0 group-focus-within/row:opacity-0'
+          }`}
+          style={{ color: 'var(--color-text-muted)' }}
+        >
+          {formatRelativeTime(updatedAt)}
+        </span>
+        {/* 操作组（2026-09-22）：置顶 / 重命名 常驻为兄弟按钮，分叉 / 归档 / 删除 收进「更多」菜单
+            （5 个横排按原尺寸也会溢出窄面板 —— 保持「更多」菜单的收纳）。
+            2026-09-27：不再需要 stopPropagation（外层已无点击处理器）；
+            2026-10-16：按钮尺寸/间距回退到 20×20 + gap-0.5（用户要求改回原样式） */}
+        <div
+          className={`col-start-1 row-start-1 ${ACT_BAR} transition-opacity duration-150 ${
+            menuOpen ? 'opacity-100' : 'opacity-0 group-hover/row:opacity-100 group-focus-within/row:opacity-100'
+          }`}
+          style={{ color: 'var(--color-text-secondary)' }}
+        >
+          {/* 以下两项主操作仅在调用方提供回调时渲染（空状态的「最近会话」列表不提供） */}
+          {onTogglePin && (
+            <button
+              type="button"
+              className={ACT_BTN}
+              title={pinned ? t('agent.unpinConversation') : t('agent.pinConversation')}
+              aria-label={pinned ? t('agent.unpinConversation') : t('agent.pinConversation')}
+              onClick={() => onTogglePin?.()}
+            >
+              <Pin size={12} />
+            </button>
+          )}
+          {onRename && (
+            <button
+              type="button"
+              className={ACT_BTN}
+              title={t('agent.renameConversation')}
+              aria-label={t('agent.renameConversation')}
+              onClick={() => { onMenuOpenChange(false); setDraft(title); setEditing(true) }}
+            >
+              <Pencil size={12} />
+            </button>
+          )}
+          {/* 「更多」触发器：自身尺寸同 ACT_BTN；菜单项不参与行 hover */}
+          <div className="relative" ref={moreAnchorRef}>
+            <button
+              type="button"
+              className={ACT_BTN}
+              title={t('tip.moreOptions')}
+              aria-label={t('tip.moreOptions')}
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              onClick={() => onMenuOpenChange(!menuOpen)}
+            >
+              <MoreHorizontal size={14} />
+            </button>
+          </div>
+        </div>
+        {/* 菜单渲染在操作组**之外**：操作组带 opacity 门控，套在里面会连菜单一起透明 */}
+        {menuOpen && (
+          <PopoverSurface ref={moreMenuRef} className="py-1" style={{ minWidth: 180 }}>
+            {onDuplicate && (
+              <MenuItem
+                icon={<GitFork size={12} />}
+                label={t('agent.duplicateConversation')}
+                onClick={() => { onMenuOpenChange(false); onDuplicate() }}
+              />
+            )}
+            {onToggleArchive && (
+              <MenuItem
+                icon={<Archive size={12} />}
+                label={archived ? t('agent.unarchiveConversation') : t('agent.archiveConversation')}
+                onClick={() => { onMenuOpenChange(false); onToggleArchive() }}
+              />
+            )}
+            {/* 删除 = 不可逆且低频：菜单末尾 + danger 着色 + 既有二次确认 */}
+            <MenuItem
+              icon={<Trash2 size={12} />}
+              label={t('agent.deleteConversation')}
+              danger
+              onClick={() => { onMenuOpenChange(false); onDelete() }}
+            />
+          </PopoverSurface>
+        )}
+      </div>
+    </div>
+  )
+}
+
+

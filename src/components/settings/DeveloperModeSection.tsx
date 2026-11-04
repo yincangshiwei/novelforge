@@ -1,0 +1,409 @@
+/**
+ * DeveloperModeSection — 开发者模式设置
+ *
+ * 接入外部程序 API（如本地浏览器服务）：配置基础地址 + 请求头 + 超时。
+ * 启用后程序内 AI 可通过工具 call_external_api 调用该 API。
+ * 安全：base URL 由主进程读取（LLM 只能传相对 path）；仅 http/https；响应 1MB 截断。
+ */
+import { useState, useEffect } from 'react'
+import { Save, Plug, ShieldAlert, HelpCircle, Globe, FileText, Terminal } from 'lucide-react'
+import { Spinner } from '../ui/Spinner'
+import { useTranslation } from '../../hooks/useTranslation'
+import type { TextKey } from '../../shared/locale'
+import { ipc } from '../../services/ipc-client'
+import { Button } from '../ui/Button'
+import { Input } from '../ui/Input'
+import { Textarea } from '../ui/Textarea'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../ui/Dialog'
+import { toast } from '../ui/Toast'
+import { renderLog } from '../../services/render-logger'
+import { useLayoutStore } from '../../stores/layout-store'
+import { useDevConsoleStore } from '../../stores/dev-console-store'
+import type { GlobalConfig } from '../../shared/ipc-channels'
+
+/** 默认超时（ms） */
+const DEFAULT_TIMEOUT = 15000
+
+export default function DeveloperModeSection() {
+  const { t } = useTranslation()
+  const [enabled, setEnabled] = useState(false)
+  const [consoleEnabled, setConsoleEnabled] = useState(false)
+  const devConsoleEnabled = useDevConsoleStore((s) => s.enabled)
+  const [apiBaseUrl, setApiBaseUrl] = useState('')
+  const [headersText, setHeadersText] = useState('{}')
+  const [timeoutMs, setTimeoutMs] = useState(DEFAULT_TIMEOUT)
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<{ success: boolean; error?: string } | null>(null)
+  const [guideOpen, setGuideOpen] = useState(false)
+  // 浏览器接入（内置 CDP）
+  const [browserEnabled, setBrowserEnabled] = useState(false)
+  const [browserPort, setBrowserPort] = useState(9222)
+  const [browserTesting, setBrowserTesting] = useState(false)
+  const [browserTestResult, setBrowserTestResult] = useState<{ success: boolean; version?: string; error?: string } | null>(null)
+  // 日志保留（双约束：数量 + 时间窗）
+  const [retentionFiles, setRetentionFiles] = useState(5)
+  const [retentionDays, setRetentionDays] = useState(7)
+
+  useEffect(() => {
+    ipc.invoke('config:get').then((cfg) => {
+      const cfg2 = cfg as GlobalConfig | null
+      const dev = cfg2?.devMode
+      if (dev) {
+        setEnabled(dev.enabled ?? false)
+        setConsoleEnabled(dev.consoleEnabled ?? false)
+        setApiBaseUrl(dev.apiBaseUrl ?? '')
+        setHeadersText(dev.headers ? JSON.stringify(dev.headers, null, 2) : '{}')
+        setTimeoutMs(dev.timeoutMs ?? DEFAULT_TIMEOUT)
+      }
+      const browser = cfg2?.devBrowser
+      if (browser) {
+        setBrowserEnabled(browser.enabled ?? false)
+        setBrowserPort(browser.cdpPort ?? 9222)
+      }
+      const retention = cfg2?.logRetention
+      if (retention) {
+        setRetentionFiles(retention.files ?? 5)
+        setRetentionDays(retention.days ?? 7)
+      }
+    }).catch(() => { })
+  }, [])
+
+  /** 保存配置（JSON headers 校验） */
+  const handleSave = async () => {
+    let headers: Record<string, string> = {}
+    try {
+      const parsed = JSON.parse(headersText || '{}')
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        // 值类型校验：fetch 要求字符串值（数字/布尔会导致 undici 报错，难定位）
+        if (Object.values(parsed).every(v => typeof v === 'string')) {
+          headers = parsed as Record<string, string>
+        } else {
+          throw new Error(t('error.headersValueString'))
+        }
+      } else {
+        throw new Error(t('error.headersNotJsonObject'))
+      }
+    } catch {
+      toast.error(t('dev.headersInvalid'))
+      return
+    }
+    const t0 = Date.now()
+    setSaving(true)
+    try {
+      await ipc.invoke('config:set', {
+        devMode: { enabled, consoleEnabled, apiBaseUrl: apiBaseUrl.trim(), headers, timeoutMs: timeoutMs || DEFAULT_TIMEOUT },
+        devBrowser: { enabled: browserEnabled, cdpPort: browserPort || 9222 },
+        // 日志保留（钳制：1-30 个文件 / 1-365 天）
+        logRetention: {
+          files: Math.min(Math.max(retentionFiles || 5, 1), 30),
+          days: Math.min(Math.max(retentionDays || 7, 1), 365),
+        },
+      })
+      renderLog('info', 'Save:Settings', t('log.render.devModeSaveSuccess').replace('{ms}', String(Date.now() - t0)))
+      toast.success(t('save.success'))
+      void useDevConsoleStore.getState().refresh()
+    } catch (e) {
+      renderLog('error', 'Save:Settings', t('log.render.devModeSaveFailed').replace('{error}', () => String(e)))
+      toast.error(t('save.failed').replace('{error}', String(e)))
+    }
+    setSaving(false)
+  }
+
+  /** 测试连接（传 UI 当前地址——未保存也能正确测试） */
+  const handleTest = async () => {
+    setTesting(true)
+    setTestResult(null)
+    const res = await ipc.invoke('dev:test', { apiBaseUrl: apiBaseUrl.trim() })
+    setTesting(false)
+    setTestResult(res.success
+      ? { success: true }
+      : { success: false, error: res.error })
+  }
+
+  /** 测试浏览器 CDP 连接（传 UI 当前端口——未保存也能正确测试） */
+  const handleBrowserTest = async () => {
+    setBrowserTesting(true)
+    setBrowserTestResult(null)
+    const res = await ipc.invoke('browser:test', { cdpPort: browserPort || 9222 })
+    setBrowserTesting(false)
+    setBrowserTestResult(res)
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* 启用开关 */}
+      <div className="flex items-center justify-between p-3 rounded-xl" style={{ border: '1px solid var(--color-border)', backgroundColor: 'var(--color-panel)' }}>
+        <div className="flex items-center gap-2 min-w-0">
+          <Plug size={14} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+          <span className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>{t('dev.enabled')}</span>
+        </div>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+          className="w-4 h-4 accent-[var(--color-accent)] cursor-pointer flex-shrink-0"
+        />
+      </div>
+
+      {/* 安全提示 */}
+      <div className="flex items-start gap-2 p-3 rounded-xl text-xs" style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-text-muted)' }}>
+        <ShieldAlert size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+        <span>{t('dev.hint')}</span>
+      </div>
+
+      {/* 开发者控制台 */}
+      <div className="p-3 rounded-xl space-y-3" style={{ border: '1px solid var(--color-border)', backgroundColor: 'var(--color-panel)' }}>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <Terminal size={14} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+            <div className="min-w-0">
+              <div className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{t('dev.consoleEnable')}</div>
+              <div className="text-micro mt-0.5" style={{ color: 'var(--color-text-muted)' }}>{t('dev.consoleEnableHint')}</div>
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            checked={consoleEnabled}
+            onChange={(e) => setConsoleEnabled(e.target.checked)}
+            className="w-4 h-4 accent-[var(--color-accent)] cursor-pointer flex-shrink-0"
+          />
+        </div>
+        {devConsoleEnabled && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              useLayoutStore.getState().closeSettings()
+              useLayoutStore.getState().openDevConsole()
+            }}
+          >
+            <Terminal size={12} />
+            {t('dev.consoleOpen')}
+          </Button>
+        )}
+      </div>
+
+      {/* 配置表单 */}
+      <div className="space-y-3">
+        <div>
+          <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>{t('dev.apiBaseUrl')}</label>
+          <Input
+            value={apiBaseUrl}
+            onChange={(e) => setApiBaseUrl(e.target.value)}
+            placeholder="http://localhost:9223"
+            className="h-8 text-xs"
+          />
+        </div>
+
+        <div>
+          <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>{t('dev.headers')}</label>
+          {/* 描边/底色/焦点环/禁用态走 ui/Textarea；仅保留此处特有的圆角、内边距与等宽字体 */}
+          <Textarea
+            value={headersText}
+            onChange={(e) => setHeadersText(e.target.value)}
+            rows={4}
+            className="rounded-lg px-3 py-2 font-mono"
+            spellCheck={false}
+          />
+        </div>
+
+        <div>
+          <label className="block text-xs mb-1" style={{ color: 'var(--color-text-muted)' }}>{t('dev.timeout')}</label>
+          <Input
+            type="number"
+            value={timeoutMs}
+            onChange={(e) => setTimeoutMs(Number(e.target.value))}
+            className="h-8 text-xs w-40"
+          />
+        </div>
+      </div>
+
+      {/* 浏览器接入（内置 CDP，开箱即用） */}
+      <div className="p-3 rounded-xl space-y-3" style={{ border: '1px solid var(--color-border)', backgroundColor: 'var(--color-panel)' }}>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2 min-w-0">
+            <Globe size={14} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+            <div className="min-w-0">
+              <div className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{t('dev.browserTitle')}</div>
+              <div className="text-micro mt-0.5" style={{ color: 'var(--color-text-muted)' }}>{t('dev.browserDesc')}</div>
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            checked={browserEnabled}
+            onChange={(e) => setBrowserEnabled(e.target.checked)}
+            className="w-4 h-4 accent-[var(--color-accent)] cursor-pointer flex-shrink-0"
+          />
+        </div>
+
+        {browserEnabled && (
+          <>
+            <div className="flex items-center gap-3">
+              <label className="text-xs flex-shrink-0" style={{ color: 'var(--color-text-muted)' }}>{t('dev.browserPort')}</label>
+              <Input
+                type="number"
+                value={browserPort || ''}
+                placeholder="9222"
+                onChange={(e) => setBrowserPort(Number(e.target.value))}
+                className="h-7 text-xs w-28"
+              />
+              <Button variant="outline" size="sm" onClick={handleBrowserTest} disabled={browserTesting}>
+                {browserTesting ? <Spinner size={12}  /> : <Globe size={12} />}
+                {t('dev.browserTest')}
+              </Button>
+            </div>
+            <div className="text-micro" style={{ color: 'var(--color-text-muted)' }}>
+              {t('dev.browserLaunchHint').replace('{port}', String(browserPort || 9222))}
+            </div>
+            <div className="text-micro" style={{ color: 'var(--color-text-muted)' }}>
+              {t('dev.browserToolHint')}
+            </div>
+            {browserTestResult && (
+              <div
+                className={`text-xs p-2 rounded break-all ${
+                  browserTestResult.success
+                    ? 'border border-[var(--color-success)]/20 text-[var(--color-success)]'
+                    : 'border border-[var(--color-error)]/20 text-[var(--color-error)]'
+                }`}
+                style={{ backgroundColor: browserTestResult.success ? 'color-mix(in srgb, var(--color-success) 8%, transparent)' : 'color-mix(in srgb, var(--color-error) 8%, transparent)' }}
+              >
+                {browserTestResult.success
+                  ? `✅ ${t('dev.browserTestSuccess').replace('{version}', browserTestResult.version ?? '')}`
+                  : `❌ ${t('dev.browserTestFailed').replace('{error}', browserTestResult.error ?? '')}`}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* 日志保留（双约束清理） */}
+      <div className="p-3 rounded-xl space-y-3" style={{ border: '1px solid var(--color-border)', backgroundColor: 'var(--color-panel)' }}>
+        <div className="flex items-center gap-2 min-w-0">
+          <FileText size={14} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+          <div className="min-w-0">
+            <div className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{t('dev.logRetentionTitle')}</div>
+            <div className="text-micro mt-0.5" style={{ color: 'var(--color-text-muted)' }}>{t('dev.logRetentionDesc')}</div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <label className="text-xs flex-shrink-0" style={{ color: 'var(--color-text-muted)' }}>{t('dev.logRetentionFiles')}</label>
+          <Input
+            type="number"
+            min={1} max={30}
+            value={retentionFiles || ''}
+            onChange={(e) => setRetentionFiles(Number(e.target.value))}
+            className="h-7 text-xs w-20"
+          />
+          <label className="text-xs flex-shrink-0" style={{ color: 'var(--color-text-muted)' }}>{t('dev.logRetentionDays')}</label>
+          <Input
+            type="number"
+            min={1} max={365}
+            value={retentionDays || ''}
+            onChange={(e) => setRetentionDays(Number(e.target.value))}
+            className="h-7 text-xs w-20"
+          />
+        </div>
+      </div>
+
+      {/* 操作按钮 */}
+      <div className="flex items-center gap-2">
+        <Button variant="outline" size="sm" onClick={handleTest} disabled={testing || !enabled}>
+          {testing ? <Spinner size={12}  /> : <Plug size={12} />}
+          {t('dev.test')}
+        </Button>
+        <Button variant="default" size="sm" onClick={handleSave} disabled={saving}>
+          <Save size={12} />
+          {t('action.save')}
+        </Button>
+        <Button variant="ghost" size="sm" onClick={() => setGuideOpen(true)} title={t('dev.guide')}>
+          <HelpCircle size={12} />
+          {t('dev.guide')}
+        </Button>
+      </div>
+
+      {/* 使用说明弹窗 */}
+      <DevGuideDialog open={guideOpen} onOpenChange={setGuideOpen} />
+
+      {/* 测试结果 */}
+      {testResult && (
+        <div
+          className={`text-xs p-2 rounded break-all ${
+            testResult.success
+              ? 'border border-[var(--color-success)]/20 text-[var(--color-success)]'
+              : 'border border-[var(--color-error)]/20 text-[var(--color-error)]'
+          }`}
+          style={{ backgroundColor: testResult.success ? 'color-mix(in srgb, var(--color-success) 8%, transparent)' : 'color-mix(in srgb, var(--color-error) 8%, transparent)' }}
+        >
+          {testResult.success ? `✅ ${t('dev.testSuccess')}` : `❌ ${t('dev.testFailed').replace('{error}', testResult.error ?? '')}`}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 使用说明弹窗（三步 + 示例 + 要点） */
+function DevGuideDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+  const { t } = useTranslation()
+  const exampleBase = 'http://localhost:9223'
+  const example1 = t('dev.guideEx1')
+  const example2 = t('dev.guideEx2')
+  const example3 = t('dev.guideEx3')
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader className="pr-10">
+          <DialogTitle>{t('dev.guideTitle')}</DialogTitle>
+        </DialogHeader>
+        <div className="px-6 pb-5 space-y-4 text-xs leading-relaxed max-h-[60vh] overflow-y-auto" style={{ color: 'var(--color-text-secondary)' }}>
+          {/* 步骤 1 */}
+          <div>
+            <div className="font-semibold mb-1" style={{ color: 'var(--color-text)' }}>{t('dev.guideStep1Title')}</div>
+            <div>{t('dev.guideStep1')}</div>
+          </div>
+
+          {/* 步骤 2：示例代码块 */}
+          <div>
+            <div className="font-semibold mb-1" style={{ color: 'var(--color-text)' }}>{t('dev.guideStep2Title')}</div>
+            <div className="mb-1">{t('dev.guideStep2')}</div>
+            <pre
+              className="p-2 rounded-lg font-mono text-micro overflow-x-auto"
+              style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-accent)' }}
+            >
+              {`${t('dev.apiBaseUrl')}: ${exampleBase}\n${t('dev.headers')}: {}`}
+            </pre>
+          </div>
+
+          {/* 步骤 3：AI 对话示例 */}
+          <div>
+            <div className="font-semibold mb-1" style={{ color: 'var(--color-text)' }}>{t('dev.guideStep3Title')}</div>
+            <div className="mb-1">{t('dev.guideStep3')}</div>
+            <div className="space-y-1">
+              {[example1, example2, example3].map((ex, i) => (
+                <pre
+                  key={i}
+                  className="p-2 rounded-lg font-mono text-micro overflow-x-auto whitespace-pre-wrap break-all"
+                  style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-text)' }}
+                >
+                  {ex}
+                </pre>
+              ))}
+            </div>
+          </div>
+
+          {/* 要点 */}
+          <div>
+            <div className="font-semibold mb-1" style={{ color: 'var(--color-text)' }}>{t('dev.guideTipsTitle')}</div>
+            <ul className="space-y-1 list-disc pl-4">
+              {[1, 2, 3, 4, 5].map(n => (
+                <li key={n}>{t(`dev.guideTip${n}` as TextKey)}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}

@@ -1,0 +1,285 @@
+<div align="center">
+
+# 🔥 NovelForge — AI Novel Writing IDE
+
+**An AI-powered integrated development environment built for web novel authors.**
+
+[![React](https://img.shields.io/badge/React-19-blue.svg)](https://reactjs.org/)
+[![Electron](https://img.shields.io/badge/Electron-41-black.svg)](https://www.electronjs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-6-3178C6.svg)](https://www.typescriptlang.org/)
+[![Version](https://img.shields.io/badge/Version-0.1.7--beta.3-orange.svg)](package.json)
+[Upstream CI (not this version)](https://github.com/LunaRime/novelforge/actions/workflows/build.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-yellow.svg)](https://opensource.org/licenses/GPL-3.0)
+
+[🇬🇧 English] &nbsp; [🇨🇳 中文](README.md)
+
+</div>
+
+---
+
+> **NovelForge** is an open-source, privacy-first AI writing IDE. It deeply integrates LLM-driven full workflows with a local RAG knowledge base, delivering an IDE-grade immersive writing experience. Supports **zh-CN / en-US / ru-RU** trilingual interface.
+
+## About This Repository
+
+This repository is an independently modified version based on [LunaRime/novelforge](https://github.com/LunaRime/novelforge). It is not the official upstream repository and does not claim original authorship of the entire codebase. Upstream attribution and the GNU GPL v3 license are retained. See [Derivative Version Notice](NOTICE.md) for provenance, modifications, and distribution notes.
+
+### Local Modifications (2026-11-04)
+
+- **Windows packaging fixes**: an `afterPack` resource hook restores EXE icons and version information while checking ASAR integrity resources; the NSIS output subdirectory is created before packaging. This resource-editing path does not automatically sign the application EXE and is not a replacement for release signing.
+- **Project renaming**: adds a current-project rename action and synchronizes the database name, recent-project list, and UI without moving the project directory.
+- **Return finalized text to draft**: adds a confirmed action to make finalized database text editable again. Text, versions, and existing post-processing results are preserved; knowledge-base, memory, and character updates are not rolled back.
+- **Agent workflow claim verification**: checks common workflow start/completion claims against this turn's tool receipts and actual task status, retracts unsupported claims, links task cards to `runId` and the matching output, persists the latest 50 workflow records per project, and rejects empty drafts or failed database saves instead of reporting success.
+
+These modifications belong to this derivative version and do not imply upstream acceptance or release. Packaging changes have targeted tests; a full installer build and installed-app verification are still required.
+
+---
+
+### 🔔 Important Note on Versioning
+
+> Starting from v2.5.2, NovelForge has officially entered the **0.y.z early development phase**. This is not a "regression" — it's an honest signal to the community about where the project stands:
+>
+> - LLM output quality and UI interactions are still being actively tuned
+> - Core APIs and workflows have not yet stabilized; breaking changes may occur
+> - Each `0.x.x` release is one small step toward the goal: "making AI write satisfying fiction"
+>
+> We welcome you to join as an **early tester** — the more feedback we get, the faster the project matures.
+
+---
+
+## 📸 Screenshots
+
+| Main Editor (Chinese) | Main Editor (English) |
+|-----------------------|----------------------|
+| ![Chinese UI](screenshots/main-editor-zh.png) | ![English UI](screenshots/main-editor-en.png) |
+
+| Welcome (English) | Welcome (Chinese) |
+|-------------------|-------------------|
+| ![Welcome](screenshots/welcome-en.png) | ![Welcome ZH](screenshots/welcome-zh.png) |
+
+| Model & Provider Setup | Settings (English) |
+|------------------------|--------------------|
+| ![Settings](screenshots/settings-zh.png) | ![Settings EN](screenshots/settings-en.png) |
+
+---
+
+## Why NovelForge?
+
+Writing a web novel is not just about typing words — it's about managing a complex system of characters, plot threads, worldbuilding rules, and chapter-level pacing across hundreds of chapters. Traditional writing tools treat this like a text document. NovelForge treats it like a software project.
+
+| Pain Point | NovelForge Solution |
+|------------|---------------------|
+| Losing track of characters across 100+ chapters | Character cards with cross-chapter dynamic tracking + voice consistency analysis |
+| Forgetting foreshadowing planted 50 chapters ago | Automatic foreshadowing scanner + resolution detector |
+| Spending $200+/month on AI API calls | Tiered model routing saves 50-70% + prompt caching cuts input costs by 50% |
+| Copy-pasting context between AI chat and editor | AI agent directly reads/writes your project — context is automatic |
+| No way to compare draft versions | Multi-draft parallel generation with AI auto-scoring |
+| Privacy concerns with cloud writing tools | 100% local storage: SQLite + LanceDB, works offline |
+
+## How It Works
+
+![NovelForge architecture](screenshots/architecture.en.png)
+
+> Author → Interface → IPC Trust Bridge → Creation Engine → LLM Services. Chapters, settings and the vector
+> index all stay **on your machine** — only model calls go online.
+> Generated with [archify](https://github.com/tt-a1i/archify) from `docs/diagrams/novelforge-architecture.en.json`
+> (Chinese version in [README.md](README.md)).
+
+The chapter pipeline itself: 📋 Blueprint → ✍️ Draft → 🔍 Review → ✨ Finalize → post-process, all backed by a local
+RAG store (SQLite + LanceDB) and gated by your confirmation at every step.
+
+## ✨ Key Features
+
+### 🧬 AI Writing Pipeline
+
+| Feature | Description |
+|---------|-------------|
+| World & Setting Management | Global worldbuilding, plot backbone, character profiles (cross-chapter dynamic tracking) |
+| Auto Outline & Beats | AI generates structural skeleton → chapter beats → scene/emotion/pacing requirements |
+| Auto Chapter Splitting | AI analyzes outline and suggests chapter count, volume structure, and climax positions |
+| Streaming Chapter Generation | Per-chapter streaming typewriter generation with precise context awareness |
+| Chapter Transition Engine | Extracts scene cards from previous 3 chapters and injects into prompts for continuity |
+| Paragraph-Level Rewriting | Expand / condense / style shift / conflict enhance / polish — five modes, no full rewrite |
+| Editorial Board Review | 5-role parallel review (editor-in-chief / plot / prose / continuity / style) + weighted scoring |
+| Character Voice Consistency | Analyzes character dialogue style post-finalization, auto-injects for consistency |
+| Multi-Draft Comparison | Parallel generation of multiple versions per chapter, AI auto-scoring |
+| Foreshadowing Manager | Auto-scans for new foreshadowing + detects resolution of existing threads |
+| Post-Process Pipeline | Ingest → plot extraction → character update → foreshadowing scan → voice analysis → style learning (DAG parallel) |
+| Multilingual Prompt Templates | Built-in templates in EN/RU (19 templates + system constraints + system roles), AI output language follows the UI language |
+
+### 📊 Writing Activity Dashboard
+
+| Feature | Description |
+|---------|-------------|
+| Daily Activity Heatmap | GitHub Contribution-style full-year view, hover for per-day writing/revision/calls/cost |
+| Monthly Trend Chart | 12-month writing trend with year switching for history |
+| Global Statistics | Cross-project aggregation of written words / revisions / model calls / tokens / cost |
+
+### 🔍 Observability
+
+| Feature | Description |
+|---------|-------------|
+| Dual-Environment Logs | Dev (DEBUG full) vs release (INFO+) separate directories; renderer logs persisted + global error capture |
+| LLM Extraction Logs | Call/JSON-parse/self-check retry fully visible, full diagnostics on parse failure |
+| Save Feedback | Toast feedback for every save operation + modular logs (Save:{Module}) |
+
+### 🧠 Million-Word Local Knowledge Base + Vector Engine
+
+| Feature | Description |
+|---------|-------------|
+| LLM + Vector Hybrid Retrieval | Semantic search + full-text search, auto-injected into AI prompts |
+| LLM-as-Vectorization | Use your LLM as the embedding model — no dedicated embedding API needed |
+| Local Embedding Model | Optional local Ollama (e.g. bge-m3) for offline semantic search; four-step fallback: local ⇄ cloud API → LLM → full-text |
+| Chinese Text Search | jieba tokenization + FTS index — Chinese queries no longer degrade to whole-sentence matching |
+| IVF_PQ Vector Index | LanceDB ANN index for large-scale vector search acceleration |
+| 100% Local Storage | SQLite + LanceDB, works offline |
+
+### 💭 AI Memory (Story Memory)
+
+| Feature | Description |
+|---------|-------------|
+| Three-Level Summaries | Finalize a chapter → chapter memory; complete the volume → volume memory; every 3 volumes → book state |
+| Cross-Session Facts | Conversation compaction extracts reusable facts so the next chat starts informed — at no extra cost |
+| Invalidation & Rebuild | Editing volume boundaries or re-finalizing marks affected memory as "needs rebuild"; stale memory stops entering context |
+| Inspect & Edit | The "AI Memory" sidebar group lets you view / edit / delete files and manually rebuild volumes and the book state |
+
+### 💰 Cost Optimization Engine
+
+| Feature | Description |
+|---------|-------------|
+| Tiered Model Routing | elite / standard / budget — three tiers, saves 50-70% |
+| Prompt Caching | Automatic cache hits, cuts input costs by 50% |
+| Real-Time Cost Tracking | Live session cost display in the status bar |
+| Token Budget Engine | Intelligent truncation with system prompt size control |
+
+### 🤖 AI Agent Assistant
+
+| Feature | Description |
+|---------|-------------|
+| Workflow Tool Calls | Agent starts creative tasks through `start_workflow`; prose is not execution, and common start/completion claims are checked against actual receipts |
+| Conversation Branching | Fork a new session from any message / rewind with recovery, branch hierarchy in history panel |
+| Tool Result Spill-to-Disk | Long tool results stored on disk with path + summary in context; LLM re-reads on demand (deterministic naming + dedupe) |
+| Adaptive Context Compression | Budget scales with model window; recoverable errors auto-degrade and retry (withhold-then-recover) |
+| Tools & Skills | 23 built-in tools (read/write, retrieval, editing, workflows) + SKILL.md skill packs (built-in / user / project, Cursor-compatible) |
+| MCP | Plug in any MCP server to extend the tool surface |
+| Context Visibility | Usage ring + detail popover (base / memory / history / current), live cost and cache-hit readout |
+
+### 🛡️ Privacy & Security
+
+| Feature | Description |
+|---------|-------------|
+| Electron Sandbox | `sandbox: true` + IPC allowlist + path sandbox |
+| API Key Encryption | Electron safeStorage encrypted storage |
+| Exponential Backoff Retry | Auto-retry for 429/503/5xx + streaming retry |
+| Database Integrity | SQLite PRAGMA checks + unified timestamps + CHECK constraints |
+
+---
+
+## 🚀 Installation
+
+### 📦 Upstream Pre-built Releases
+
+[Upstream Releases](https://github.com/LunaRime/novelforge/releases) provide upstream binaries, **not the modifications in this repository**. Build this derivative from its own source. Any future binary release should link its corresponding source. Actual upstream release attachments take precedence:
+- **Windows**: `NovelForge-{version}-Installer.exe` (NSIS installer)
+- **Windows**: `NovelForge-{version}-Portable.zip` (portable, extract and run)
+
+### 🔨 Build from Source
+
+#### Requirements
+
+| Tool | Version | Notes |
+|------|---------|-------|
+| **Node.js** | `>= 22.x` | Matches Electron 41's bundled version |
+| **pnpm** | `>= 9.x` | Package manager |
+| **Python** | `>= 3.10` | Required to compile native modules (`better-sqlite3`, `lancedb`) |
+| **C++ Toolchain** | — | Windows: Visual Studio Build Tools · macOS: Xcode CLT · Linux: `build-essential` |
+
+#### Quick Start
+
+Clone or download **this repository**, then enter its project root. Cloning the upstream repository instead will not include the modifications listed above. Once this repository has a hosting URL, obtain its clone URL from the repository page.
+
+```bash
+# Run from the project root of this repository's source
+
+# 2. Install dependencies
+pnpm install
+
+# 3. Development mode (Vite HMR)
+pnpm run dev
+
+# 4. Type check
+pnpm run typecheck
+
+# 5. Run tests
+pnpm run test
+
+# 6. Full build
+npm_config_user_agent="pnpm/9.15.4" \
+CSC_IDENTITY_AUTO_DISCOVERY=false \
+ELECTRON_BUILDER_BINARIES_MIRROR="https://npmmirror.com/mirrors/electron-builder-binaries/" \
+pnpm run build
+```
+
+> **Build environment variables**:
+> - `npm_config_user_agent` — Forces electron-builder to detect pnpm
+> - `CSC_IDENTITY_AUTO_DISCOVERY=false` — Skips code signing (not needed for local builds)
+> - `ELECTRON_BUILDER_BINARIES_MIRROR` — Mirror for faster downloads (essential in China; optional elsewhere)
+>
+> Build output is organized by release type at `release/{type}/{version}/` (`alpha` internal / `beta` public / `stable` release):
+> - `NovelForge-{version}-Portable/` — Portable edition (`.7z` archive auto-generated for beta/stable)
+> - `NovelForge-{version}-Installer/NovelForge-{version}-Installer.exe` — NSIS installer
+> - `latest.yml` / `.blockmap` — electron-updater metadata
+
+#### Windows Build Issues
+
+| Issue | Solution |
+|-------|----------|
+| winCodeSign 7z symlink download failure | Manually extract to `%LOCALAPPDATA%/electron-builder/Cache/winCodeSign/` |
+| NSIS 7z symlink download failure | Extract to `%LOCALAPPDATA%/electron-builder/Cache/nsis/` |
+| pnpm not detected | Set `npm_config_user_agent=pnpm/9.15.4` |
+| GitHub download timeout | Set `ELECTRON_BUILDER_BINARIES_MIRROR` mirror |
+
+#### Native Modules
+
+The project depends on two native modules: `better-sqlite3` and `@lancedb/lancedb`.
+
+```bash
+# Rebuild native modules for Electron's bundled Node version
+pnpm run rebuild
+```
+
+---
+
+## ⚙️ Model Configuration
+
+Supports `OpenAI` · `DeepSeek` · `Gemini` · `Claude` · `Ollama` · `Zhipu GLM` · any OpenAI-compatible API.
+
+- **Provider accounts** — one credential, many models: add a provider and it **fetches the available model list automatically**; tick the models you want and switch between them without re-entering keys
+- **Tiered routing** — assign a model to each of the three tiers (creative writing / standard analysis / lightweight), so expensive models only handle the work that needs them
+- **Local embedding model** — one-click download inside the app (multi-path speed probing + resumable transfer + automatic rerouting when a path stalls)
+
+---
+
+## 🏗️ Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Frontend | React 19 + TypeScript + Zustand + Tailwind CSS + Radix UI |
+| Desktop | Electron 41 + Vite 8 |
+| Data | better-sqlite3 (relational) + LanceDB (vector) |
+| AI | OpenAI Protocol + Gemini Protocol + MCP + ReAct Agent |
+| Testing | Vitest + Storybook |
+| CI/CD | GitHub Actions (ubuntu / windows / macos matrix) |
+
+---
+
+## 📄 License
+
+The upstream GNU GPL v3 license is retained; see [LICENSE](LICENSE). The direct upstream is [LunaRime/novelforge](https://github.com/LunaRime/novelforge), whose README also credits [Vela / heider-x](https://github.com/heider-x/vela) as an earlier source. These credits are preserved without independently confirming the earliest original author or the complete contribution history. See [Derivative Version Notice](NOTICE.md).
+
+This derivative is independently maintained and is not an official upstream release. Binary distributions must provide access to their corresponding source and necessary build scripts while retaining applicable copyright, licensing, and warranty notices.
+
+---
+
+<div align="center">
+<b>NovelForge — Forge your novel with AI.</b>
+</div>

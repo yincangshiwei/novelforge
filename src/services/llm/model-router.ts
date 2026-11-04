@@ -1,0 +1,271 @@
+/**
+ * NovelForge 模型路由器 — 按任务自动选择最优模型
+ *
+ * 三层模型策略：
+ * - Elite: 创意写作、架构规划 → GPT-5.6, Claude Opus, DeepSeek-V4-Pro
+ * - Standard: 审稿、分析、风格检查 → GPT-5.6-Luna, DeepSeek-V4-Flash, Gemini Flash
+ * - Budget: JSON 提取、摘要、分类 → GPT-5.4-Nano, 本地模型
+ *
+ * 预期节省 API 费用 50-70%。
+ */
+
+import type { ModelProfile } from '../../shared/ipc-channels'
+
+// ===== 类型定义 =====
+
+export type ModelTier = 'elite' | 'standard' | 'budget'
+
+export type CallPurpose =
+  // 创意写作（Elite）
+  | 'draft_chapter'
+  | 'refine_chapter'
+  | 'architecture_gen'
+  | 'config_gen'
+  | 'first_draft'
+  // 标准分析（Standard）
+  | 'review_chapter'
+  | 'consistency_check'
+  | 'style_analysis'
+  | 'blueprint_gen'
+  | 'mutual_eval'
+  | 'character_extract'
+  // 轻量操作（Budget）
+  | 'summarize'
+  | 'extract_json'
+  | 'classify'
+  | 'embedding'
+  // Agent
+  | 'agent_chat'
+  | 'agent_tool_exec'
+  // 通用
+  | 'default'
+
+/** 默认的 purpose → tier 映射 */
+export const PURPOSE_TIER_MAP: Record<CallPurpose, ModelTier> = {
+  // Elite
+  draft_chapter: 'elite',
+  refine_chapter: 'elite',
+  architecture_gen: 'elite',
+  config_gen: 'elite',
+  first_draft: 'elite',
+  // Standard
+  review_chapter: 'standard',
+  consistency_check: 'standard',
+  style_analysis: 'standard',
+  blueprint_gen: 'standard',
+  mutual_eval: 'standard',
+  character_extract: 'standard',
+  // Budget
+  summarize: 'budget',
+  extract_json: 'budget',
+  classify: 'budget',
+  embedding: 'budget',
+  // Agent
+  agent_chat: 'standard',
+  agent_tool_exec: 'budget',
+  // 默认
+  default: 'standard',
+}
+
+export interface ModelRouteConfig {
+  elite: string[]
+  standard: string[]
+  budget: string[]
+  /**
+   * 路由策略（A 档）：`static`（默认）= 按 PURPOSE_TIER_MAP 静态定层；
+   * `dynamic` = 按 Agent 对话档位（agentModeToTier）动态定层。
+   * 由 llm-store 消费并随 modelRoutes 一起持久化；ModelRouter 自身只透传、不解释。
+   */
+  strategy?: 'static' | 'dynamic'
+}
+
+/** 默认配置（用户可自定义） */
+export const DEFAULT_ROUTE_CONFIG: ModelRouteConfig = {
+  elite: [],
+  standard: [],
+  budget: [],
+}
+
+/**
+ * 对话档位 → 路由层（A 档动态策略的判据，**零 LLM 成本**）。
+ *
+ * 复用 Agent 对话现成的六档「思考等级」（用户可见、可控的投入旋钮）：
+ * quick/swift = 快速问答 → budget；balanced/reflective = 常规 → standard；deep/max = 深度推理 → elite。
+ * 注意：参数刻意用字符串联合而非 import AgentMode —— 避免 model-router 反向依赖 store。
+ */
+export function agentModeToTier(
+  mode: 'quick' | 'swift' | 'balanced' | 'reflective' | 'deep' | 'max',
+): ModelTier {
+  switch (mode) {
+    case 'quick':
+    case 'swift':
+      return 'budget'
+    case 'deep':
+    case 'max':
+      return 'elite'
+    default:
+      return 'standard'
+  }
+}
+
+// ===== 模型路由器 =====
+
+export class ModelRouter {
+  private config: ModelRouteConfig
+  private models: ModelProfile[]
+
+  constructor(config: ModelRouteConfig, models: ModelProfile[]) {
+    this.config = config
+    this.models = models
+    // ⚠️ 不再自动填充 tier（2026-08-06 产品决策「路由优先，默认模型兜底」）：
+    //    autoDetectTiers 曾按名称启发式填满所有层，导致用户显式默认模型被路由覆盖。
+    //    路由配置只来自用户持久化配置；未配置的层由调用方回退到 defaultModelId。
+  }
+
+  /** 模型是否可用于聊天/生成（排除 embedding 专用模型，防路由把聊天请求发给向量模型） */
+  private isChatModel(model: ModelProfile): boolean {
+    return !model.purposes?.includes('embedding')
+  }
+
+  /**
+   * 根据 purpose 选择最佳可用模型。
+   * `tierOverride` 供动态策略使用（A 档）：给定则跳过静态 purpose→tier 映射、直接定位到该层，
+   * 层内选择与降级链逻辑完全复用；不传时行为与既有一致。
+   */
+  route(purpose: CallPurpose, tierOverride?: ModelTier): string | null {
+    const tier = tierOverride ?? (PURPOSE_TIER_MAP[purpose] || 'standard')
+
+    // 尝试 tier 内的模型（仅聊天模型；embedding 模型可能因 autoDetectTiers 误入各层）
+    const tierModelIds = this.config[tier] || []
+    for (const id of tierModelIds) {
+      const model = this.models.find(m => m.id === id)
+      if (model && this.isChatModel(model)) return id
+    }
+
+    // 降级到下一层
+    return this.fallback(tier)
+  }
+
+  /** 降级链 */
+  private fallback(fromTier: ModelTier): string | null {
+    const fallbackOrder: ModelTier[] =
+      fromTier === 'elite' ? ['standard', 'budget'] :
+      fromTier === 'standard' ? ['elite', 'budget'] :
+      ['standard', 'elite']
+
+    for (const tier of fallbackOrder) {
+      const ids = this.config[tier] || []
+      for (const id of ids) {
+        const model = this.models.find(m => m.id === id)
+        if (model && this.isChatModel(model)) return id
+      }
+    }
+
+    // 所有层均无有效模型 → 返回 null，由调用方（llm-store.getModelForPurpose）
+    // 回退到用户显式默认模型（产品决策：路由优先，默认模型兜底）
+    return null
+  }
+
+  /** 获取模型的 tier */
+  getTier(modelId: string): ModelTier | null {
+    for (const tier of ['elite', 'standard', 'budget'] as ModelTier[]) {
+      if (this.config[tier]?.includes(modelId)) return tier
+    }
+    return null
+  }
+
+  /** 获取某层所有可用模型 */
+  getAvailableInTier(tier: ModelTier): ModelProfile[] {
+    const ids = this.config[tier] || []
+    return ids
+      .map(id => this.models.find(m => m.id === id))
+      .filter((m): m is ModelProfile => !!m)
+  }
+
+  /** 获取所有分层分配 */
+  getAllTiers(): Record<ModelTier, ModelProfile[]> {
+    return {
+      elite: this.getAvailableInTier('elite'),
+      standard: this.getAvailableInTier('standard'),
+      budget: this.getAvailableInTier('budget'),
+    }
+  }
+
+  /**
+   * 估算费用（基于每 1K tokens 价格）
+   * 这些价格已过时，仅作估算参考。
+   */
+  estimateCost(
+    purpose: CallPurpose,
+    estimatedInputTokens: number,
+    estimatedOutputTokens: number,
+  ): { inputCost: number; outputCost: number; totalCost: number; modelId: string } {
+    const modelId = this.route(purpose) || 'unknown'
+    const model = this.models.find(m => m.id === modelId)
+
+    // 粗略价格估算（USD per 1K tokens，2026-08 参考价；具体型号在前，避免 includes 误匹配）
+    const prices: Record<string, { input: number; output: number }> = {
+      'gpt-5.6-sol': { input: 0.005, output: 0.03 },
+      'gpt-5.6-terra': { input: 0.0025, output: 0.015 },
+      'gpt-5.6-luna': { input: 0.001, output: 0.006 },
+      'gpt-5.4-mini': { input: 0.00075, output: 0.0045 },
+      'gpt-5.4-nano': { input: 0.0002, output: 0.00125 },
+      'deepseek-v4-flash': { input: 0.00014, output: 0.00028 },
+      'deepseek-v4-pro': { input: 0.000435, output: 0.00087 },
+      'gemini-3.1-pro-preview': { input: 0.002, output: 0.012 },
+      'gemini-3.6-flash': { input: 0.0015, output: 0.0075 },
+      'gemini-3.5-flash': { input: 0.0015, output: 0.009 },
+      'gemini-3-flash-preview': { input: 0.0005, output: 0.003 },
+      // 旧模型兼容（存量配置仍可能引用）
+      // ⚠️ 顺序即匹配优先级：gpt-4o-mini 必须在 gpt-4o 之前（includes 先命中通用型号会 16 倍误计）
+      'gpt-4o-mini': { input: 0.00015, output: 0.0006 },
+      'gpt-4o': { input: 0.0025, output: 0.01 },
+      'gpt-4-turbo': { input: 0.01, output: 0.03 },
+      'gpt-3.5-turbo': { input: 0.0005, output: 0.0015 },
+      'claude-3-opus': { input: 0.015, output: 0.075 },
+      'claude-3.5-sonnet': { input: 0.003, output: 0.015 },
+      'claude-3-haiku': { input: 0.00025, output: 0.00125 },
+      'gemini-1.5-flash': { input: 0.000075, output: 0.0003 },
+      'gemini-1.5-pro': { input: 0.00125, output: 0.005 },
+    }
+
+    const name = model?.modelName || model?.name || ''
+    let priceKey = 'gpt-4o-mini' // default
+    for (const [key] of Object.entries(prices)) {
+      if (name.toLowerCase().includes(key)) {
+        priceKey = key
+        break
+      }
+    }
+
+    const price = prices[priceKey] || prices['gpt-4o-mini']
+    const inputCost = (estimatedInputTokens / 1000) * price.input
+    const outputCost = (estimatedOutputTokens / 1000) * price.output
+
+    return { inputCost, outputCost, totalCost: inputCost + outputCost, modelId }
+  }
+
+  /** 更新配置 */
+  updateConfig(config: Partial<ModelRouteConfig>): void {
+    if (config.elite) this.config.elite = config.elite
+    if (config.standard) this.config.standard = config.standard
+    if (config.budget) this.config.budget = config.budget
+    if (config.strategy) this.config.strategy = config.strategy
+  }
+
+  /** 更新模型列表 */
+  updateModels(models: ModelProfile[]): void {
+    this.models = models
+    // 不再自动填充 tier（见构造注释——路由配置只来自用户持久化配置）
+  }
+
+  /** 获取配置（含策略；getConfig 是 llm-store 的 state 回写源，漏掉 strategy 会让它被覆盖丢失） */
+  getConfig(): ModelRouteConfig {
+    return {
+      elite: [...this.config.elite],
+      standard: [...this.config.standard],
+      budget: [...this.config.budget],
+      ...(this.config.strategy ? { strategy: this.config.strategy } : {}),
+    }
+  }
+}

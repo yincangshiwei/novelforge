@@ -1,0 +1,343 @@
+import { app, BrowserWindow, Menu, dialog, shell, session } from 'electron'
+import { t } from '../src/shared/locale'
+import { registerIPCHandlers } from './ipc-handlers'
+// L4：registerMCPHandlers 已并入 electron/ipc-handlers.ts 的 registerIPCHandlers()（唯一注册入口）
+import { trustWebContents, untrustWebContents } from './security/ipc-guard'
+// 覆盖层高度常量与 setter 同处一地，避免两处写死的数字错位
+// （main.ts 已通过 ipc-handlers 传递依赖该模块，此处直接引用不引入循环）
+import { TITLEBAR_OVERLAY_HEIGHT } from './controllers/config-controller'
+import { closeProjectDatabase } from './database'
+import { installGlobalErrorHandlers, logger, detectLogEnvironment, LogEnvironment } from './utils/logger'
+import { migrateLegacyDirs } from './utils/config-utils'
+import { runCredentialMigration } from './credentials/migrate'
+import { safeErrorMessage } from './utils/error-utils'
+
+import path from 'node:path'
+import { exec } from 'node:child_process'
+
+// Rolldown CJS 输出中 __dirname 是 Node.js 原生全局变量
+// import.meta.url 在 CJS 中被错误转换为 {}.url，直接使用原生 __dirname 更可靠
+
+// 构建产物目录结构
+process.env.APP_ROOT = path.join(__dirname, '..')
+
+// 打包版开发者控制台显式开关：--devtools 等价于 NOVELFORGE_DEVTOOLS=1
+// （开发态/CLI 隔离实例默认开启；正式用户必须显式传参）
+if (process.argv.includes('--devtools')) process.env.NOVELFORGE_DEVTOOLS = '1'
+
+export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
+export const MAIN_DIST = path.join(process.env.APP_ROOT, 'dist-electron')
+export const RENDERER_DIST = path.join(process.env.APP_ROOT, 'dist')
+
+process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
+  ? path.join(process.env.APP_ROOT, 'public')
+  : RENDERER_DIST
+
+let win: BrowserWindow | null
+
+/**
+ * 构建应用菜单
+ *
+ * Windows/Linux：原生菜单栏的「文件/帮助」功能已迁移至设置界面
+ * （检查更新 / 查看发布页 / 关于 / 卸载 / 退出），故直接隐藏菜单栏。
+ * macOS：保留原生菜单（屏幕顶部菜单栏是平台惯例，非窗口内按键）。
+ */
+function buildAppMenu() {
+  const isMac = process.platform === 'darwin'
+
+  if (!isMac) {
+    Menu.setApplicationMenu(null)
+    return
+  }
+
+  const template: Electron.MenuItemConstructorOptions[] = [
+    // macOS 应用菜单
+    ...(isMac ? [{
+      label: app.getName(),
+      submenu: [
+        { role: 'about' as const, label: t('menu.aboutApp') },
+        { type: 'separator' as const },
+        { role: 'quit' as const, label: t('menu.quitApp') },
+      ],
+    }] : []),
+
+    // 文件
+    {
+      label: t('menu.file'),
+      submenu: [
+        {
+          label: t('menu.checkUpdate'),
+          accelerator: 'CmdOrCtrl+U',
+          click: () => {
+            const focused = BrowserWindow.getFocusedWindow()
+            focused?.webContents.send('menu:check-update')
+          },
+        },
+        { type: 'separator' },
+        isMac ? { role: 'close', label: t('menu.closeWindow') } : { role: 'quit', label: t('menu.quit') },
+      ],
+    },
+
+    // 帮助
+    {
+      label: t('menu.help'),
+      submenu: [
+        {
+          label: t('menu.checkUpdate').replace('...', ''),
+          click: () => {
+            const focused = BrowserWindow.getFocusedWindow()
+            focused?.webContents.send('menu:check-update')
+          },
+        },
+        {
+          label: t('menu.viewReleases'),
+          click: () => {
+            shell.openExternal('https://github.com/LunaRime/novelforge/releases')
+          },
+        },
+        { type: 'separator' },
+        {
+          label: `${t('menu.aboutApp')} v${app.getVersion()}`,
+          click: () => {
+            dialog.showMessageBox({
+              type: 'info',
+              title: t('dialog.aboutTitle'),
+              message: `NovelForge v${app.getVersion()}`,
+              detail: t('dialog.aboutMessage'),
+            })
+          },
+        },
+        { type: 'separator' },
+        {
+          label: t('menu.uninstall'),
+          click: () => {
+            dialog.showMessageBox({
+              type: 'warning',
+              title: t('dialog.uninstallConfirmTitle'),
+              message: t('dialog.uninstallConfirmMsg'),
+              buttons: [t('dialog.buttons.cancel'), t('dialog.buttons.uninstall')],
+              defaultId: 0,
+              cancelId: 0,
+            }).then(({ response }) => {
+              if (response === 1) {
+                const appDir = path.dirname(app.getPath('exe'))
+                const uninstallerPath = path.join(appDir, 'Uninstall NovelForge.exe')
+                exec(`"${uninstallerPath}"`, (err) => {
+                  if (err) {
+                    logger.error('Main', t('log.uninstall.launchFailed').replace('{err}', err.message))
+                    dialog.showErrorBox(
+                      t('dialog.uninstallFailedTitle'),
+                      t('dialog.uninstallFailedMsg').replace('{error}', err.message)
+                    )
+                  }
+                })
+                setTimeout(() => app.quit(), 500)
+              }
+            })
+          },
+        },
+      ],
+    },
+  ]
+
+  const menu = Menu.buildFromTemplate(template)
+  Menu.setApplicationMenu(menu)
+}
+
+function createWindow() {
+  const isMac = process.platform === 'darwin'
+  win = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    minWidth: 1024,
+    minHeight: 640,
+    title: t('window.title'),
+    icon: path.join(process.env.APP_ROOT!, 'build', 'icon.png'),
+    /**
+     * 自定义标题栏 —— **必须按平台分设**。
+     *
+     * ⚠️ 真机实测（2026-09-25）：`titleBarStyle: 'hiddenInset'` 是 **macOS 专有**，
+     * 在 Windows 上被**静默忽略** → 退回标准窗口边框 = 一条系统标题栏（应用图标 + 窗口标题 +
+     * 最小化/最大化/关闭），底色由 Windows 按**系统**主题绘制、**不跟应用主题**。
+     * 用户报的「最上面那一条主题切换时没变」即此。
+     *
+     * 更要紧的是：本应用的布局**从 2026-09-22 起就按「无边框 + 拖拽区在图标栏」设计**
+     * （见 ui-layout-standard），而这条设置在 Windows 上从未生效 —— 即**设计形态没落地**。
+     *
+     * - macOS：`hiddenInset` + 左侧红绿灯
+     * - Windows/Linux：`hidden` 启用**窗口控件覆盖层（WCO）**——系统只画窗口按钮，
+     *   其余区域交还应用。配色由渲染层按当前主题推过来（见 window:set-titlebar-overlay）。
+     */
+    titleBarStyle: isMac ? 'hiddenInset' : 'hidden',
+    ...(isMac ? { trafficLightPosition: { x: 12, y: 10 } } : {}),
+    ...(isMac ? {} : {
+      // 启动瞬间的值：对齐启动闪屏品牌色（图标渐变中段 #3FB884）；渲染层一就绪就换成真实主题色
+      titleBarOverlay: { color: '#3FB884', symbolColor: '#ffffff', height: TITLEBAR_OVERLAY_HEIGHT },
+    }),
+    // 启动瞬间的窗口底色：对齐启动闪屏品牌色（图标渐变中段 #3FB884）
+    backgroundColor: '#3FB884',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      // 安全性设置
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+    },
+  })
+
+  // L4 S6：来源校验白名单 —— 只有显式登记的己方窗口才能调 IPC，未登记者（含未来新增的、
+  // 带 preload 的窗口；以及任何子帧）默认拒绝。窗口销毁时注销，避免 id 复用导致误放行。
+  const trustedId = win.webContents.id
+  trustWebContents(trustedId)
+  win.on('closed', () => { untrustWebContents(trustedId) })
+
+  // 通过 session API 设置 Content-Security-Policy（Electron 推荐方式，防御 XSS）
+  // 开发模式下需要 'unsafe-inline' 支持 Vite HMR 注入脚本 + react-refresh preamble。
+  // ⚠️ P0-1：生产环境（loadFile file://）不经过 webRequest——CSP 已由 index.html 的
+  // meta 标签承担（script-src 'self' 严格模式，内联脚本已外移至 public/theme-init.js、
+  // startup-timer.js）；此处仅 dev 模式生效（与 meta 的 dev 值一致，双保险）。
+  const cspPolicy = [
+    "default-src 'self'",
+    VITE_DEV_SERVER_URL
+      ? "script-src 'self' 'unsafe-inline'"
+      : "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: https:",
+    "font-src 'self' data:",
+    "connect-src 'self' https://*.openai.com https://*.anthropic.com https://*.googleapis.com https://*.deepseek.com https://*.bigmodel.cn http://localhost:* http://127.0.0.1:*",
+    "media-src 'self'",
+  ].join('; ')
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [cspPolicy],
+      },
+    })
+  })
+
+  if (process.platform === 'darwin') {
+    app.dock?.setIcon(path.join(process.env.APP_ROOT!, 'build', 'icon.png'))
+  }
+
+  // 构建应用菜单
+  buildAppMenu()
+
+  // 渲染进程崩溃检测 — 自动提示重载
+  win.webContents.on('render-process-gone', (_event, details) => {
+    logger.error('Main', t('log.main.rendererGone')
+      .replace('{reason}', details.reason)
+      .replace('{exitCode}', String(details.exitCode)))
+    dialog.showErrorBox(
+      t('dialog.crashTitle'),
+      t('dialog.crashMsg')
+    )
+    if (win && !win.isDestroyed()) {
+      win.webContents.reload()
+      win.focus()
+    }
+  })
+
+  // 关闭窗口前检查未保存内容
+  win.on('close', async (e) => {
+    try {
+      // 查询渲染进程是否有脏 tab
+      const hasDirty = await win?.webContents.executeJavaScript(
+        'window.__vela_hasDirtyTabs ? window.__vela_hasDirtyTabs() : false',
+      ).catch(() => false)
+
+      if (hasDirty) {
+        e.preventDefault()
+        const { response } = await dialog.showMessageBox(win!, {
+          type: 'warning',
+          title: t('dialog.unsavedTitle'),
+          message: t('dialog.unsavedMsg'),
+          buttons: [t('dialog.buttons.cancel'), t('dialog.buttons.discardExit')],
+          defaultId: 0,
+          cancelId: 0,
+        })
+        if (response === 1) {
+          // 用户确认退出 — 强制关闭
+          win?.destroy()
+        }
+      }
+    } catch {
+      // IPC 不可用时正常关闭
+    }
+  })
+
+  // 自动化/CLI 入口：--project=<路径> 直接打开项目，避免依赖原生文件选择框与桌面焦点
+  const projectArg = process.argv.find(a => a.startsWith('--project='))?.slice('--project='.length)
+  // 开发者控制台独立入口：不依赖项目，由 CLI 的 --dev-console 触发
+  const devConsoleArg = process.argv.includes('--dev-console')
+  // 隔离实例身份（CLI 注入）：供 CDP 客户端确认连到的确实是本实例
+  const devInstanceArg = process.argv.find(a => a.startsWith('--dev-instance='))?.slice('--dev-instance='.length)
+  const devInstanceId = process.env.NOVELFORGE_DEV_INSTANCE || devInstanceArg
+  if (VITE_DEV_SERVER_URL) {
+    const url = new URL(VITE_DEV_SERVER_URL)
+    if (projectArg) url.searchParams.set('project', projectArg)
+    if (devConsoleArg) url.searchParams.set('devconsole', '1')
+    if (devInstanceId) url.searchParams.set('instance', devInstanceId)
+    win.loadURL(url.toString())
+    logger.info('Main', t('log.main.devMode').replace('{url}', url.toString()))
+  } else {
+    const query: Record<string, string> = {}
+    if (projectArg) query.project = projectArg
+    if (devConsoleArg) query.devconsole = '1'
+    if (devInstanceId) query.instance = devInstanceId
+    win.loadFile(
+      path.join(RENDERER_DIST, 'index.html'),
+      Object.keys(query).length > 0 ? { query } : undefined,
+    )
+    logger.info('Main', t('log.main.productionStart'))
+  }
+}
+
+// macOS: 关闭所有窗口不退出
+app.on('window-all-closed', () => {
+  closeProjectDatabase()
+  logger.info('Main', t('log.main.allWindowsClosed'))
+  if (process.platform !== 'darwin') {
+    app.quit()
+    win = null
+  }
+})
+
+// macOS: 点击 dock 图标重新创建窗口
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow()
+  }
+})
+
+// 应用即将退出时清理
+app.on('before-quit', () => {
+  closeProjectDatabase()
+  logger.info('Main', t('log.main.appQuitting'))
+  logger.close()
+})
+
+app.whenReady().then(async () => {
+  // 全局目录迁移：~/.vela → ~/.novelforge（config.json 哨兵判定 + auto 形态新目录清理重试——
+  // 失败静默、旧路径兜底读取；在 logger/ensureVelaHome 首次写入新目录之前执行，
+  // 避免新目录固化出非 auto 形态后迁移永久搁浅）
+  await migrateLegacyDirs()
+  // 存量密钥迁移（v3 T4）：把 models.json / providers.json 里的明文（含 ENC: 密文）key
+  // 搬进 credentials.json 并给条目补发 apiKeyRef。幂等（没有遗留 key 时一个字节都不写）
+  // 且可回退（首次执行前留 *.pre-credentials.bak）；必须赶在 registerIPCHandlers/createWindow
+  // 之前 —— 那时还没有任何读写配置的 IPC 在跑，迁移独占三份文件。
+  // 失败不阻断启动：runCredentialMigration 自身已兜底（返回 outcome 不抛），这里的 try/catch
+  // 是启动路径上的最后一道保险（任何异常都不该让应用起不来），且懒迁移钩子还会再试。
+  try {
+    await runCredentialMigration()
+  } catch (error) {
+    logger.error('Main', `[migrate] 存量密钥迁移失败（已忽略，下次启动再试）：${safeErrorMessage(error)}`)
+  }
+  // 双环境日志：dev 模式 / 内测版（-alpha.N 或历史日期式）→ 开发日志（DEBUG 全量）；
+  // 公测版（-beta.N）/ 正式版 → 发布日志（INFO 起）
+  const logEnv = detectLogEnvironment(Boolean(VITE_DEV_SERVER_URL), app.getVersion())
+  installGlobalErrorHandlers(logEnv, app.getVersion())
+  registerIPCHandlers()
+  createWindow()
+  logger.info('Main', t('log.main.startupDone').replace('{env}', t(logEnv === LogEnvironment.Dev ? 'log.envDev' : 'log.envRelease')))
+})

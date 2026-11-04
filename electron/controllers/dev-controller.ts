@@ -1,0 +1,182 @@
+/**
+ * 开发者模式 Controller — 外部 API 接入（主进程代理 fetch）
+ *
+ * 为什么走主进程：渲染进程 CSP `connect-src` 白名单限制自定义端点（尤其本地 http 服务），
+ * 主进程 net.fetch 不受渲染 CSP 限制。
+ *
+ * 安全设计：
+ * - base URL 由主进程从配置读取——LLM/渲染层只能传相对 path，防任意 URL 调用（SSRF 面收窄到配置的单一端点）
+ * - http/https 白名单校验（拒绝 file://、ftp:// 等）
+ * - 超时（配置 timeoutMs，默认 15s，AbortController）
+ * - 响应大小限制（1MB 截断，防大响应拖垮主进程）
+ * - 错误信息 sanitize（不含敏感请求头）
+ */
+import { app } from 'electron'
+import { readJsonFile, GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG } from '../utils/config-utils'
+import { isIpcMetricsEnabled, setIpcMetricsEnabled, getIpcMetrics, clearIpcMetrics } from '../dev/ipc-metrics'
+import { listTables, getSchema, runQuery } from '../dev/db-inspector'
+import { getPerfSnapshot } from '../dev/perf-snapshot'
+import { logger } from '../utils/logger'
+import { safeErrorMessage } from '../utils/error-utils'
+import { t } from '../../src/shared/locale'
+import { isValidHttpUrl, isValidRelativePath, buildDevApiUrl, truncateResponse } from '../utils/dev-api-utils'
+import type { DevApiRequest, DevApiResponse, DevIpcMetricsData, GlobalConfig } from '../../src/shared/ipc-channels'
+import { guardedHandle } from '../security/ipc-guard'
+import { proxyFetch } from '../net/proxy-fetch'
+
+/** 响应体最大字节数（1MB，超出截断） */
+const MAX_RESPONSE_BYTES = 1024 * 1024
+/** 默认超时（ms） */
+const DEFAULT_TIMEOUT_MS = 15000
+
+/** 读取开发者模式配置（未配置时返回 null） */
+function getDevConfig(): GlobalConfig['devMode'] | null {
+  try {
+    const config = readJsonFile<GlobalConfig>(GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG)
+    const dev = config.devMode
+    if (!dev || !dev.enabled) return null
+    return dev
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 执行一次外部 API 请求（核心：配置校验 → fetch → 大小截断 → sanitize 错误）
+ * @param baseUrlOverride 测试用覆盖地址（设置页未保存时测 UI 当前值；null 用配置）
+ */
+async function invokeDevApi(req: DevApiRequest, baseUrlOverride?: string): Promise<DevApiResponse> {
+  const dev = getDevConfig()
+  if (!dev && !baseUrlOverride) {
+    return { success: false, error: '开发者模式未启用（设置 → 开发者模式）' }
+  }
+  const baseUrl = baseUrlOverride?.trim() || dev?.apiBaseUrl || ''
+  if (!baseUrl || !isValidHttpUrl(baseUrl)) {
+    return { success: false, error: '开发者模式 API 地址无效（需 http/https）' }
+  }
+
+  // method 白名单（P3 修复）：渲染层工具有白名单，主进程此前接受任意字符串（TRACE/OPTIONS 等可透传）
+  const method = (req.method ?? 'GET').toUpperCase()
+  const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+  if (!ALLOWED_METHODS.has(method)) {
+    return { success: false, error: 'method 仅支持 GET/POST/PUT/PATCH/DELETE' }
+  }
+  const path = (req.path ?? '').trim()
+  // path 白名单：不允许绝对 URL / 协议注入（只接受相对路径，base URL 由配置决定）
+  if (!isValidRelativePath(path)) {
+    return { success: false, error: 'path 仅支持相对路径（base URL 由开发者模式配置决定）' }
+  }
+
+  const url = buildDevApiUrl(baseUrl, path)
+  if (!url) {
+    return { success: false, error: '拼接后的 URL 无效（需 http/https）' }
+  }
+
+  const timeoutMs = dev && Number.isFinite(dev.timeoutMs) && dev.timeoutMs > 0 ? dev.timeoutMs : DEFAULT_TIMEOUT_MS
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const res = await proxyFetch(url, {
+      method,
+      headers: dev?.headers ?? {},
+      body: (method === 'GET' || method === 'DELETE') ? undefined : (req.body ?? undefined),
+      signal: controller.signal,
+      // manual：不跟随重定向——3xx 返回原文并附 Location，防重定向链绕过单一端点限制（SSRF 扩展面）
+      redirect: 'manual',
+    })
+    const buf = Buffer.from(await res.arrayBuffer())
+    const { content } = truncateResponse(buf, MAX_RESPONSE_BYTES)
+    // 3xx 时附 Location（manual 模式不自动跟随，LLM 可看到重定向目标）
+    const location = res.headers.get('location')
+    return {
+      success: true,
+      status: res.status,
+      content: location ? `${content}\n\n[重定向 ${res.status} → ${location}]` : content,
+    }
+  } catch (e) {
+    const msg = safeErrorMessage(e)
+    return { success: false, error: msg.includes('abort') ? `请求超时（${timeoutMs}ms）` : msg }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 开发者控制台门禁：开发态默认开；打包版需显式开关或 --devtools */
+export function isDevConsoleEnabled(): boolean {
+  if (process.env.NOVELFORGE_DEVTOOLS === '1') return true
+  if (!app.isPackaged) return true
+  try {
+    const config = readJsonFile<GlobalConfig>(GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG)
+    return config.devMode?.consoleEnabled === true
+  } catch {
+    return false
+  }
+}
+
+function assertDevConsoleEnabled(): void {
+  if (!isDevConsoleEnabled()) throw new Error(t('dev.consoleDisabled'))
+}
+
+export function registerDevController() {
+  /** 开发者控制台：打开/关闭 IPC 指标采集 */
+  guardedHandle('dev:ipc-set-enabled', async (_event, enabled: boolean) => {
+    assertDevConsoleEnabled()
+    setIpcMetricsEnabled(Boolean(enabled))
+    return { success: true }
+  })
+
+  /** 开发者控制台：读取 IPC 指标 */
+  guardedHandle('dev:ipc-metrics', async (): Promise<DevIpcMetricsData> => {
+    assertDevConsoleEnabled()
+    return { enabled: isIpcMetricsEnabled(), ...getIpcMetrics() }
+  })
+
+  /** 开发者控制台：清空 IPC 指标 */
+  guardedHandle('dev:ipc-clear', async () => {
+    assertDevConsoleEnabled()
+    clearIpcMetrics()
+    return { success: true }
+  })
+
+  /** 开发者控制台：项目数据库表列表 */
+  guardedHandle('dev:db-tables', async () => {
+    assertDevConsoleEnabled()
+    return listTables()
+  })
+
+  /** 开发者控制台：表结构 */
+  guardedHandle('dev:db-schema', async (_event, table: string) => {
+    assertDevConsoleEnabled()
+    return getSchema(table)
+  })
+
+  /** 开发者控制台：只读 SQL */
+  guardedHandle('dev:db-query', async (_event, sql: string, limit?: number) => {
+    assertDevConsoleEnabled()
+    return runQuery(sql, limit)
+  })
+
+  /** 开发者控制台：性能快照 */
+  guardedHandle('dev:perf', async () => {
+    assertDevConsoleEnabled()
+    return getPerfSnapshot()
+  })
+
+  /** 调用外部 API（AI 工具 call_external_api 与设置页测试共用） */
+  guardedHandle('dev:invoke', async (_event, req: DevApiRequest): Promise<DevApiResponse> => {
+    try {
+      return await invokeDevApi(req)
+    } catch (e) {
+      logger.error('Dev', t('log.dev.invokeError').replace('{err}', safeErrorMessage(e)))
+      return { success: false, error: safeErrorMessage(e) }
+    }
+  })
+
+  /** 测试连接（GET baseUrl 根路径；apiBaseUrl 可选覆盖——设置页未保存也能测 UI 当前值） */
+  guardedHandle('dev:test', async (_event, override?: { apiBaseUrl?: string }): Promise<{ success: boolean; status?: number; error?: string }> => {
+    const res = await invokeDevApi({ path: '', method: 'GET' }, override?.apiBaseUrl)
+    if (res.success) return { success: true, status: res.status }
+    return { success: false, error: res.error }
+  })
+}

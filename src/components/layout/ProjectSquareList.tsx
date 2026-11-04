@@ -1,0 +1,255 @@
+/**
+ * ProjectSquareList — 左侧活动栏（LT）项目方块列表（全新独立组件）
+ *
+ * 竖排正方形小方块 [[项目一],[项目二],…]（与角色管理图标同尺寸）：
+ * - 每个方块显示项目名截断（完整信息在悬停提示）
+ * - 最多展示 5 个，更多时列表内部滚动
+ * - 悬停提示：项目全名 / 完整路径 / 最近打开时间
+ * - 点击方块 → 打开该项目 + 侧边栏切换到「项目工作台」
+ *   （聚焦章节蓝图/草稿箱/正式稿，非专注模式）
+ */
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Trash2, FolderOpen, AlertTriangle } from 'lucide-react'
+import { useProjectStore } from '../../stores/project-store'
+import { useLayoutStore } from '../../stores/layout-store'
+import { useEditorStore } from '../../stores/editor-store'
+import { ipc } from '../../services/ipc-client'
+import { formatLocaleDateTime } from '../../shared/locale'
+import { cn } from '../../lib/utils'
+import { useTranslation } from '../../hooks/useTranslation'
+import { confirmDeleteProject } from '../ui/Confirm'
+import { EmptyState } from '../ui/EmptyState'
+import { openBuiltinEditor } from '../panels/sidebar/SidebarShared'
+import {
+  Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle, DialogDescription,
+} from '../ui/Dialog'
+
+// ===== 常量 =====
+
+/** 方块列表可见高度（5 个方块 + 间距 + 内边距），超出滚动 */
+const LIST_MAX_HEIGHT = 5 * 30 + 4 * 6 + 12
+
+/** 滚轮一次步进的累积阈值（px）：鼠标滚轮一格 ΔY≈100 恰好触发一次；触控板小步累积触发 */
+const WHEEL_STEP_THRESHOLD = 50
+
+/** 步长保底 = 方块高 30 + 间距 6（真实布局取相邻方块 offsetTop 差；jsdom / 测量失败时用它） */
+const FALLBACK_STEP = 36
+
+/** 相邻方块的滚动步长（实测；无法测量时保底） */
+function stepSize(el: HTMLElement): number {
+  const [a, b] = [el.children[0], el.children[1]] as (HTMLElement | undefined)[]
+  const d = a && b ? b.offsetTop - a.offsetTop : 0
+  return d > 0 ? d : FALLBACK_STEP
+}
+
+/** 项目色板 — 8 个色相均匀分布，按列表顺序取色（列表内保证不冲突） */
+const PROJECT_PALETTE = [15, 45, 90, 140, 190, 240, 285, 330]
+
+/** 取色相（固定饱和度/亮度保证白字可读） */
+function projectColor(index: number): string {
+  const hue = PROJECT_PALETTE[index % PROJECT_PALETTE.length]
+  return `hsl(${hue} 60% 45%)`
+}
+
+/** 方块首字/首字母（中文取首字，英文取首字母大写） */
+function initialOf(name: string): string {
+  const ch = name.trim().charAt(0)
+  if (!ch) return '?'
+  return /[a-zA-Z]/.test(ch) ? ch.toUpperCase() : ch
+}
+
+// ===== 组件 =====
+
+export default function ProjectSquareList() {
+  const { t } = useTranslation()
+  const recentProjects = useProjectStore(s => s.recentProjects)
+  const currentProject = useProjectStore(s => s.currentProject)
+  const openProject = useProjectStore(s => s.openProject)
+  const deleteProjectFolder = useProjectStore(s => s.deleteProjectFolder)
+  const removeRecentProject = useProjectStore(s => s.removeRecentProject)
+  // 故事架构未完成提示弹窗（进入工作台前置检查）
+  const [archPrompt, setArchPrompt] = useState<{ path: string; name: string; done: number } | null>(null)
+
+  // 过滤：排除当前项目（不再截断为 5 个 —— 可见窗口 5 个，其余用滚轮循环浏览，2026-09-28）
+  const targets = recentProjects.filter(p => p.path !== currentProject?.path)
+
+  // ===== 滚轮循环滚动（2026-09-28：替代原生滚动条） =====
+  // 超出 5 个时：滚轮一次走一个方块，到端后循环（底部再下滚 → 回顶部；顶部上滚 → 到底部）。
+  // ⚠️ 必须原生监听 + passive:false —— React 的 onWheel 以 passive 注册，preventDefault 无效。
+  const listRef = useRef<HTMLDivElement | null>(null)
+  const wheelAccRef = useRef(0)
+  const offsetRef = useRef(0)
+  /** 可滚位置数（0 = 无需滚动） */
+  const maxOffset = Math.max(0, targets.length - 5)
+
+  useEffect(() => {
+    const el = listRef.current
+    if (!el) return
+    // 列表缩短（如删除项目）后钳制偏移，避免停在空白处
+    if (offsetRef.current > maxOffset) offsetRef.current = maxOffset
+    el.scrollTop = offsetRef.current * stepSize(el)
+
+    const onWheel = (e: WheelEvent) => {
+      if (maxOffset <= 0) return // 无可滚空间：不拦截、不移动
+      e.preventDefault()
+      // deltaMode=1（行）/2（页）折算为像素；Chromium 鼠标滚轮通常已是像素模式，此处兜底
+      const dy = e.deltaMode === 0 ? e.deltaY : e.deltaY * 40
+      const acc = wheelAccRef.current + dy
+      if (Math.abs(acc) < WHEEL_STEP_THRESHOLD) {
+        wheelAccRef.current = acc
+        return
+      }
+      wheelAccRef.current = 0 // 一次一格：触发后清零，不残留余量
+      const dir = acc > 0 ? 1 : -1
+      let next = offsetRef.current + dir
+      if (next > maxOffset) next = 0 // 循环：底部再下滚 → 回顶部
+      else if (next < 0) next = maxOffset // 顶部上滚 → 到底部
+      offsetRef.current = next
+      el.scrollTop = next * stepSize(el)
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [maxOffset])
+
+  // 点击方块：打开该项目 + 进入项目工作台（非专注模式）；
+  // 进入后异步检查故事架构完整性（4 项），未完成弹窗提示可跳转填充
+  const handleSquareClick = useCallback(async (projectPath: string, projectName: string) => {
+    const prevView = useLayoutStore.getState().sidebarView
+    const ok = await openProject(projectPath, { keepView: true })
+    if (!ok) return
+    // 竞态保护：openProject 异步期间用户可能已切换视图（角色管理/项目结构等），
+    // 此时不覆盖用户选择、不清 Tab —— 只有视图未被用户改变时才进工作台
+    if (useLayoutStore.getState().sidebarView !== prevView) return
+    // 切换项目：清空旧项目残留的编辑器 Tab（避免内容错乱）
+    useEditorStore.getState().clearTabs()
+    useLayoutStore.setState({ sidebarOpen: true, sidebarView: 'project' })
+    // 前置检查：故事架构未填充完成（<4/4）时弹窗提示（不阻塞工作台进入）
+    try {
+      const summary = await ipc.invoke('project:get-summary', projectPath)
+      if (summary && summary.archGenerated < 4) {
+        setArchPrompt({ path: projectPath, name: projectName, done: summary.archGenerated })
+      }
+    } catch { /* 摘要获取失败不打扰用户 */ }
+  }, [openProject])
+
+  // 去填充故事架构：打开世界观/架构编辑器（WorldBuildingEditor）
+  const handleGoFill = useCallback(() => {
+    setArchPrompt(null)
+    openBuiltinEditor('world-building-editor', t('editor.storyArch'), 'world-building')
+  }, [t])
+
+  // 删除/移出最近项目（删除文件夹或仅移出列表）
+  const handleDelete = useCallback(async (e: React.MouseEvent, projectPath: string) => {
+    e.stopPropagation()
+    const action = await confirmDeleteProject()
+    if (action === 'delete') await deleteProjectFolder(projectPath)
+    else if (action === 'remove') await removeRecentProject(projectPath)
+  }, [deleteProjectFolder, removeRecentProject])
+
+  return (
+    <div className="flex flex-col items-center w-full">
+      {/* 方块列表 — 竖排正方形小方块（与角色管理图标同尺寸），最多 5 个可见 */}
+      <div
+        ref={listRef}
+        data-square-list
+        className="flex flex-col items-center gap-1.5 overflow-hidden w-full py-1.5"
+        style={{ maxHeight: LIST_MAX_HEIGHT }}
+      >
+        {targets.length === 0 && (
+          <EmptyState
+            message={t('charList.noHistory')}
+            size="2xs"
+            className="text-center text-[var(--color-text-muted)]"
+          />
+        )}
+        {targets.map((p, i) => {
+          // 悬停提示：全名/完整路径/最近打开时间（无效时间戳不追加行）
+          const timeText = formatLocaleDateTime(p.updatedAt)
+          const tipText = `${p.name}\n${p.path}${timeText ? `\n${timeText}` : ''}`
+          const color = projectColor(i)
+          return (
+            // ⚠️ 2026-09-25 修：删除入口此前是 `<span role="button">` **嵌在** `<button>` 内部，
+            // 既无 tabIndex 也无键盘处理 —— 键盘用户完全够不到「移出项目」这条路径，
+            // 且交互元素嵌套本身是非法 HTML。改为**兄弟节点 + 真 `<button>`**
+            // （原生支持 Enter/Space 触发，无需手写 onKeyDown）。
+            /* ⚠️ flex-shrink-0 必须保留：可见窗口靠 overflow-hidden 裁剪实现，
+               缺它则 flex 默认把超出 5 个的方块压缩塞进 maxHeight（2026-09-28 实测：
+               7 个项目全被挤在区域内、滚不出第 6 个之后的项目） */
+            <div key={p.path} className="group relative w-[30px] h-[30px] flex-shrink-0">
+              <button
+                type="button"
+                data-project-square
+                onClick={() => handleSquareClick(p.path, p.name)}
+                title={tipText}
+                className={cn(
+                  'w-full h-full rounded-md flex items-center justify-center',
+                  'transition-all duration-150 cursor-pointer select-none overflow-hidden',
+                  'hover:brightness-110',
+                )}
+                style={{
+                  backgroundColor: color,
+                  boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.15)',
+                }}
+              >
+                {/* 首字/首字母（完整信息在悬停提示） */}
+                <span className="text-sm font-bold leading-none text-white drop-shadow-sm">
+                  {initialOf(p.name)}
+                </span>
+              </button>
+              {/* 删除/移出（悬停或组内获得焦点时显示，半透明黑底保证彩色底上可见） */}
+              <button
+                type="button"
+                className="absolute top-0 right-0 p-[1px] rounded opacity-0 group-hover:opacity-80 group-focus-within:opacity-100 hover:!opacity-100 transition-opacity cursor-pointer"
+                style={{ color: '#fff', backgroundColor: 'rgba(0,0,0,0.35)' }}
+                onClick={(e) => handleDelete(e, p.path)}
+                title={t('project.deleteTooltip')}
+                aria-label={t('project.deleteTooltip')}
+              >
+                <Trash2 size={8} />
+              </button>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* 故事架构未完成提示弹窗（进入工作台前置检查） */}
+      <Dialog open={!!archPrompt} onOpenChange={(v) => { if (!v) setArchPrompt(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertTriangle size={14} style={{ color: 'var(--color-warning)' }} />
+              {t('workspace.archIncomplete')}
+            </DialogTitle>
+            <DialogDescription>
+              <span className="flex items-center gap-1.5">
+                <FolderOpen size={12} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+                <span className="truncate font-medium">{archPrompt?.name}</span>
+              </span>
+              <span className="block mt-1">
+                {t('workspace.archPrompt').replace('{done}', String(archPrompt?.done ?? 0))}
+              </span>
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <button
+              type="button"
+              onClick={() => setArchPrompt(null)}
+              className="px-3 py-1.5 rounded-lg text-xs transition-colors cursor-pointer"
+              style={{ color: 'var(--color-text-secondary)', backgroundColor: 'var(--color-hover)' }}
+            >
+              {t('action.close')}
+            </button>
+            <button
+              type="button"
+              onClick={handleGoFill}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer"
+              style={{ color: '#fff', backgroundColor: 'var(--color-accent)' }}
+            >
+              {t('workspace.goFill')}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}

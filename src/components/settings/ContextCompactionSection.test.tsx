@@ -1,0 +1,274 @@
+// @vitest-environment jsdom
+/**
+ * ContextCompactionSection — 设置页「上下文与压缩」（§7.1-C2 保留偏好）。
+ * 契约：读出已存偏好；保存时**钳制**（与读取侧同一真源）后写 config:set；
+ * 文案说明「只影响之后的压缩」与 keepBatches 会释放旧原文。
+ */
+import { describe, it, expect, beforeEach, beforeAll, vi } from 'vitest'
+import { createRoot, type Root } from 'react-dom/client'
+import { act } from 'react'
+import ContextCompactionSection from './ContextCompactionSection'
+import { t } from '../../shared/locale'
+
+beforeAll(() => {
+  const g = globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }
+  g.IS_REACT_ACT_ENVIRONMENT = true
+})
+
+let invoke: ReturnType<typeof vi.fn>
+
+const render = (): { container: HTMLElement; root: Root } => {
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  act(() => { root.render(<ContextCompactionSection />) })
+  return { container, root }
+}
+
+beforeEach(() => {
+  document.body.innerHTML = ''
+  invoke = vi.fn(async (ch: string) => {
+    if (ch === 'config:get') return { compaction: { budgetPercent: 80, historyMaxTokens: 6000, minimumChangeTokens: 300, keepBatches: 2 } }
+    if (ch === 'config:set') return { success: true }
+    return null
+  })
+  Object.defineProperty(window, 'velaAPI', { value: { invoke }, configurable: true })
+})
+
+describe('ContextCompactionSection', () => {
+  it('读出已存偏好并回填四个输入框', async () => {
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const inputs = [...container.querySelectorAll('input')] as HTMLInputElement[]
+    expect(inputs).toHaveLength(4)
+    expect(inputs.map(i => i.value)).toEqual(['80', '6000', '300', '2'])
+    act(() => { root.unmount() })
+  })
+
+  it('文案写明「只影响之后的压缩」与 keepBatches 会释放旧原文（口径诚实）', async () => {
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    expect(container.textContent).toContain(t('settings.compactionDesc'))
+    expect(container.textContent).not.toContain('**')   // 纯文本 <p> 里星号会原样显示给用户
+    // 命名要指向**真实存在**的入口（评审 Minor 5：曾写「恢复原文」，卡片上并无此按钮）
+    expect(container.textContent).toContain('展开恢复')
+    expect(container.textContent).toContain('压缩卡片会从对话里消失')
+    act(() => { root.unmount() })
+  })
+
+  it('保存：超范围值被钳制后再写（写进去的一定能被读回）', async () => {
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const inputs = [...container.querySelectorAll('input')] as HTMLInputElement[]
+    // 输入框顺序：budgetPercent[0] / historyMaxTokens[1] / minimumChangeTokens[2] / keepBatches[3]
+    // 把历史预算（inputs[1]）改成超上限（999999 → 32000）、最小降幅（inputs[2]）改负数（-5 → 0）
+    act(() => {
+      const setNative = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+      setNative.call(inputs[1], '999999')
+      inputs[1].dispatchEvent(new Event('input', { bubbles: true }))
+      setNative.call(inputs[2], '-5')
+      inputs[2].dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    const saveBtn = [...container.querySelectorAll('button')].find(b => b.textContent?.trim() === t('action.save'))!
+    act(() => { saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+
+    const call = invoke.mock.calls.find(c => c[0] === 'config:set')
+    expect(call?.[1]).toEqual({ compaction: { budgetPercent: 80, historyMaxTokens: 32000, minimumChangeTokens: 0, keepBatches: 2 } })
+    act(() => { root.unmount() })
+  })
+
+  it('读配置失败 → 回默认值（不崩、不冒充已读到）', async () => {
+    invoke.mockRejectedValue(new Error('no config'))
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const inputs = [...container.querySelectorAll('input')] as HTMLInputElement[]
+    expect(inputs.map(i => i.value)).toEqual(['80', '4000', '200', '0'])
+    // 读失败必须**明示**（显示的是默认值，不是盘上的值）——不冒充「已读到」
+    expect(container.textContent).toContain(t('settings.compactionLoadFailed'))
+    act(() => { root.unmount() })
+  })
+
+  // ===== 自学习压缩 v1（实验性开关）=====
+  it('默认关闭：开关 aria-checked=false；未触碰时保存载荷不含 compactionLearning（防陈旧覆盖）', async () => {
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const sw = container.querySelector('[role="switch"]') as HTMLButtonElement
+    expect(sw).toBeTruthy()
+    expect(sw.getAttribute('aria-checked')).toBe('false')
+
+    const saveBtn = [...container.querySelectorAll('button')].find(b => b.textContent?.trim() === t('action.save'))!
+    act(() => { saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const payload = invoke.mock.calls.find(c => c[0] === 'config:set')?.[1] as Record<string, unknown>
+    expect('compactionLearning' in payload).toBe(false)
+    act(() => { root.unmount() })
+  })
+
+  it('开启开关 + 重置 → 保存时写入 compactionLearning（enabled=true、统计清零）', async () => {
+    invoke = vi.fn(async (ch: string) => {
+      if (ch === 'config:get') {
+        return {
+          compaction: { budgetPercent: 80, historyMaxTokens: 6000, minimumChangeTokens: 300, keepBatches: 2 },
+          compactionLearning: { enabled: false, minChangeFactor: 1.2, stats: { compressions: 5, skipped: 2 } },
+        }
+      }
+      if (ch === 'config:set') return { success: true }
+      return null
+    })
+    Object.defineProperty(window, 'velaAPI', { value: { invoke }, configurable: true })
+
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const sw = container.querySelector('[role="switch"]') as HTMLButtonElement
+    act(() => { sw.dispatchEvent(new MouseEvent('click', { bubbles: true })) })   // 开启
+    const resetBtn = [...container.querySelectorAll('button')].find(b => b.textContent?.trim() === t('settings.learningReset'))!
+    act(() => { resetBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    // 防呆：重置先弹确认（对话框挂到 body）——确认后才真正重置
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    expect(document.body.textContent).toContain(t('settings.learningResetConfirm'))
+    const confirmBtn = [...document.body.querySelectorAll('button')]
+      .find(b => b.textContent?.trim() === t('settings.learningResetConfirmBtn'))!
+    act(() => { confirmBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 250)) })   // 退场动画
+    const saveBtn = [...container.querySelectorAll('button')].find(b => b.textContent?.trim() === t('action.save'))!
+    act(() => { saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+
+    const payload = invoke.mock.calls.find(c => c[0] === 'config:set')?.[1] as {
+      compaction: unknown
+      compactionLearning: { enabled: boolean; minChangeFactor: number; stats: { compressions: number } }
+    }
+    expect(payload.compaction).toBeTruthy()                    // 保留偏好仍照写
+    expect(payload.compactionLearning.enabled).toBe(true)      // 开关落盘
+    expect(payload.compactionLearning.minChangeFactor).toBe(1) // 重置回默认
+    expect(payload.compactionLearning.stats.compressions).toBe(0)
+    act(() => { root.unmount() })
+  })
+
+  it('已触碰但未重置 → 保存时保留盘上实时统计/规则/倍率（不被 mount 快照覆盖）', async () => {
+    let getCalls = 0
+    invoke = vi.fn(async (ch: string) => {
+      if (ch === 'config:get') {
+        getCalls++
+        return {
+          compaction: { budgetPercent: 80, historyMaxTokens: 6000, minimumChangeTokens: 300, keepBatches: 2 },
+          // mount 时（第 1 次）= 陈旧快照；保存时（第 2 次）= 聊天期间推进的实时状态
+          compactionLearning: getCalls === 1
+            ? { enabled: false, minChangeFactor: 1, stats: { compressions: 3 } }
+            : {
+                enabled: false,
+                minChangeFactor: 1.3,
+                stats: { compressions: 9, fidelityWarns: 2 },
+                rules: [{ id: 'keep-characters', active: true, evidence: 4 }],
+              },
+        }
+      }
+      if (ch === 'config:set') return { success: true }
+      return null
+    })
+    Object.defineProperty(window, 'velaAPI', { value: { invoke }, configurable: true })
+
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const sw = container.querySelector('[role="switch"]') as HTMLButtonElement
+    act(() => { sw.dispatchEvent(new MouseEvent('click', { bubbles: true })) })   // 只拨开关，不重置
+    const saveBtn = [...container.querySelectorAll('button')].find(b => b.textContent?.trim() === t('action.save'))!
+    act(() => { saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+
+    const payload = invoke.mock.calls.find(c => c[0] === 'config:set')?.[1] as {
+      compactionLearning: {
+        enabled: boolean
+        minChangeFactor: number
+        stats: { compressions: number; fidelityWarns: number }
+        rules: Array<{ id: string; active: boolean }>
+      }
+    }
+    expect(payload.compactionLearning.enabled).toBe(true)            // 用户意图生效
+    expect(payload.compactionLearning.stats.compressions).toBe(9)    // 实时统计未被陈旧快照抹掉
+    expect(payload.compactionLearning.stats.fidelityWarns).toBe(2)
+    expect(payload.compactionLearning.minChangeFactor).toBe(1.3)
+    expect(payload.compactionLearning.rules.find(r => r.id === 'keep-characters')!.active).toBe(true)
+    act(() => { root.unmount() })
+  })
+
+  it('重置防呆：取消确认 → 学习数据不变，保存也不写该键', async () => {
+    invoke = vi.fn(async (ch: string) => {
+      if (ch === 'config:get') {
+        return {
+          compaction: { budgetPercent: 80, historyMaxTokens: 6000, minimumChangeTokens: 300, keepBatches: 2 },
+          compactionLearning: { enabled: false, minChangeFactor: 1.2, stats: { compressions: 5 } },
+        }
+      }
+      if (ch === 'config:set') return { success: true }
+      return null
+    })
+    Object.defineProperty(window, 'velaAPI', { value: { invoke }, configurable: true })
+
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const resetBtn = [...container.querySelectorAll('button')].find(b => b.textContent?.trim() === t('settings.learningReset'))!
+    act(() => { resetBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 30)) })
+    const cancelBtn = [...document.body.querySelectorAll('button')]
+      .find(b => b.textContent?.trim() === t('action.cancel'))!
+    act(() => { cancelBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 250)) })
+
+    // 取消后未触碰学习控件 → 保存载荷仍不含 compactionLearning（统计不被抹掉）
+    const saveBtn = [...container.querySelectorAll('button')].find(b => b.textContent?.trim() === t('action.save'))!
+    act(() => { saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const payload = invoke.mock.calls.find(c => c[0] === 'config:set')?.[1] as Record<string, unknown>
+    expect('compactionLearning' in payload).toBe(false)
+    act(() => { root.unmount() })
+  })
+
+  // ===== 2026-10 §2.4：统计行改指标 chip（一条 `·` 串 → 6 个按功能个性化的指标）=====
+  it('统计行：6 个 MetricChip（顺序 / 语气 / 说明齐全），全 0 也照常渲染', async () => {
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    const chips = [...container.querySelectorAll('[data-metric-chip]')] as HTMLElement[]
+    expect(chips).toHaveLength(6)
+    expect(chips.map(c => c.querySelector('[data-metric-label]')!.textContent)).toEqual([
+      t('metric.compactions'), t('metric.skipped'), t('metric.truncations'),
+      t('metric.fidelityWarns'), t('metric.reverts'), t('metric.regenerations'),
+    ])
+    // 全 0 也逐片渲染：0 是信息（学习尚未积累），不做整行隐藏
+    expect(chips.map(c => c.querySelector('[data-metric-value]')!.textContent))
+      .toEqual(['0', '0', '0', '0', '0', '0'])
+    // 语气：截断 / 保真告警 / 移除 = 要留意（warn），压缩 / 跳过 / 重生成 = 中性过程量
+    expect(chips.map(c => c.getAttribute('data-tone')))
+      .toEqual(['neutral', 'neutral', 'warn', 'warn', 'warn', 'neutral'])
+    // 解释型 tooltip：这个数是什么、来自哪
+    expect(chips.map(c => c.getAttribute('title'))).toEqual([
+      t('metric.compactionsHint'), t('metric.skippedHint'), t('metric.truncationsHint'),
+      t('metric.fidelityWarnsHint'), t('metric.revertsHint'), t('metric.regenerationsHint'),
+    ])
+    act(() => { root.unmount() })
+  })
+
+  it('统计行：数值取自盘上学习统计（不是写死的 0）', async () => {
+    invoke = vi.fn(async (ch: string) => {
+      if (ch === 'config:get') {
+        return {
+          compaction: { budgetPercent: 80, historyMaxTokens: 6000, minimumChangeTokens: 300, keepBatches: 2 },
+          compactionLearning: {
+            enabled: true,
+            stats: { compressions: 3, skipped: 1, truncations: 2, fidelityWarns: 4, reverts: 5, regenerations: 6 },
+          },
+        }
+      }
+      if (ch === 'config:set') return { success: true }
+      return null
+    })
+    Object.defineProperty(window, 'velaAPI', { value: { invoke }, configurable: true })
+
+    const { container, root } = render()
+    await act(async () => { await new Promise(r => setTimeout(r, 20)) })
+    expect([...container.querySelectorAll('[data-metric-value]')].map(el => el.textContent))
+      .toEqual(['3', '1', '2', '4', '5', '6'])
+    act(() => { root.unmount() })
+  })
+})

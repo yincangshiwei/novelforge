@@ -1,0 +1,265 @@
+import { t, type TextKey } from '../../../shared/locale'
+import { BaseWorkflowCommand, CommandExecuteParams } from './base-command'
+import { useProjectStore } from '../../../stores/project-store'
+import { getPromptTemplate } from '../../prompt-templates'
+import { ReviewPromptBuilder } from '../../prompts/prompt-builder'
+import { ipc } from '../../ipc-client'
+
+
+export interface ReviewChapterParams {
+  draftPath: string
+  draftContent: string
+  chapterNumber: number
+  /** 审稿维度侧重点（可选） */
+  reviewFocus?: string
+}
+
+export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
+  constructor(private params: ReviewChapterParams) {
+    super()
+  }
+
+  async execute({ callbacks }: CommandExecuteParams): Promise<string> {
+    const project = useProjectStore.getState().currentProject
+    if (!project) throw new Error(t('error.noProject'))
+
+    const draft = this.params.draftContent
+    if (!draft) throw new Error(t('error.noDraft'))
+
+    callbacks.log(t('log.review.starting'))
+    callbacks.log(t('log.review.loadingSettings'))
+
+    // 使用向量检索获取与待审章节相关的历史上下文（替代全局摘要）
+    // ⚠️ M 级修复：统一走 retrieveContextForQuery——此前用草稿前 200 字做裸 kb:search
+    //   （无范围/阈值）：对话/场景铺垫常命中无关片段 → 审稿者把无关内容当「前文」误报矛盾；
+    //   检索 query 改用标题+关键事件+角色组合（buildChapterRAGQuery）
+    let contextSummary = t('inject.review.noContextReference')
+    try {
+      const { retrieveContextForQuery, buildChapterRAGQuery } = await import('../../agent/rag-context-provider')
+      const queryText = buildChapterRAGQuery({
+        chapterNumber: this.params.chapterNumber,
+        title: '',
+        keyEvents: draft.slice(0, 300),
+        characters: [],
+      })
+      const rag = await retrieveContextForQuery(queryText, undefined, this.params.chapterNumber)
+      if (rag && rag.formattedContext) {
+        contextSummary = rag.formattedContext
+      }
+    } catch {
+      contextSummary = t('inject.kbSearchUnavailable')
+    }
+
+    const characterState = await this.readCharacterStates()
+    const worldBuilding = await this.readWorldBuilding()
+
+    // ⚠️ H 级修复：注入待回收伏笔清单——模板要求检查「伏笔完整性」但此前无基准数据，
+    //    LLM 只能编造「前文埋了 XX 伏笔未回收」制造伪问题，或漏报真实断裂
+    let foreshadowingList = ''
+    try {
+      const { loadAllForeshadowing } = await import('../../foreshadowing-manager')
+      const pending = (await loadAllForeshadowing())
+        .filter(f => !f.resolved && (f.setChapter ?? 0) <= this.params.chapterNumber)
+        .sort((a, b) => (b.setChapter ?? 0) - (a.setChapter ?? 0))
+        .slice(0, 8)
+      if (pending.length > 0) {
+        foreshadowingList = pending.map((f, i) =>
+          t('inject.foreshadowItem')
+            .replace(/\{index\}/g, () => String(i + 1))
+            .replace(/\{chapter\}/g, () => String(f.setChapter))
+            .replace(/\{content\}/g, () => String(f.content))
+            .replace(/\{type\}/g, () => String(f.type))).join('\n')
+      }
+    } catch { /* 伏笔清单加载失败不阻断 */ }
+
+    const template = getPromptTemplate('consistency_check')
+    if (!template) throw new Error(t('error.templateNotFound').replace('{name}', t('inject.review.templateName')))
+
+    const promptBuilder = new ReviewPromptBuilder(template)
+      .withChapterContent(draft)
+      .withCharacterStates(characterState)
+      .withGlobalSummary(contextSummary)
+      .withWorldBuilding(worldBuilding)
+      .withForeshadowing(foreshadowingList)
+      .withReviewFocus(this.params.reviewFocus || '')
+
+    callbacks.log(t('log.review.calling'))
+
+    // 期望 JSON 格式返回
+    const reviewResultRaw = await this.callLLMWithBuilder(
+      promptBuilder,
+      callbacks,
+      { purpose: 'review_chapter' }
+    )
+
+    const { parseDraftMeta } = await import('../chapter-workflow')
+    const baseDraft = await parseDraftMeta(this.params.draftPath)
+    if (!baseDraft) throw new Error(t('error.noBaseDraft'))
+    const baseVersion = baseDraft.version
+
+    const revIndex = await ipc.invoke('db:review-next-index', baseDraft.id)
+
+    // 解析审稿结果 — 三层回退策略：
+    //   L1: Markdown 表格解析（优先，匹配 Prompt 要求）
+    //   L2: JSON 解析（LLM 实际经常输出 JSON，即使 Prompt 说不要）
+    //   L3: 原始文本兜底（保留完整输出供 ReviewReport 的旧版解析器处理）
+    const { parseMarkdownTable, robustParseJSON } = await import('../workflow-utils')
+    let parsedResult: { items?: Array<Record<string, string>>; summary?: string; rawResponse?: string } | undefined
+
+    // L1: Markdown 表格
+    const tableRows = parseMarkdownTable(reviewResultRaw)
+    if (tableRows && tableRows.length > 0) {
+      parsedResult = {
+        items: tableRows.map(r => ({
+          category: r.category || '',
+          severity: r.severity || 'pass',
+          quote: r.quote || '',
+          description: r.description || '',
+        })),
+        summary: t('inject.review.summaryDone').replace('{count}', String(tableRows.length)),
+      }
+      callbacks.log(t('log.review.mdParsed').replace('{count}', String(tableRows.length)))
+    } else {
+      // L2: JSON 回退 — 很多 LLM 习惯性输出 JSON 而非 Markdown 表格
+      const jsonParsed = robustParseJSON(reviewResultRaw, false)
+      if (jsonParsed && typeof jsonParsed === 'object') {
+        const obj = jsonParsed as Record<string, unknown>
+        // 兼容多种 JSON 结构：{ items: [...] } / { findings: [...] } / 直接是数组
+        const items = Array.isArray(obj.items) ? obj.items
+          : Array.isArray(obj.findings) ? obj.findings
+          : Array.isArray(obj.issues) ? obj.issues
+          : Array.isArray(jsonParsed) ? jsonParsed
+          : null
+
+        if (items && items.length > 0) {
+          parsedResult = {
+            items: (items as Array<Record<string, unknown>>).map(item => ({
+              category: String(item.category || item.dimension || item.type || t('review.comprehensiveCheck')),
+              severity: String(item.severity || item.level || 'pass'),
+              quote: String(item.quote || item.excerpt || ''),
+              description: String(item.description || item.detail || item.issue || ''),
+            })),
+            summary: String(obj.summary || obj.conclusion || t('inject.review.summaryJsonParsed').replace('{count}', String(items.length))),
+          }
+          callbacks.log(t('log.review.jsonParsed').replace('{count}', String(items.length)))
+        } else if (obj.summary || obj.conclusion) {
+          // 纯文本类型的 JSON 响应（包含 summary 但无结构化 items）
+          parsedResult = {
+            items: [{ category: t('review.comprehensiveCheck'), severity: 'warning', description: String(obj.summary || obj.conclusion) }],
+            summary: String(obj.summary || obj.conclusion),
+          }
+          callbacks.log(t('log.review.jsonPlainText'))
+        }
+      }
+
+      // L3: 全部解析策略失败 — 直接传递原始文本给 ReviewReport 的旧版解析器
+      if (!parsedResult) {
+        callbacks.log(t('log.review.unparsable'))
+        // 不包装成 JSON — 直接存原始文本，ReviewReport.parseLegacyReport() 会处理
+        parsedResult = {
+          summary: '',
+          items: [],
+          rawResponse: reviewResultRaw,
+        }
+      }
+    }
+
+    // DB 持久化: 始终保存完整结构化数据 + 原始响应（如有）
+    const dbContent: Record<string, unknown> = {
+      items: parsedResult.items,
+      summary: parsedResult.summary,
+    }
+    if (parsedResult.rawResponse) {
+      dbContent.rawResponse = parsedResult.rawResponse
+    }
+    await ipc.invoke('db:review-create', {
+      baseDraftId: baseDraft.id,
+      reviewIndex: revIndex,
+      content: JSON.stringify(dbContent, null, 2),
+    })
+
+    // Tab 内容: L1/L2 传 JSON 字符串供 ReviewReport 结构化渲染
+    //           L3 传原始文本供 ReviewReport.parseLegacyReport() 旧版解析器处理
+    const reportContent = parsedResult.rawResponse
+      ? parsedResult.rawResponse
+      : JSON.stringify(parsedResult, null, 2)
+
+    const { useEditorStore } = await import('../../../stores/editor-store')
+    const pseudoReviewPath = `vela://draft/ch${this.params.chapterNumber}/v${baseVersion}/review${revIndex}`
+    useEditorStore.getState().openFile({
+      id: `review-${this.params.draftPath}-${revIndex}`,
+      name: t('workflow.reviewReport').replace('{n}', String(this.params.chapterNumber)),
+      type: 'review-report',
+      content: reportContent,
+      filePath: this.params.draftPath,
+      reportPath: pseudoReviewPath,
+      reviewReport: reportContent,
+      chapterNumber: this.params.chapterNumber,
+    })
+
+    callbacks.log(t('log.review.done').replace('{revision}', String(revIndex)))
+    return reviewResultRaw
+  }
+
+  /** 角色枚举 → 本地化角色标签（未知枚举原样保留，避免改动既有数据语义） */
+  private roleLabel(role?: string): string {
+    if (!role) return t('common.unknownWord')
+    const known: Record<string, TextKey> = {
+      protagonist: 'characterRole.protagonist',
+      antagonist: 'characterRole.antagonist',
+      supporting: 'characterRole.supporting',
+      extra: 'characterRole.extra',
+    }
+    return known[role] ? t(known[role]) : role
+  }
+
+  /** 分级角色状态注入 — 核心角色完整档案，配角精简 */
+  private async readCharacterStates(): Promise<string> {
+    try {
+      const allChars = await ipc.invoke('db:character-get-all') as Array<{
+        name: string; role: string; tier?: number; currentState?: Record<string, unknown>
+      }>
+      const tier1: string[] = []
+      const tier2: string[] = []
+
+      for (const card of allChars) {
+        if (!card.name) continue
+        const tier = card.tier ?? (card.role === 'protagonist' || card.role === 'antagonist' ? 1 : 2)
+        const cs = card.currentState
+
+        if (!cs) continue
+
+        if (tier === 1) {
+          tier1.push(
+            t('inject.review.charStateTier1')
+              .replace('{name}', () => card.name)
+              .replace('{role}', () => this.roleLabel(card.role))
+              .replace('{power}', () => String(cs.powerLevel || ''))
+              .replace('{location}', () => String(cs.location || ''))
+              .replace('{physical}', () => String(cs.physicalState || ''))
+              .replace('{mental}', () => String(cs.mentalState || ''))
+              .replace('{recent}', () => String(cs.recentEvents || ''))
+          )
+        } else if (tier === 2) {
+          tier2.push(
+            t('inject.review.charStateTier2')
+              .replace('{name}', () => card.name)
+              .replace('{role}', () => t('characterRole.supporting'))
+              .replace('{location}', () => String(cs.location || ''))
+              .replace('{recent}', () => String(cs.recentEvents || ''))
+          )
+        }
+      }
+
+      const parts: string[] = []
+      if (tier1.length > 0) parts.push(tier1.join('\n'))
+      if (tier2.length > 0) parts.push(tier2.join('\n'))
+      return parts.length > 0 ? parts.join('\n') : t('common.noneYetPlaceholder')
+    } catch { return t('common.readFailedPlaceholder') }
+  }
+
+  private async readWorldBuilding(): Promise<string> {
+    const core = await ipc.invoke('db:project-core-get')
+    return core?.worldbuilding || t('common.noneYetPlaceholder')
+  }
+}

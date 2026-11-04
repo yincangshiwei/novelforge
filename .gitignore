@@ -1,0 +1,89 @@
+# 依赖
+node_modules
+
+# 构建输出
+dist
+dist-electron
+release
+/release-fresh/
+/resource-diagnostic-*/
+/resource-hook-tests-*/
+
+# 本地助手数据及小说工程（保留磁盘文件，不随源码分发）
+.codebuddy/
+.novelforge/
+
+# 测试临时产物（真机冒烟/隔离实例产生，含截图与临时工程）
+.test-artifacts
+.test-projects
+
+# 日志
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# 编辑器
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 临时文件
+*.local
+dist-ssr
+tailwind.config.js.bak
+.package.json.bak
+
+# Claude Code 计划书（不提交）
+.codewhale-plans/
+.codewhale/
+
+# 测试覆盖率
+.agents/
+coverage/
+.claude/
+CLAUDE.md
+.codex/
+AGENTS.md
+rule.md
+rule.lite.md
+
+# 中间产物 / 隐私文件（不提交）
+public/logos/raw/
+public/buyme/
+scripts/font-char-set.txt
+
+# TypeScript 增量编译缓存
+*.tsbuildinfo
+
+# pnpm 本地缓存（不走 store 时的临时落盘目录）
+.pnpm-store/
+
+# 测试临时产物（受限沙箱下 vitest 的临时 config / 临时目录，不提交）
+.tmp-vitest/
+.vitest-min.config.mjs
+
+# git worktrees（隔离工作区）.worktrees/
+.worktrees/
+# UI 截图产出（scripts/shot-stories.mjs）
+.shots/
+
+# superpowers SDD 执行工作区（计划执行期间的 ledger / 评审包，不提交）
+.superpowers/
+
+# WorkBuddy 本地工作记忆（与 .codex/.claude/.agents 同类，不随仓库分发）
+.workbuddy/

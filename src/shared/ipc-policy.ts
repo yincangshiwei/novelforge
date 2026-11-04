@@ -1,0 +1,347 @@
+/**
+ * IPC 通道权限策略表（L4 设计 §4.1）—— **唯一真源，纯数据、零运行时 import**。
+ *
+ * ⚠️ 为什么放 src/shared/ 且只允许 `import type`：
+ *   `vite.config.ts` 的 preload 构建块**没有** `rollupOptions.external`（main 块有）——
+ *   preload import 什么就被打进 dist-electron/preload.cjs。若本文件 import 了
+ *   ipc-guard / grants / electron 等主进程模块，会把主进程代码打进 sandbox preload。
+ *   `import type` 会被完全擦除，故类型约束与运行时安全可兼得。
+ *
+ * `Record<InvokeChannel, ChannelPolicy>` 让 **tsc 双向把关**：漏登记或多登记都编译失败。
+ * 通道集合以 `src/shared/ipc-channels.ts` 的 `InvokeChannel` 为准（事件通道不进本表）。
+ *
+ * authority 语义见设计 §4.2；destructive / spawn 将在 S10 起要求显式授权上下文。
+ */
+import type { InvokeChannel } from './ipc-channels'
+
+/** 权限类（设计 §4.2 + S2 新增 `dialog`：打开原生对话框，是授权的**签发源**） */
+export type IpcAuthority =
+  | 'read-project'
+  | 'write-project'
+  | 'read-global'
+  | 'write-global'
+  | 'destructive'
+  | 'spawn'
+  | 'network-secret'
+  | 'dev-bridge'
+  | 'dialog'
+
+/**
+ * 路径参数声明（S8 启用）：入参下标 + 意图。
+ * ⚠️ 必须支持**多下标**——例如 `db:get-daily-activity` 的路径在第 2/3 位
+ * （`[days?, projectPath?, currentProjectPath?]`，见设计 §0.2 M4）。
+ */
+export interface PathArgSpec {
+  index: number
+  intent: 'read' | 'write' | 'delete'
+}
+
+export interface ChannelPolicy {
+  authority: IpcAuthority
+  /** S8 起填充；为空表示该通道当前不做路径校验 */
+  pathArgs?: PathArgSpec[]
+}
+
+/**
+ * 主→渲染**事件**通道的运行时清单（L4 S7）——与 invoke 通道分开的单一真源。
+ *
+ * 为什么需要它：preload 的事件前缀白名单此前是手工维护的元组，与事件通道的实际使用
+ * **发生过漂移**（`import:progress` 一直被 `import-controller` 发送却不在白名单里 →
+ * 渲染层订阅被 `checkChannel` 抛错，成了一条静默死通道，直到 S1 才发现）。
+ * 现在 preload 的 event 前缀由本清单派生，这类漂移在结构上不可能再发生。
+ *
+ * 新增事件通道时改这里 + `AllEventChannels`（类型侧）；parity 测试会校验两者一致。
+ */
+export const IPC_EVENT_CHANNELS = [
+  'llm:stream-chunk',
+  'llm:stream-done',
+  'llm:stream-error',
+  'update:status-changed',
+  'update:download-progress',
+  'import:progress',
+  'menu:check-update',
+  'embedding:local-pull-progress',
+] as const
+
+/**
+ * 通道 → 策略。S2 阶段只填 authority；pathArgs 由 S8 补齐。
+ */
+export const IPC_CHANNEL_POLICY: Record<InvokeChannel, ChannelPolicy> = {
+  'browser:list-tabs': { authority: 'dev-bridge' },
+  'browser:test': { authority: 'dev-bridge' },
+  'config:get': { authority: 'read-global' },
+  'config:get-vela-home': { authority: 'read-global' },
+  'config:set': { authority: 'write-global' },
+  'config:set-locale': { authority: 'write-global' },
+  // 凭据层（模型管理 v3 §4.1）—— 与 `llm:save-provider` 同档（network-secret）：
+  //   三者都只碰**密钥本体**。写目标是全局凭据库（~/.novelforge/credentials.json），
+  //   读侧（describe）虽然只是状态查询，但「哪些 ref 已配置」本身就是攻击面（枚举+时序），
+  //   且它与写侧成对使用 —— 同档可避免「读得到写不了」这种半开状态。
+  'credential:describe': { authority: 'network-secret' },
+  'credential:set': { authority: 'network-secret' },
+  'credential:unset': { authority: 'network-secret' },
+  'db:blueprint-delete': { authority: 'destructive' },
+  'db:blueprint-get': { authority: 'read-project' },
+  'db:blueprint-get-all': { authority: 'read-project' },
+  'db:blueprint-get-all-sorted': { authority: 'read-project' },
+  'db:blueprint-get-gaps': { authority: 'read-project' },
+  'db:blueprint-update-notes': { authority: 'write-project' },
+  'db:blueprint-update-priority': { authority: 'write-project' },
+  'db:blueprint-update-priority-batch': { authority: 'write-project' },
+  'db:blueprint-update-sort-order': { authority: 'write-project' },
+  'db:binder-reorder': { authority: 'write-project' },
+  'db:scene-list': { authority: 'read-project' },
+  'db:scene-upsert': { authority: 'write-project' },
+  'db:scene-delete': { authority: 'write-project' },
+  'db:scene-reorder': { authority: 'write-project' },
+  'world:entity-list': { authority: 'read-project' },
+  'world:entity-upsert': { authority: 'write-project' },
+  'world:entity-delete': { authority: 'write-project' },
+  'world:relation-list': { authority: 'read-project' },
+  'world:relation-upsert': { authority: 'write-project' },
+  'world:relation-delete': { authority: 'write-project' },
+  'timeline:event-list': { authority: 'read-project' },
+  'timeline:event-upsert': { authority: 'write-project' },
+  'timeline:event-delete': { authority: 'write-project' },
+  'db:blueprint-upsert': { authority: 'write-project' },
+  'db:blueprint-upsert-many': { authority: 'write-project' },
+  'db:character-delete': { authority: 'destructive' },
+  'db:character-get-all': { authority: 'read-project' },
+  'db:character-merge': { authority: 'write-project' },
+  'db:character-merge-fields': { authority: 'write-project' },
+  'db:character-save-all': { authority: 'write-project' },
+  'db:character-update-appearance-stats': { authority: 'read-project' },
+  'db:character-update-state': { authority: 'write-project' },
+  'db:character-upsert': { authority: 'write-project' },
+  'db:checkpoint-clear': { authority: 'destructive' },
+  'db:checkpoint-load': { authority: 'write-project' },
+  'db:checkpoint-save': { authority: 'write-project' },
+
+  // automation — 写作自动化（D 档）
+  'db:automation-list': { authority: 'read-project' },
+  'db:automation-trigger-states': { authority: 'read-project' },
+  'db:automation-inbox-list': { authority: 'read-project' },
+  'db:automation-running-runs': { authority: 'read-project' },
+  'db:automation-finalized-chapters': { authority: 'read-project' },
+  'db:automation-chapter-texts': { authority: 'read-project' },
+  'db:automation-save': { authority: 'write-project' },
+  'db:automation-set-enabled': { authority: 'write-project' },
+  'db:automation-apply-outcome': { authority: 'write-project' },
+  'db:automation-inbox-update': { authority: 'write-project' },
+  'db:automation-run-append': { authority: 'write-project' },
+  'db:automation-run-update': { authority: 'write-project' },
+  'db:automation-delete': { authority: 'destructive' },
+  'db:close': { authority: 'write-project' },
+  'db:draft-create': { authority: 'write-project' },
+  'db:draft-get-all-chapter-numbers': { authority: 'read-project' },
+  'db:draft-get-finalized': { authority: 'read-project' },
+  'db:draft-get-full': { authority: 'read-project' },
+  'db:draft-get-latest': { authority: 'read-project' },
+  'db:draft-get-max-finalized-chapter': { authority: 'read-project' },
+  'db:draft-get-meta': { authority: 'read-project' },
+  'db:draft-list': { authority: 'read-project' },
+  'db:draft-next-version': { authority: 'write-project' },
+  'db:draft-update-content': { authority: 'write-project' },
+  'db:draft-apply-content': { authority: 'write-project' },
+  'db:draft-snapshot-create': { authority: 'write-project' },
+  'db:draft-snapshot-list': { authority: 'read-project' },
+  'db:draft-snapshot-get-full': { authority: 'read-project' },
+  'db:draft-snapshot-prune': { authority: 'write-project' },
+  'db:draft-branch-list': { authority: 'read-project' },
+  'db:draft-branch-create': { authority: 'write-project' },
+  'db:draft-branch-merge': { authority: 'write-project' },
+  'db:draft-branch-archive': { authority: 'write-project' },
+  'db:draft-update-status': { authority: 'write-project' },
+  'db:evaluation-create': { authority: 'write-project' },
+  'db:evaluation-list-by-draft': { authority: 'read-project' },
+  'db:get-daily-activity': { authority: 'read-project' },
+  'db:get-latest-summary': { authority: 'read-project' },
+  'db:get-llm-history': { authority: 'read-project' },
+  'db:get-llm-stats': { authority: 'read-project' },
+  'db:log-llm-call': { authority: 'write-project' },
+  'db:post-process-create-run': { authority: 'write-project' },
+  'db:post-process-get-latest-run': { authority: 'read-project' },
+  'db:post-process-get-steps': { authority: 'read-project' },
+  'db:post-process-is-all-passed': { authority: 'write-project' },
+  'db:post-process-mark-step-failed': { authority: 'write-project' },
+  'db:post-process-mark-step-ok': { authority: 'write-project' },
+  'db:preference-get-top': { authority: 'read-project' },
+  'db:preference-record': { authority: 'write-project' },
+  'db:project-core-get': { authority: 'read-project' },
+  'db:project-core-update': { authority: 'write-project' },
+  'db:publication-delete': { authority: 'destructive' },
+  'db:publication-list': { authority: 'read-project' },
+  'db:publication-save': { authority: 'write-project' },
+  'db:review-create': { authority: 'write-project' },
+  'db:review-get-full': { authority: 'read-project' },
+  'db:review-get-latest': { authority: 'read-project' },
+  'db:review-list': { authority: 'read-project' },
+  'db:review-next-index': { authority: 'write-project' },
+  'db:revision-create': { authority: 'write-project' },
+  'db:revision-get-full': { authority: 'read-project' },
+  'db:revision-get-pending': { authority: 'read-project' },
+  'db:revision-list': { authority: 'read-project' },
+  'db:revision-mark-discarded': { authority: 'write-project' },
+  'db:revision-mark-merged': { authority: 'write-project' },
+  'db:revision-next-index': { authority: 'write-project' },
+  'db:save-summary-snapshot': { authority: 'write-project' },
+  'db:usage-stats': { authority: 'read-project' },
+  'db:usage-dashboard': { authority: 'read-project' },
+  'db:usage-stats-global': { authority: 'read-global' },
+  'db:volume-delete': { authority: 'destructive' },
+  'db:volume-get-all': { authority: 'read-project' },
+  'db:volume-get-by-chapter': { authority: 'read-project' },
+  'db:volume-upsert': { authority: 'write-project' },
+  'dev:invoke': { authority: 'dev-bridge' },
+  'dev:test': { authority: 'dev-bridge' },
+  'dev:ipc-set-enabled': { authority: 'dev-bridge' },
+  'dev:ipc-metrics': { authority: 'dev-bridge' },
+  'dev:ipc-clear': { authority: 'dev-bridge' },
+  'dev:console-status': { authority: 'dev-bridge' },
+  'dev:instance-list': { authority: 'dev-bridge' },
+  'dev:instance-start': { authority: 'spawn' },
+  'dev:instance-stop': { authority: 'spawn' },
+  'dev:instance-clean': { authority: 'destructive' },
+  'dev:db-tables': { authority: 'read-project' },
+  'dev:db-schema': { authority: 'read-project' },
+  'dev:db-query': { authority: 'read-project' },
+  'dev:perf': { authority: 'dev-bridge' },
+  'dialog:save-file': { authority: 'dialog' },
+  'dialog:select-files': { authority: 'dialog' },
+  'dialog:select-folder': { authority: 'dialog' },
+  'dialog:select-import-folder': { authority: 'dialog' },
+  'dialog:select-novel-files': { authority: 'dialog' },
+  'dialog:select-skill-file': { authority: 'dialog' },
+  'embedding:cache-stats': { authority: 'network-secret' },
+  'embedding:clear-cache': { authority: 'network-secret' },
+  'embedding:clear-dedup': { authority: 'network-secret' },
+  'embedding:compare': { authority: 'network-secret' },
+  'embedding:dedup-stats': { authority: 'network-secret' },
+  'embedding:generate': { authority: 'network-secret' },
+  'embedding:generate-batch': { authority: 'network-secret' },
+  'embedding:generate-with-llm': { authority: 'network-secret' },
+  'embedding:get-llm-config': { authority: 'network-secret' },
+  'embedding:get-model': { authority: 'network-secret' },
+  'embedding:list-llm-candidates': { authority: 'network-secret' },
+  'embedding:list-models': { authority: 'network-secret' },
+  // T4 本地向量档。四条探测/拉取通道与既有 `embedding:*` 同档（network-secret）：
+  //   `local-pull` 触发的是 **Ollama 侧**经 HTTP 下载模型（本应用不起子进程 → 不是 `spawn` 语义，
+  //   见设计 §4.2「spawn = 起子进程」），与 detect/list/test 打的是同一个本地 HTTP 服务，
+  //   单独给 spawn 会让同一组按钮在 P2 出现不一致的授权要求而无安全收益。
+  'embedding:local-detect': { authority: 'network-secret' },
+  // 读/写全局配置分别对齐 `config:get`（read-global）/ `config:set`（write-global）
+  'embedding:local-get-config': { authority: 'read-global' },
+  'embedding:local-list-models': { authority: 'network-secret' },
+  'embedding:local-pull': { authority: 'network-secret' },
+  'embedding:local-set-config': { authority: 'write-global' },
+  'embedding:local-test': { authority: 'network-secret' },
+  'embedding:set-llm-config': { authority: 'network-secret' },
+  'embedding:set-model': { authority: 'network-secret' },
+  'embedding:similarity-search': { authority: 'network-secret' },
+  'embedding:test-llm': { authority: 'network-secret' },
+  'export:export-chapters': { authority: 'write-global' },
+  'export:select-output-dir': { authority: 'dialog' },
+  'fs:agent-archive-delete': { authority: 'destructive' },
+  'fs:agent-archive-list': { authority: 'read-project' },
+  'fs:agent-archive-read': { authority: 'read-project' },
+  'fs:agent-archive-write': { authority: 'write-project' },
+  'fs:agent-archive-original-read': { authority: 'read-project' },
+  'fs:agent-archive-original-write': { authority: 'write-project' },
+  'fs:agent-archive-original-delete': { authority: 'destructive' },
+  'fs:agent-result-write': { authority: 'write-project' },
+  'fs:check-exists': { authority: 'read-project' },
+  'fs:delete-file': { authority: 'destructive' },
+  'fs:list-dir': { authority: 'read-project' },
+  'fs:mkdir': { authority: 'write-project' },
+  'fs:read-external-file': { authority: 'read-project' },
+  'fs:read-file': { authority: 'read-project' },
+  'fs:read-json': { authority: 'read-project' },
+  'fs:workflow-output-append': { authority: 'write-project' },
+  'fs:workflow-output-delete-run': { authority: 'destructive' },
+  'fs:workflow-output-tail': { authority: 'read-project' },
+  'fs:write-buffer': { authority: 'write-project' },
+  'fs:write-file': { authority: 'write-project' },
+  'fs:write-json': { authority: 'write-project' },
+  'health:check': { authority: 'read-global' },
+  'health:check-llm': { authority: 'read-global' },
+  'import:split-chapters': { authority: 'read-project' },
+  'kb:backfill-tokens': { authority: 'read-project' },
+  'kb:backfill-vectors': { authority: 'read-project' },
+  'kb:get-vectorless-count': { authority: 'read-project' },
+  'kb:import-document': { authority: 'read-project' },
+  'kb:import-folder': { authority: 'read-project' },
+  'kb:import-text': { authority: 'read-project' },
+  'kb:list-documents': { authority: 'read-project' },
+  'kb:remove-document': { authority: 'read-project' },
+  'kb:search': { authority: 'read-project' },
+  'kb:search-with-scope': { authority: 'read-project' },
+  'kb:stats': { authority: 'read-project' },
+  'llm:cancel': { authority: 'network-secret' },
+  'llm:concurrency-config': { authority: 'network-secret' },
+  'llm:concurrency-status': { authority: 'network-secret' },
+  'llm:delete-model': { authority: 'network-secret' },
+  'llm:delete-provider': { authority: 'network-secret' },
+  'llm:generate': { authority: 'network-secret' },
+  'llm:generate-stream': { authority: 'network-secret' },
+  'llm:get-default-embedding-model': { authority: 'network-secret' },
+  'llm:get-default-model': { authority: 'network-secret' },
+  'llm:get-routes': { authority: 'network-secret' },
+  'llm:list-models': { authority: 'network-secret' },
+  'llm:list-provider-models': { authority: 'network-secret' },
+  'llm:list-providers': { authority: 'network-secret' },
+  'llm:save-model': { authority: 'network-secret' },
+  'llm:save-provider': { authority: 'network-secret' },
+  'llm:set-default-embedding-model': { authority: 'network-secret' },
+  'llm:set-default-model': { authority: 'network-secret' },
+  'llm:set-routes': { authority: 'network-secret' },
+  'llm:test-connection': { authority: 'network-secret' },
+  'log:get-today': { authority: 'read-global' },
+  'log:list-files': { authority: 'read-global' },
+  'log:open-dir': { authority: 'write-global' },
+  'log:read-file': { authority: 'read-global' },
+  'log:write': { authority: 'write-global' },
+  'mcp:add-server': { authority: 'spawn' },
+  'mcp:call-tool': { authority: 'spawn' },
+  'mcp:connect': { authority: 'spawn' },
+  'mcp:disconnect': { authority: 'write-global' },
+  'mcp:disconnect-all': { authority: 'write-global' },
+  'mcp:get-config-path': { authority: 'read-global' },
+  'mcp:get-servers-status': { authority: 'read-global' },
+  'mcp:list-resources': { authority: 'read-global' },
+  'mcp:list-tools': { authority: 'read-global' },
+  'mcp:load-config': { authority: 'spawn' },
+  'mcp:remove-server': { authority: 'write-global' },
+  'memory:delete': { authority: 'destructive' },
+  'memory:list': { authority: 'read-project' },
+  'memory:mark-stale': { authority: 'write-project' },
+  'memory:read': { authority: 'read-project' },
+  'memory:write': { authority: 'write-project' },
+  'project:create': { authority: 'write-project' },
+  'project:delete-folder': { authority: 'destructive' },
+  'project:get-summary': { authority: 'read-project' },
+  'project:open': { authority: 'write-project' },
+  'project:recent-list': { authority: 'read-project' },
+  'project:remove-recent': { authority: 'write-global' },
+  'project:save': { authority: 'write-project' },
+  'project:update-config': { authority: 'write-project' },
+  'report:render-html': { authority: 'read-project' },
+  'skill:delete': { authority: 'write-global' },
+  'skill:import': { authority: 'write-global' },
+  'skill:list': { authority: 'read-global' },
+  'styles:get': { authority: 'read-global' },
+  'styles:list': { authority: 'read-global' },
+  'templates:delete': { authority: 'write-global' },
+  'templates:get': { authority: 'read-global' },
+  'templates:list': { authority: 'read-global' },
+  'templates:save': { authority: 'write-global' },
+  'uninstall:clean-user-data': { authority: 'destructive' },
+  'uninstall:trigger': { authority: 'destructive' },
+  'update:check': { authority: 'spawn' },
+  'update:download': { authority: 'spawn' },
+  'update:get-status': { authority: 'read-global' },
+  'update:get-version': { authority: 'read-global' },
+  'update:install': { authority: 'spawn' },
+  'update:open-releases': { authority: 'write-global' },
+  // 窗口外观（标题栏覆盖层配色）—— 只改窗口 chrome，不读写任何数据
+  'window:set-titlebar-overlay': { authority: 'dev-bridge' },
+}

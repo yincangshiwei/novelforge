@@ -1,0 +1,359 @@
+import { create } from 'zustand'
+import { ipc } from '../services/ipc-client'
+import { loadProjectCustomPrompts, clearProjectCustomPrompts } from '../services/prompt-templates'
+import type { ProjectData, NovelConfig, FileNode } from '../shared/ipc-channels'
+import { alertError } from '../components/ui/Confirm'
+import { renderLog } from '../services/render-logger'
+import { toast } from '../components/ui/Toast'
+import { t } from '../shared/locale'
+
+/**
+ * 从 currentProject 中提取纯净的 ProjectData 字段，
+ * 防止 Zustand 状态中混入非序列化属性导致 Electron IPC structured clone 挂起。
+ */
+function toPlainProjectData(p: ProjectData): ProjectData {
+  return {
+    id: p.id,
+    name: p.name,
+    path: p.path,
+    novelConfig: p.novelConfig ? { ...p.novelConfig } : p.novelConfig,
+    characterStates: p.characterStates,
+    createdAt: p.createdAt,
+    updatedAt: p.updatedAt,
+  }
+}
+
+/** 给 Promise 包裹超时保护，防止 IPC 调用永远不返回 */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(t('error.timeoutMs').replace('{label}', label).replace('{ms}', String(ms))))
+    }, ms)
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v) },
+      (e) => { clearTimeout(timer); reject(e) },
+    )
+  })
+}
+// 延迟导入 ProjectService，避免循环依赖
+let _onProjectOpened: (() => Promise<void>) | null = null
+let _onProjectClosed: (() => void) | null = null
+async function callProjectOpened() {
+  if (!_onProjectOpened) {
+    const { onProjectOpened } = await import('../services/project-service')
+    _onProjectOpened = onProjectOpened
+  }
+  await _onProjectOpened()
+}
+async function callProjectClosed() {
+  if (!_onProjectClosed) {
+    const { onProjectClosed } = await import('../services/project-service')
+    _onProjectClosed = onProjectClosed
+  }
+  _onProjectClosed()
+}
+
+interface ProjectState {
+  /** 当前打开的项目 */
+  currentProject: ProjectData | null
+  /** 项目文件树 */
+  fileTree: FileNode[]
+  /** 最近项目列表 */
+  recentProjects: Array<{ name: string; path: string; updatedAt: number }>
+  /** 是否正在加载 */
+  loading: boolean
+
+  // ===== Actions =====
+  /** 新建项目 */
+  createProject: (config: {
+    name: string
+    path: string
+    genre: string
+    targetAudience: string
+  }) => Promise<boolean>
+  /** 打开项目 */
+  openProject: (projectPath: string, opts?: { keepView?: boolean }) => Promise<boolean>
+  /** 保存项目 */
+  saveProject: () => Promise<boolean>
+  /** 改名成功后同步当前项目和最近项目，不修改目录 */
+  renameProject: (name: string) => Promise<boolean>
+  /** 更新小说配置 */
+  updateNovelConfig: (config: Partial<NovelConfig>) => void
+  /** 线③：AI 产出应用前的配置快照（撤销出口） */
+  configSnapshot: NovelConfig | null
+  /** 线③：快照当前配置（AI 产出应用前调用，供撤销恢复） */
+  snapshotNovelConfig: () => void
+  /** 线③：恢复快照（撤销 AI 产出）；无快照时 no-op 返回 false */
+  restoreNovelConfigSnapshot: () => boolean
+  /** 刷新文件树 */
+  refreshFileTree: () => Promise<void>
+  /** 加载最近项目 */
+  loadRecentProjects: () => Promise<void>
+  /** 关闭项目 */
+  closeProject: () => Promise<boolean>
+  /** 更新角色状态（内存 + 持久化） */
+  updateCharacterStates: (states: string) => Promise<void>
+  /** 删除项目文件夹（从磁盘删除） */
+  deleteProjectFolder: (projectPath: string) => Promise<boolean>
+  /** 移除历史记录（仅从最近列表中移除） */
+  removeRecentProject: (projectPath: string) => Promise<void>
+}
+
+let openingProject = false
+
+export const useProjectStore = create<ProjectState>()((set, get) => ({
+  currentProject: null,
+  fileTree: [],
+  recentProjects: [],
+  loading: false,
+  configSnapshot: null,
+
+  createProject: async (config) => {
+    set({ loading: true })
+    try {
+      const result = await ipc.invoke('project:create', config)
+      if (!result.success) {
+        console.error('[Project] 创建失败:', result.error)
+        alertError(result.error ?? t('status.unknown'), { title: t('dialog.createFailed') })
+        return false
+      }
+      // 使用主进程返回的实际项目路径（跨平台安全，避免路径分隔符问题）
+      const projectDir = result.projectPath ?? `${config.path}/${config.name}`
+      // keepView：新建/导入后保持当前视图（home），让方块列表立即显示新项目
+      return get().openProject(projectDir, { keepView: true })
+    } catch (e) {
+      console.error('[Project] createProject 异常:', e)
+      alertError(String(e), { title: t('dialog.createError') })
+      return false
+    } finally {
+      set({ loading: false })
+    }
+  },
+
+
+  openProject: async (projectPath, opts) => {
+    // #34 块 C：保存/删除进行中禁止切项目——IPC await 期间 DB 已切换，
+    // 旧项目数据会被写进新项目库（saveAll 全量 upsert + 改名 diff 曾误删新项目角色）
+    const { useCharacterStore } = await import('./character-store')
+    if (useCharacterStore.getState().saving) {
+      toast.warning(t('tip.characterSaving'))
+      return false
+    }
+    const { useWorkflowStore } = await import('./workflow-store')
+    const { useAgentStore } = await import('./agent-store')
+    if (openingProject || useWorkflowStore.getState().hasActiveRun() || useAgentStore.getState().generating) {
+      toast.warning(t('workflow.projectBusy'))
+      return false
+    }
+    openingProject = true
+    set({ loading: true })
+    try {
+      const result = await ipc.invoke('project:open', projectPath)
+      if (result.success && result.project) {
+        // 切换项目时清空配置快照——旧项目的快照不得跨项目残留（否则撤销会用 A 的快照覆盖 B）
+        set({ currentProject: result.project, configSnapshot: null })
+        // 加载项目级 Prompt 覆盖（此前仅在设置页挂载时加载——未打开设置页时覆盖静默失效；
+        // 挂到项目打开统一入口，新建/导入/切换均生效）
+        loadProjectCustomPrompts(projectPath).catch(() => {})
+        // 同步最近项目到全局配置（主进程活动聚合/历史导航可读）
+        const list = get().recentProjects
+        if (!list.some(p => p.path === projectPath)) {
+          list.unshift({ name: result.project.name, path: projectPath, updatedAt: Date.now() })
+          set({ recentProjects: list.slice(0, 20) })
+        }
+        ipc.invoke('config:set', { recentProjects: get().recentProjects.slice(0, 20) }).catch(() => {})
+        // 加载文件树
+        await get().refreshFileTree()
+        // 默认自动展开侧边栏并切换到项目结构视图；
+        // keepView（新建/导入）时保持当前视图，让方块列表显示新项目
+        if (!opts?.keepView) {
+          const { useLayoutStore } = await import('./layout-store')
+          useLayoutStore.setState({ sidebarOpen: true, sidebarView: 'project' })
+        }
+        // 统一初始化 Layer 2 Store（角色卡、草稿等）
+        await callProjectOpened()
+        return true
+      }
+      console.error('[Project] 打开失败:', result.error)
+      alertError(result.error ?? t('status.unknown'), { title: t('dialog.openFailed') })
+      return false
+    } catch (e) {
+      console.error('[Project] IPC 通信异常:', e)
+      // L4 S5：原实现写死 `'/tmp/vela_error.log'` —— Windows 上解析为**当前盘的 \tmp\**
+      //   （会在用户盘根目录外造目录），且返回值从不检查（失败静默）。改为走应用日志流：
+      //   LogsView 可见、跟着日志保留策略走、不再向用户磁盘写垃圾文件。
+      renderLog('error', 'Project', `${t('dialog.openError')}: ${String(e)}`)
+      alertError(String(e), { title: t('dialog.openError') })
+      return false
+    } finally {
+      openingProject = false
+      set({ loading: false })
+    }
+  },
+
+  saveProject: async () => {
+    const project = get().currentProject
+    console.log('[project-store.saveProject] 开始保存，项目ID:', project?.id)
+    if (!project) {
+      console.log('[project-store.saveProject] 项目为空，跳过保存')
+      return false
+    }
+    try {
+      // 提取纯净数据，防止 structured clone 序列化异常属性
+      const plainData = toPlainProjectData(project)
+      console.log('[project-store.saveProject] 准备调用 IPC，数据大小:', JSON.stringify(plainData).length)
+      const result = await withTimeout(
+        ipc.invoke('project:save', plainData.id, plainData),
+        15_000,
+        'project:save',
+      )
+      console.log('[project-store.saveProject] IPC 调用完成，结果:', result)
+      return result.success
+    } catch (err) {
+      console.error('[project-store.saveProject] 保存失败:', err)
+      return false
+    }
+  },
+
+  renameProject: async (name) => {
+    const project = get().currentProject
+    const trimmedName = name.trim()
+    if (!project || !trimmedName) return false
+    if (trimmedName === project.name) return true
+
+    try {
+      // 仅提交名称，避免异步改名把编辑期间的新配置覆盖回旧快照。
+      const result = await withTimeout(
+        ipc.invoke('project:save', project.id, { path: project.path, name: trimmedName }),
+        15_000,
+        'project:save(rename)',
+      )
+      if (!result.success) return false
+
+      const updatedAt = Date.now()
+      set((state) => ({
+        currentProject: state.currentProject?.id === project.id && state.currentProject.path === project.path
+          ? { ...state.currentProject, name: trimmedName, updatedAt }
+          : state.currentProject,
+        recentProjects: [
+          { name: trimmedName, path: project.path, updatedAt },
+          ...state.recentProjects.filter(p => p.path !== project.path),
+        ].slice(0, 20),
+      }))
+      // project:save 已更新历史文件；同时同步全局配置供活动聚合读取。
+      ipc.invoke('config:set', { recentProjects: get().recentProjects }).catch(() => {})
+      return true
+    } catch (err) {
+      console.error('[project-store.renameProject] 改名失败:', err)
+      return false
+    }
+  },
+
+  updateNovelConfig: (config) => {
+    const project = get().currentProject
+    if (!project) return
+    set({
+      currentProject: {
+        ...project,
+        novelConfig: { ...project.novelConfig, ...config },
+      },
+    })
+  },
+
+  snapshotNovelConfig: () => {
+    const project = get().currentProject
+    if (!project) return
+    // 深拷贝快照（避免后续 updateNovelConfig 浅合并污染快照引用）
+    set({ configSnapshot: JSON.parse(JSON.stringify(project.novelConfig)) as NovelConfig })
+  },
+
+  restoreNovelConfigSnapshot: () => {
+    const { configSnapshot, currentProject } = get()
+    if (!configSnapshot || !currentProject) return false
+    set({
+      currentProject: { ...currentProject, novelConfig: configSnapshot },
+      configSnapshot: null,
+    })
+    // 撤销后落盘（快照是应用前的旧值，恢复即回到已保存状态）
+    void get().saveProject()
+    return true
+  },
+
+  refreshFileTree: async () => {
+    const project = get().currentProject
+    if (!project) return
+    const tree = await ipc.invoke('fs:list-dir', project.path)
+    set({ fileTree: tree })
+  },
+
+  loadRecentProjects: async () => {
+    const list = await ipc.invoke('project:recent-list')
+    set({ recentProjects: list })
+  },
+
+  closeProject: async () => {
+    const { useWorkflowStore } = await import('./workflow-store')
+    const { useAgentStore } = await import('./agent-store')
+    if (get().loading || useWorkflowStore.getState().hasActiveRun() || useAgentStore.getState().generating) {
+      toast.warning(t('workflow.projectBusy'))
+      return false
+    }
+    useWorkflowStore.getState().resetProject()
+    callProjectClosed()
+    clearProjectCustomPrompts()
+    set({ currentProject: null, fileTree: [] })
+    return true
+  },
+
+  updateCharacterStates: async (states) => {
+    const project = get().currentProject
+    if (!project) return
+    const updated = { ...project, characterStates: states }
+    set({ currentProject: updated })
+    try {
+      await withTimeout(
+        ipc.invoke('project:save', project.id, toPlainProjectData(updated)),
+        15_000,
+        'project:save(characterStates)',
+      )
+    } catch (err) {
+      console.error('[project-store.updateCharacterStates] 持久化失败:', err)
+    }
+  },
+
+  deleteProjectFolder: async (projectPath) => {
+    try {
+      // 如果当前打开的就是要删除的项目，先关闭
+      const current = get().currentProject
+      if (current && current.path === projectPath) {
+        if (!await get().closeProject()) return false
+      }
+      const result = await ipc.invoke('project:delete-folder', projectPath)
+      if (result.success) {
+        // 从本地状态中移除
+        set((s) => ({
+          recentProjects: s.recentProjects.filter((p) => p.path !== projectPath),
+        }))
+        return true
+      }
+      console.error('[Project] 删除文件夹失败:', result.error)
+      alertError(result.error ?? t('status.unknown'), { title: t('dialog.deleteFailed') })
+      return false
+    } catch (e) {
+      console.error('[Project] deleteProjectFolder 异常:', e)
+      alertError(String(e), { title: t('dialog.deleteError') })
+      return false
+    }
+  },
+
+  removeRecentProject: async (projectPath) => {
+    try {
+      await ipc.invoke('project:remove-recent', projectPath)
+      set((s) => ({
+        recentProjects: s.recentProjects.filter((p) => p.path !== projectPath),
+      }))
+    } catch (e) {
+      console.error('[Project] removeRecentProject 异常:', e)
+    }
+  },
+}))

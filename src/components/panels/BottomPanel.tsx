@@ -1,0 +1,518 @@
+import { useState, useEffect } from 'react'
+import { getCurrentLocale } from '../../shared/locale'
+import { useTranslation } from '../../hooks/useTranslation'
+import {
+  Clock,
+  Play, X, ChevronDown, ChevronRight, Zap, ScrollText, Inbox,
+} from 'lucide-react'
+import { ProgressBar } from '../ui/ProgressBar'
+import { StateDot, type StateDotState } from '../ui/StateDot'
+import { useLayoutStore, type BottomTab } from '../../stores/layout-store'
+import { useWorkflowStore, type WorkflowStep, type WorkflowRun } from '../../stores/workflow-store'
+import LogsView from './LogsView'
+import InboxPanel from './automation/InboxPanel'
+import { useAutomationStore } from '../../stores/automation-store'
+
+/** 下方工具窗口 — 显隐由 App.tsx 通过 bottomPanelOpen 条件渲染 Panel 容器控制 */
+export default function BottomPanel() {
+  const { t } = useTranslation()
+  /** 底部面板 Tab 名称映射（通过 i18n 字典统一管理）— 组件内求值，语言切换后标题跟随更新 */
+  const TAB_LABELS: Record<string, string> = {
+    tasks:    t('panel.tasks'),
+    log:      t('panel.log'),
+    inbox:    t('automation.inbox.tab'),
+  }
+  const bottomTab = useLayoutStore(s => s.bottomTab)
+  const toggleBottomPanel = useLayoutStore(s => s.toggleBottomPanel)
+  const openBottomTab = useLayoutStore(s => s.openBottomTab)
+  // ✅ 只订阅 activeRuns，不订阅 globalLogs 等高频字段
+  const activeRuns = useWorkflowStore(s => s.activeRuns)
+  // 收件箱未处理数（D 档徽章）：用长度而非数组本身订阅，避免每次 loadAll 都触发重渲染
+  const pendingInboxCount = useAutomationStore(s => s.inbox.filter(i => i.status === 'pending').length)
+
+  // 声明为 string：兼容旧版本持久化的 bottomTab='models'（已映射到活动视图）
+  const activeTab: string = bottomTab || 'tasks'
+  // 兼容旧持久化值：'activity'（写作统计已于 2026-09-22 搬去编辑区页面）与 'models' 一律回落到
+  // 任务视图——否则老用户升级后会看到一个空白底栏
+  const effectiveTab = (activeTab === 'activity' || activeTab === 'models') ? 'tasks' : activeTab
+  // 任何活跃任务运行中
+  const hasRunning = activeRuns.some(r => r.status === 'running')
+  const hasWaiting = activeRuns.some(r => r.status === 'waiting')
+
+  /** 面板内 Tab 点击：切到其他 Tab 打开面板，点当前 Tab 收起（与左栏语义一致） */
+  const handleTabClick = (id: BottomTab) => {
+    if (bottomTab === id) toggleBottomPanel()
+    else openBottomTab(id)
+  }
+
+  const TAB_ICONS: Record<string, typeof Zap> = {
+    tasks: Zap,
+    log: ScrollText,
+    inbox: Inbox,
+  }
+
+  return (
+    <div
+      className="w-full h-full flex flex-col overflow-hidden"
+      style={{
+        backgroundColor: 'var(--color-panel)',
+        // 朝向缓冲带的一侧不再画 1px 边框（见 novel-editor.css [data-separator]）
+      }}
+    >
+      {/* 面板标题头 — 内置 Tab 切换（就近原则，无需移回左栏） */}
+      <div
+        className="no-select flex items-center justify-between flex-shrink-0 px-2"
+        style={{ height: 'var(--height-panel-header)', borderBottom: '1px solid var(--color-border)' }}
+      >
+        {/* 左侧：Tab 组 */}
+        <div className="flex items-center gap-1">
+          {(['tasks', 'log', 'inbox'] as const).map(id => {
+            const Icon = TAB_ICONS[id]
+            const active = effectiveTab === id
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => handleTabClick(id)}
+                className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs transition-colors cursor-pointer"
+                style={{
+                  color: active ? 'var(--color-text)' : 'var(--color-text-muted)',
+                  backgroundColor: active ? 'var(--color-hover)' : 'transparent',
+                }}
+              >
+                <Icon size={12} strokeWidth={active ? 2 : 1.5} />
+                {TAB_LABELS[id]}
+                {/* 任务 Tab 状态点 + 活跃数徽章 */}
+                {id === 'tasks' && activeRuns.length > 0 && (
+                  <span
+                    className="text-micro font-mono px-1 rounded"
+                    style={{ backgroundColor: 'rgba(var(--color-accent-rgb), 0.12)', color: 'var(--color-accent)' }}
+                  >
+                    {activeRuns.length}
+                  </span>
+                )}
+                {id === 'tasks' && activeRuns.length > 0 && hasRunning && (
+                  <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: 'var(--color-accent)' }} />
+                )}
+                {id === 'tasks' && activeRuns.length > 0 && hasWaiting && !hasRunning && (
+                  <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: 'var(--color-warning)' }} />
+                )}
+                {/* 收件箱未处理数徽章（D 档） */}
+                {id === 'inbox' && pendingInboxCount > 0 && (
+                  <span
+                    className="text-micro font-mono px-1 rounded"
+                    style={{ backgroundColor: 'rgba(var(--color-accent-rgb), 0.12)', color: 'var(--color-accent)' }}
+                  >
+                    {pendingInboxCount}
+                  </span>
+                )}
+              </button>
+            )
+          })}
+        </div>
+
+        {/* 右侧：关闭按钮 */}
+        <button onClick={toggleBottomPanel} title={t('tip.closePanel')} className="icon-btn" style={{ width: 18, height: 18 }}>
+          <X size={12} strokeWidth={1.5} />
+        </button>
+      </div>
+
+      {/* 内容区 */}
+      <div className="flex-1 overflow-hidden">
+        {effectiveTab === 'tasks' && <TaskRunView />}
+        {effectiveTab === 'log' && <LogsView />}
+        {effectiveTab === 'inbox' && <InboxPanel />}
+      </div>
+    </div>
+  )
+}
+
+
+// ===== ⚡ 任务视图（工作流进度主视图）— 支持多任务 =====
+
+function TaskRunView() {
+  const { t } = useTranslation()
+  const activeRuns = useWorkflowStore(s => s.activeRuns)
+  const history = useWorkflowStore(s => s.history)
+  const waitingRuns = useWorkflowStore(s => s.waitingRuns)
+  const cancelWorkflow = useWorkflowStore(s => s.cancelWorkflow)
+  const confirmContinue = useWorkflowStore(s => s.confirmContinue)
+
+  console.log('[BottomPanel] TaskRunView render: activeRuns=', activeRuns.map(r => r.id.slice(0,8) + ':' + r.status + ':' + r.steps.map(s=>s.status).join('/')))
+
+  if (activeRuns.length === 0 && history.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-3" style={{ color: 'var(--color-text-muted)' }}>
+        <Zap size={36} style={{ opacity: 0.5 }} />
+        <span className="text-xs">{t('empty.noTasks')}</span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="h-full overflow-y-auto pb-4">
+      {/* 活跃任务列表（支持多个并行） */}
+      {activeRuns.length > 0 && (
+        <div className="flex-shrink-0" style={{ borderBottom: history.length > 0 ? '1px solid var(--color-border)' : undefined }}>
+          {activeRuns.map((run, idx) => {
+            const runWaiting = waitingRuns[run.id]
+            return (
+              <div key={run.id} style={{ borderBottom: idx < activeRuns.length - 1 ? '1px solid var(--color-border)' : undefined }}>
+                <ActiveRunPanel
+                  run={run}
+                  waitingForConfirm={runWaiting?.waitingForConfirm ?? false}
+                  waitingAfterStepIndex={runWaiting?.waitingAfterStepIndex ?? -1}
+                  onConfirm={() => confirmContinue(run.id)}
+                  onCancel={() => cancelWorkflow(run.id)}
+                />
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* 历史记录（简表；2026-09-27 可供性修复：行 = 主按钮，点击就地展开步骤详情 ——
+          此前行有 hover 变色却无点击处理器） */}
+      {history.length > 0 && (
+        <div className="flex-shrink-0">
+          <div className="px-4 pt-3 pb-1 text-micro font-semibold" style={{ color: 'var(--color-text-muted)' }}>
+            {t('panel.taskHistory')}
+          </div>
+          <div className="px-2 pb-2">
+            {history.map((run) => (
+              <HistoryRunItem key={run.id} run={run} />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ===== 历史运行行（可展开步骤详情） =====
+
+/**
+ * 2026-09-27 可供性修复：历史行此前「hover 变色但无点击处理器」——
+ * 现行为主按钮（键盘可达），点击就地展开该次运行的步骤详情（复用 WorkflowStepItem）。
+ */
+function HistoryRunItem({ run }: { run: WorkflowRun }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setExpanded(v => !v)}
+        className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-left cursor-pointer transition-colors hover:bg-[var(--color-hover)]"
+      >
+        <ChevronRight
+          size={10}
+          className={expanded ? 'rotate-90' : ''}
+          style={{ transition: 'transform 0.15s', flexShrink: 0, color: 'var(--color-text-muted)' }}
+        />
+        {/* 状态点（线② 2b：StateDot 五态，替代 CheckCircle2/XCircle） */}
+        <StateDot state={runDotState(run)} />
+        {/* 标题 */}
+        <span className="flex-1 text-xs truncate" style={{ color: 'var(--color-text-secondary)' }}>
+          {run.title}
+        </span>
+        {/* 步骤计数 */}
+        <span className="text-micro font-mono flex-shrink-0" style={{ color: 'var(--color-text-muted)' }}>
+          {run.steps.filter(s => s.status === 'completed').length}/{run.steps.length}
+        </span>
+        {/* 时间 */}
+        <span className="text-micro flex-shrink-0 w-14 text-right" style={{ color: 'var(--color-text-muted)' }}>
+          {new Date(run.createdAt).toLocaleTimeString(getCurrentLocale(), { hour: '2-digit', minute: '2-digit' })}
+        </span>
+      </button>
+      {expanded && (
+        <div className="px-4 pb-1">
+          {run.steps.map((step, i) => (
+            <WorkflowStepItem key={step.id} step={step} index={i} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ===== 当前任务进度面板（接收 run 参数，支持多实例） =====
+
+function ActiveRunPanel({
+  run,
+  waitingForConfirm,
+  waitingAfterStepIndex,
+  onConfirm,
+  onCancel,
+}: {
+  run: WorkflowRun
+  waitingForConfirm: boolean
+  waitingAfterStepIndex: number
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const { t } = useTranslation()
+  const [expanded, setExpanded] = useState(true)
+
+  // 需要确认时自动展开
+  useEffect(() => {
+    let mounted = true
+    if (waitingForConfirm) {
+      Promise.resolve().then(() => {
+        if (mounted) setExpanded(true)
+      })
+    }
+    return () => { mounted = false }
+  }, [waitingForConfirm])
+
+  const runningStep = run.steps.find(s => s.status === 'running')
+  const completedCount = run.steps.filter(s => s.status === 'completed').length
+  const totalCount = run.steps.length
+  const progress = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0
+  const nextStepName = run.steps[waitingAfterStepIndex + 1]?.name
+  const isActive = run.status === 'running' || run.status === 'waiting'
+
+  console.log('[BottomPanel] ActiveRunPanel render: run.status=', run.status, 'steps=', run.steps.map(s => s.status).join(','))
+
+  return (
+    <div>
+      {/* ── 状态条（始终可见）：主按钮 = 折叠/展开（原生 button，键盘可达）；
+             取消按钮作兄弟、独立触发（2026-09-27：不再需要 stopPropagation） ── */}
+      <div className="flex items-center gap-1 px-3 py-2 select-none">
+        <button
+          type="button"
+          onClick={() => setExpanded(v => !v)}
+          className="flex items-center gap-2.5 flex-1 min-w-0 text-left cursor-pointer rounded hover:bg-[var(--color-hover)]"
+        >
+          {/* 状态点（线② 2b：StateDot 五态，替代 Spinner/Clock） */}
+          <div className="flex-shrink-0">
+            <StateDot state={runDotState(run)} />
+          </div>
+
+          {/* 标题 + 进度条 */}
+          <div className="flex-1 min-w-0">
+            <div className="flex items-baseline gap-1.5 mb-1">
+              <p className="text-xs font-medium truncate" style={{ color: 'var(--color-text)' }}>
+                {runningStep && isActive ? runningStep.name : run.title}
+              </p>
+              <span className="text-micro font-mono flex-shrink-0" style={{ color: 'var(--color-accent)' }}>
+                {progress}%
+              </span>
+            </div>
+            {/* 2px 进度条 */}
+            <ProgressBar value={progress} />
+          </div>
+
+          {/* 右侧：步骤计数 + 折叠箭头 */}
+          <div className="flex items-center gap-1 flex-shrink-0">
+            <span className="text-micro font-mono" style={{ color: 'var(--color-text-muted)' }}>
+              {completedCount}/{totalCount}
+            </span>
+            {expanded
+              ? <ChevronDown size={11} style={{ color: 'var(--color-text-muted)' }} />
+              : <ChevronRight size={11} style={{ color: 'var(--color-text-muted)' }} />
+            }
+          </div>
+        </button>
+        {/* 取消按钮（独立行为 → 兄弟节点；命中区 icon-btn = 22×22） */}
+        <button
+          type="button"
+          onClick={onCancel}
+          className="icon-btn"
+          title={t('tip.cancelTask')}
+        >
+          <X size={11} />
+        </button>
+      </div>
+
+      {/* ── 步骤详情列表（展开时显示） ── */}
+      {expanded && (
+        <div className="pb-2">
+          {/* 步骤列表——扁平连接器风格 */}
+          <div className="px-4">
+            {run.steps.map((step, i) => (
+              <WorkflowStepItem key={step.id} step={step} index={i} />
+            ))}
+          </div>
+
+          {/* ── 等待确认操作区 ── */}
+          {waitingForConfirm && nextStepName && (
+            <div
+              className="mx-4 mt-2 px-3 py-2 rounded flex items-center gap-2"
+              style={{
+                backgroundColor: 'rgba(var(--color-accent-rgb), 0.07)',
+                border: '1px solid rgba(var(--color-accent-rgb), 0.25)',
+              }}
+            >
+              <Clock size={11} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+              <span className="text-xs flex-1 truncate" style={{ color: 'var(--color-text-secondary)' }}>
+                {t('panel.nextStep').replace('{name}', nextStepName)}
+              </span>
+              <button
+                onClick={onConfirm}
+                className="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium flex-shrink-0"
+                style={{ backgroundColor: 'var(--color-accent)', color: 'var(--color-text)' }}
+              >
+                <Play size={10} /> {t('nextStep.continue')}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── 折叠时若等待确认：状态条下方显示简洁提示 ── */}
+      {waitingForConfirm && !expanded && nextStepName && (
+        <div
+          className="mx-3 mb-2 px-2.5 py-1.5 rounded flex items-center gap-2"
+          style={{
+            backgroundColor: 'rgba(var(--color-accent-rgb), 0.07)',
+            border: '1px solid rgba(var(--color-accent-rgb), 0.25)',
+          }}
+        >
+          <Clock size={11} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />
+          <span className="text-xs flex-1 truncate" style={{ color: 'var(--color-text-secondary)' }}>
+            {t('panel.nextStep').replace('{name}', nextStepName)}
+          </span>
+          <button
+            onClick={(e) => { e.stopPropagation(); onConfirm() }}
+            className="flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium flex-shrink-0"
+            style={{ backgroundColor: 'var(--color-accent)', color: 'var(--color-text)' }}
+          >
+            <Play size={10} /> {t('nextStep.continue')}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ===== 工作流步骤项（扁平连接器风格） =====
+
+function WorkflowStepItem({
+  step,
+  index,
+}: {
+  step: WorkflowStep
+  index: number
+}) {
+  const { t } = useTranslation()
+  const [expanded, setExpanded] = useState(false)
+  const hasDetail = !!step.error || step.logs.length > 0
+
+  /** 步骤标题行内容（有详情时整行 = 按钮；无详情 = 纯状态行，见下方渲染分支） */
+  const rowContent = (
+    <>
+      {hasDetail && (
+        expanded
+          ? <ChevronDown size={10} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+          : <ChevronRight size={10} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+      )}
+      {/* 状态点（线② 2b：StateDot 五态，替代原竖线连接器 + 状态图标） */}
+      <StepStatusIcon status={step.status} />
+      <span
+        className="text-xs flex-1 truncate"
+        style={{
+          color: step.status === 'running'
+            ? 'var(--color-text)'
+            : step.status === 'pending'
+              ? 'var(--color-text-muted)'
+              : 'var(--color-text-secondary)',
+          fontWeight: step.status === 'running' ? 500 : 400,
+        }}
+      >
+        {index + 1}. {step.name}
+      </span>
+      {/* 进度百分比 */}
+      {step.progress !== undefined && step.status === 'running' && (
+        <span className="text-micro font-mono flex-shrink-0" style={{ color: 'var(--color-accent)' }}>
+          {step.progress}%
+        </span>
+      )}
+      {/* 完成耗时（若有时间戳）或简单标记 */}
+      {step.status === 'skipped' && (
+        <span className="text-micro flex-shrink-0" style={{ color: 'var(--color-text-muted)' }}>{t('status.aborted')}</span>
+      )}
+    </>
+  )
+
+  // 运行中自动展开
+  useEffect(() => {
+    let mounted = true
+    if (step.status === 'running') {
+      Promise.resolve().then(() => {
+        if (mounted) setExpanded(true)
+      })
+    }
+    return () => { mounted = false }
+  }, [step.status])
+
+  return (
+    <div className="pb-0.5">
+      {/* 步骤标题行（线② 2b：StateDot 已在 rowContent 行首，去掉原竖线连接器——
+          dsh member 行 = 状态点 + 名字 + 状态，无竖线） */}
+      {hasDetail ? (
+        <button
+          type="button"
+          onClick={() => setExpanded(v => !v)}
+          className="w-full flex items-center gap-1.5 py-1 text-left cursor-pointer rounded hover:bg-[var(--color-hover)]"
+        >
+          {rowContent}
+        </button>
+      ) : (
+        <div className="flex items-center gap-1.5 py-1">
+          {rowContent}
+        </div>
+      )}
+
+      {/* 详情区（展开时显示：日志 + 错误） */}
+      {expanded && hasDetail && (
+        <div className="mb-1 pl-6">
+          {step.error && (
+            <div
+              className="text-micro px-2 py-1 rounded mb-1"
+              style={{ backgroundColor: 'rgba(var(--color-error-rgb),0.08)', color: 'var(--color-error)' }}
+            >
+              {step.error}
+            </div>
+          )}
+          {step.logs.length > 0 && (
+            <div className="max-h-16 overflow-y-auto space-y-0.5">
+              {step.logs.slice(-6).map((log, i) => (
+                <div key={i} className="text-micro font-mono leading-4" style={{ color: 'var(--color-text-muted)' }}>
+                  {log}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 步骤状态图标（对齐竖线连接器）—— 线② 2b 改用 StateDot 五态（dsh 状态点统一语义） */
+function StepStatusIcon({ status }: { status: WorkflowStep['status'] }) {
+  return <StateDot state={stepDotState(status)} />
+}
+
+/** StepStatus → StateDot 五态 */
+function stepDotState(status: WorkflowStep['status']): StateDotState {
+  switch (status) {
+    case 'completed': return 'done'
+    case 'running': return 'ongoing'
+    case 'failed': return 'error'
+    case 'skipped': case 'pending':
+    default: return 'idle'
+  }
+}
+
+/** WorkflowStatus → StateDot 五态（run 级） */
+function runDotState(run: WorkflowRun): StateDotState {
+  switch (run.status) {
+    case 'running': return 'ongoing'
+    case 'waiting': case 'paused': return 'warning'
+    case 'failed': return 'error'
+    case 'completed': return 'done'
+    default: return 'idle'
+  }
+}
+

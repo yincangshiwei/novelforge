@@ -1,0 +1,156 @@
+/**
+ * 应用更新 Zustand Store
+ *
+ * 管理更新状态、触发检查和下载、追踪进度
+ */
+
+import { create } from 'zustand'
+import { ipc } from '../services/ipc-client'
+import type { UpdateStatus, UpdateInfo, UpdateProgressInfo } from '../shared/ipc-channels'
+
+interface UpdateState {
+  /** 当前更新状态 */
+  status: UpdateStatus
+  /** 更新信息（新版本号、日期、更新日志等） */
+  updateInfo: UpdateInfo | null
+  /** 下载进度 */
+  downloadProgress: UpdateProgressInfo | null
+  /** 错误信息 */
+  error: string | null
+  /** 当前版本 */
+  currentVersion: string
+  /** 应用名称 */
+  appName: string
+  /** 是否正在加载 */
+  loading: boolean
+
+  // ---- Actions ----
+
+  /** 初始化：获取当前版本并监听状态变化 */
+  init: () => () => void
+  /** 检查更新 */
+  checkForUpdates: () => Promise<boolean>
+  /** 下载更新 */
+  downloadUpdate: () => Promise<boolean>
+  /** 安装更新（重启应用） */
+  installUpdate: () => Promise<boolean>
+  /** 打开 GitHub Releases 页面 */
+  openReleasesPage: () => void
+  /** 触发卸载 */
+  triggerUninstall: () => Promise<boolean>
+  /** 清理用户数据 */
+  cleanUserData: () => Promise<boolean>
+}
+
+export const useUpdateStore = create<UpdateState>((set, get) => ({
+  status: 'idle',
+  updateInfo: null,
+  downloadProgress: null,
+  error: null,
+  currentVersion: '',
+  appName: 'NovelForge',
+  loading: false,
+
+  init: () => {
+    // 获取当前版本
+    ipc.invoke('update:get-version').then((result) => {
+      set({ currentVersion: result.currentVersion, appName: result.appName })
+    }).catch(() => {
+      // IPC 失败时回退到构建时注入的版本号（禁止硬编码）
+      set({ currentVersion: __APP_VERSION__, appName: 'NovelForge' })
+    })
+
+    // 监听状态变化
+    const cleanup = ipc.on('update:status-changed', (data) => {
+      set({
+        status: data.status,
+        updateInfo: data.info ?? get().updateInfo,
+        error: data.error ?? null,
+      })
+    })
+
+    // 监听下载进度
+    const cleanupProgress = ipc.on('update:download-progress', (data) => {
+      set({ downloadProgress: data.progress })
+    })
+
+    return () => {
+      cleanup()
+      cleanupProgress()
+    }
+  },
+
+  checkForUpdates: async () => {
+    set({ loading: true, error: null })
+    try {
+      const result = await ipc.invoke('update:check')
+      set({ loading: false })
+      if (result.hasUpdate && result.info) {
+        // 双保险：主进程事件推送 'available' 之外，invoke 结果直接落状态
+        set({ updateInfo: result.info, status: 'available' })
+        return true
+      }
+      // 检查失败与「无更新」是两种结果：主进程先发 error 事件、再返回
+      // { hasUpdate: false, error }；若无条件置 no-update，断网/限流会被
+      // 显示成「已是最新版本」，且与自动检查路径表现不一致。
+      if (result.error) {
+        set({ status: 'error', error: result.error })
+        return false
+      }
+      set({ status: 'no-update' })
+      return false
+    } catch (err) {
+      set({ loading: false, error: String(err), status: 'error' })
+      return false
+    }
+  },
+
+  downloadUpdate: async () => {
+    set({ loading: true, error: null })
+    try {
+      const result = await ipc.invoke('update:download')
+      set({ loading: false })
+      // 启动即返回：状态完全由 update:status-changed 事件驱动
+      if (!result.success && result.error !== 'already-downloading') {
+        set({ error: result.error ?? null, status: 'error' })
+      }
+      return result.success
+    } catch (err) {
+      set({ loading: false, error: String(err), status: 'error' })
+      return false
+    }
+  },
+
+  installUpdate: async () => {
+    try {
+      const result = await ipc.invoke('update:install')
+      return result.success
+    } catch (err) {
+      set({ error: String(err) })
+      return false
+    }
+  },
+
+  openReleasesPage: () => {
+    ipc.invoke('update:open-releases').catch(() => {})
+  },
+
+  triggerUninstall: async () => {
+    try {
+      const result = await ipc.invoke('uninstall:trigger')
+      return result.success
+    } catch (err) {
+      set({ error: String(err) })
+      return false
+    }
+  },
+
+  cleanUserData: async () => {
+    try {
+      const result = await ipc.invoke('uninstall:clean-user-data')
+      return result.success
+    } catch {
+      return false
+    }
+  },
+}))

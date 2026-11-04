@@ -1,0 +1,594 @@
+import { useEffect } from 'react'
+import { Panel, Group as PanelGroup, Separator as PanelResizeHandle, useDefaultLayout } from 'react-resizable-panels'
+import { useShallow } from 'zustand/shallow'
+import { useThemeStore } from './stores/theme-store'
+import { useLayoutStore } from './stores/layout-store'
+import { useDevConsoleStore } from './stores/dev-console-store'
+import { useLLMStore } from './stores/llm-store'
+import { useProjectStore } from './stores/project-store'
+import { useMCPStore } from './stores/mcp-store'
+import { useWorkflowStore } from './stores/workflow-store'
+import { useAgentStore } from './stores/agent-store'
+import { useUpdateStore } from './stores/update-store'
+import { matchesBinding, shortcutBinding } from './stores/shortcut-store'
+import { useAutomationStore } from './stores/automation-store'
+import { useThinkingStore } from './stores/thinking-store'
+import { t } from './shared/locale'
+import { useTranslation } from './hooks/useTranslation'
+import { setWindowTitle } from './lib/window-title'
+import { ipc } from './services/ipc-client'
+import StatusBar from './components/layout/StatusBar'
+import LeftToolWindowBar from './components/layout/LeftToolWindowBar'
+import RightToolWindowBar from './components/layout/RightToolWindowBar'
+// 应用图标：直接引用**打包用的那个文件**（而非在 public/ 放一份副本），保证单一来源
+import appIcon from '../build/icon.png'
+import Sidebar from './components/panels/Sidebar'
+import EditorArea from './components/panels/EditorArea'
+import AIPanel from './components/panels/AIPanel'
+import AIOutputPanel from './components/panels/AIOutputPanel'
+import BottomPanel from './components/panels/BottomPanel'
+import NewProjectDialog from './components/dialogs/NewProjectDialog'
+import ImportNovelDialog from './components/dialogs/ImportNovelDialog'
+import ChapterCreationDialog from './components/dialogs/ChapterCreationDialog'
+import DevConsoleDialog from './components/dev/DevConsoleDialog'
+import ActivityDialog from './components/dialogs/ActivityDialog'
+import SettingsModal from './components/settings/SettingsModal'
+import { ErrorBoundary } from './components/ErrorBoundary'
+import { toast } from './components/ui/Toast'
+import { globalEventBus } from './shared/event-bus'
+import { loadCustomPrompts } from './services/prompt-templates'
+import GlobalTitleTooltip from './components/ui/GlobalTitleTooltip'
+import CommandPalette from './components/command-palette/CommandPalette'
+import { useCommandStore } from './stores/command-store'
+import { Search } from 'lucide-react'
+
+// L2 任务6：恢复前加载所有 workflow 模块，触发顶层 registerWorkflow（须在 restoreCheckpoint 调用之前，
+// 否则恢复时 registry 空 → 所有 run 走降级）。
+import './services/workflows/workflow-registry-init'
+
+/**
+ * 各区域的**内容下限（像素）**——低于这个宽度就看不出这块是什么功能了，所以它就是拖拽下限。
+ *
+ * ⚠️ `react-resizable-panels` 的尺寸 prop **数字按像素解释**（只有带单位的字符串才是其它语义：
+ * `"20%"` 是百分比、`"176px"` 是像素）。此前写的 `minSize={10}` 一直是 **10 像素**，
+ * 等于没有下限——这正是「区域能一路收缩到底」的原因。
+ */
+const REGION_MIN_PX = { sidebar: 220, ai: 260, bottom: 120 } as const
+/** 上限同样按规范：侧栏 220–400、Agent 面板 260–460（底栏用视口百分比由 Panel maxSize 管） */
+const REGION_MAX_PX = { sidebar: 400, ai: 460 } as const
+
+/**
+ * ⚠️ **单位必须显式写清**（2026-09-20 连环踩坑的根源）：
+ * `react-resizable-panels` 的尺寸 prop —— **数字 = 像素**（`dist/…js:95-110` 用 `sizeStyleToPx` 换算），
+ * 只有带单位的字符串才是别的语义（`"20%"` 百分比、`"176px"` 像素）。
+ *
+ * 原代码的 `defaultSize={20}/{60}/{20}` 其实是 **20px/60px/20px**，只因库把各面板尺寸做了**比例归一化**
+ * 才看起来像 20%:60%:20%。所以一旦引入 176/232 像素下限，下限就会把默认布局顶开、比例失真
+ * （真机现象：重启后各区域大小不对）。**默认尺寸一律写成百分比字符串，下限一律写成像素。**
+ */
+const SIDEBAR_DEFAULT = '22%'
+const AI_PANEL_DEFAULT = '22%'
+const EDITOR_DEFAULT = '56%'
+/** 编辑区下限：两侧面板现在都有真实下限，编辑区不能被挤成一条缝 */
+const EDITOR_MIN_PX = 360
+
+/**
+ * 顶栏 —— 系统窗口控件覆盖层（WCO）留位 + **窗口拖拽区** + 应用标识。
+ *
+ * ⚠️ 为什么必须是**独立元素**、而不是给根容器加 `paddingTop`（2026-09-25 真机两轮反馈）：
+ *   ① `padding` 区**不属于任何拖拽元素** → 顶部那一条**拖不动窗口**（用户反馈）
+ *   ② 只在图标栏留位不够 —— 覆盖层宽度覆盖到右侧 AGENT 面板头部，而覆盖层底色是
+ *      `--color-canvas`（最外围缝隙色）、盖住的却是面板头部（另一种底色）→ 右上角出现**看得见的接缝**
+ *   做成独立元素后：它自己既是留位、又是拖拽区、还是应用标识的落点，且底色与覆盖层同色 → 无缝。
+ *
+ * 高度由系统通过 `env(titlebar-area-height)` 告知；**未启用覆盖层时为 0**
+ * （macOS / 浏览器），此时它不占位、内容被 overflow 裁掉 —— macOS 的交通灯在**左上角**，
+ * 标识放那里会撞，所以 macOS 走它自己的 28px 留位（见 LeftToolWindowBar）。
+ *
+ * ⚠️ 拖拽区内的交互元素若要可点，必须显式 `-webkit-app-region: no-drag`（本元素暂无按钮；
+ * 将来放命令面板入口时记得加）。
+ */
+function TitleStrip() {
+  const currentProject = useProjectStore((s) => s.currentProject)
+  const openPalette = useCommandStore((s) => s.openPalette)
+  const shortcut = navigator.userAgent.includes('Mac') ? '⌘K' : 'Ctrl K'
+  return (
+    <div
+      className="flex items-center gap-2 pl-2.5 pr-3 overflow-hidden select-none flex-shrink-0"
+      style={{
+        height: 'env(titlebar-area-height, 0px)',
+        backgroundColor: 'var(--color-canvas)',
+        WebkitAppRegion: 'drag',
+      } as React.CSSProperties}
+    >
+      {/* 应用图标 —— 原生标题栏移除后，这里是唯一的应用标识处。
+          ⚠️ 必须与**打包用的图标是同一个文件**（`build/icon.png`，electron-builder 的
+          `icon.ico` 由它生成、窗口图标也用它）：复制一份到 public/ 会有两个来源、
+          改一次忘一处就会静默不一致（2026-09-25 首次实现时误用了 public/icon.svg ——
+          那是另一版设计，用户一眼看出不是他设计的那个）。
+          尺寸走**图标刻度体系的 16 档**（面板标题档），标题栏图标就是这个规格。 */}
+      <img src={appIcon} alt="" width={16} height={16} style={{ flexShrink: 0 }} />
+      {/*
+        ⚠️ 标题栏不是放 logo 的地方：首版用了 `text-2xs`(10px) + `brand-gradient`（品牌渐变字），
+        用户看出来的「不像正常应用」即此 —— 那更像宣传位而不是标题栏。
+        常规应用就是 **12px 常规文字色**。
+
+        ⚠️ 写的是**会变的东西**（当前项目名），不是固定品牌名 —— 固定字符串占着这条栏
+        等于零信息，应用名在图标、启动器、关于页、任务栏都已有。没开项目时回落品牌名。
+        `min-w-0` 不可省：flex item 默认 `min-width: auto`，少了它 `truncate` 的省略号
+        不生效，长项目名会被父容器 `overflow-hidden` 直接切掉。
+      */}
+      <span className="text-xs truncate min-w-0" style={{ color: 'var(--color-text)' }}>
+        {currentProject?.name ?? 'NovelForge'}
+      </span>
+      <span className="flex-1" />
+      {/* 命令面板入口：标题栏是拖拽区，按钮必须显式 no-drag */}
+      <button
+        type="button"
+        onClick={() => openPalette('commands')}
+        title={t('command.title')}
+        aria-label={t('command.title')}
+        className="inline-flex items-center gap-1.5 rounded px-2"
+        style={{
+          height: 20,
+          border: '1px solid var(--color-border)',
+          backgroundColor: 'var(--color-panel)',
+          color: 'var(--color-text-muted)',
+          fontSize: 10.5,
+          cursor: 'pointer',
+          WebkitAppRegion: 'no-drag',
+        } as React.CSSProperties}
+      >
+        <Search size={10} />
+        <span>{shortcut}</span>
+      </button>
+    </div>
+  )
+}
+
+/** 区域 → 我们自己的 DOM 标记属性值（`[data-region]`，见面板内的包装 div） */
+const REGION_PANEL_ID = { sidebar: 'sidebar', ai: 'ai', bottom: 'bottom' } as const
+
+/**
+ * 分隔条**松手**时：若该区域已贴到内容下限 → 关闭它。
+ *
+ * 三个设计决定，都是踩坑换来的（2026-09-20，勿回退）：
+ * - **直接量 DOM**（我们自己的 `[data-region]` 标记 div 的 `getBoundingClientRect`），不引入 ref / 模块级可变状态：
+ *   `App.tsx` 每次热更新都会重新求值模块顶层，模块级变量与 `window.addEventListener` 会**累积**，
+ *   旧闭包不失效 → 表现为「区域莫名自己关掉」。
+ * - **不用 `collapsible`**：库按 panel id 记账折叠态，关闭时卸载、重开时同 id 注册，可能恢复
+ *   「已折叠」记忆 → 区域看似回来了却仍是 0 宽；而且 `collapsible` 是「一过下限立刻折到 0」，
+ *   没有「停在下限」这一步。
+ * - **只在松手后关闭**：拖拽中库持有布局，此时卸载面板会让「注册 N 个 / DOM N−1 个」不一致，
+ *   `ResizeObserver` 回调随即抛 `Invalid N panel layout: …` 并刷屏。
+ */
+function closeIfAtFloor(region: 'sidebar' | 'ai' | 'bottom'): void {
+  const el = document.querySelector(`[data-region="${REGION_PANEL_ID[region]}"]`)
+  if (!(el instanceof HTMLElement)) return
+  const rect = el.getBoundingClientRect()
+  const px = region === 'bottom' ? rect.height : rect.width
+  // 容差 1px：`minSize` 也是像素，贴住下限时两者应当相等
+  if (px > 0 && px <= REGION_MIN_PX[region] + 1) {
+    useLayoutStore.getState().closeRegion(region)
+  }
+}
+
+/**
+ * NovelForge 主应用组件
+ * 使用 react-resizable-panels 实现可拖拽调整大小的四区布局：
+ * 每个区域有**内容下限**（到下限即停住）；在下限处松手 → 该区域**关闭（消失）**，
+ * 从活动栏 / 右侧图标栏可重新打开。实现细节见 `closeIfAtFloor` 的注释。
+ */
+export default function App() {
+  const initTheme = useThemeStore((s) => s.initTheme)
+  // 合并 layout selector 为单次 subscribe（useShallow 浅比较），避免过度订阅导致全树重渲染
+  const {
+    sidebarOpen, aiPanelOpen, rightView, settingsOpen, closeSettings,
+    newProjectOpen, closeNewProject,
+    importNovelOpen, closeImportNovel, chapterCreationOpen,
+    chapterCreationPrefill, closeChapterCreation,
+    focusMode, bottomPanelOpen,
+    activityDialogOpen, closeActivityDialog,
+    devConsoleOpen, closeDevConsole,
+  } = useLayoutStore(useShallow(s => ({
+    sidebarOpen: s.sidebarOpen,
+    aiPanelOpen: s.aiPanelOpen,
+    rightView: s.rightView,
+    settingsOpen: s.settingsOpen,
+    closeSettings: s.closeSettings,
+    newProjectOpen: s.newProjectOpen,
+    closeNewProject: s.closeNewProject,
+    importNovelOpen: s.importNovelOpen,
+    closeImportNovel: s.closeImportNovel,
+    chapterCreationOpen: s.chapterCreationOpen,
+    chapterCreationPrefill: s.chapterCreationPrefill,
+    closeChapterCreation: s.closeChapterCreation,
+    focusMode: s.focusMode,
+    bottomPanelOpen: s.bottomPanelOpen,
+    activityDialogOpen: s.activityDialogOpen,
+    closeActivityDialog: s.closeActivityDialog,
+    devConsoleOpen: s.devConsoleOpen,
+    closeDevConsole: s.closeDevConsole,
+  })))
+  // 开发者控制台可由 CLI/自动化远程打开（只负责开弹窗；后端仍有门禁）
+  useEffect(() => {
+    const target = window as Window & { __velaOpenDevConsole?: () => void }
+    target.__velaOpenDevConsole = () => useLayoutStore.getState().openDevConsole()
+    return () => { delete target.__velaOpenDevConsole }
+  }, [])
+
+  const initLLM = useLLMStore((s) => s.init)
+  const loadRecentProjects = useProjectStore((s) => s.loadRecentProjects)
+  const currentProject = useProjectStore((s) => s.currentProject)
+  const projectLoading = useProjectStore((s) => s.loading)
+  // 面板尺寸记忆：react-resizable-panels 自己按 group id 存 localStorage。
+  // 折叠态由 layout-store 持久化，两者合起来 = 重启后回到同一工作台。
+  const horizontalLayout = useDefaultLayout({ id: 'novelforge-main-horizontal', storage: localStorage })
+  const verticalLayout = useDefaultLayout({ id: 'novelforge-middle-vertical', storage: localStorage })
+  // 订阅 locale 只为让下面那个「窗口标题」effect 在**切语言时重跑**（回落标题是本地化的）
+  const { locale } = useTranslation()
+
+  // 窗口标题 = 「项目名 — NovelForge」（无项目回落应用标题）。见 lib/window-title 的说明：
+  // 我们是自绘顶栏，系统（任务栏 / Alt-Tab / Mission Control）看不到它，只认 document.title。
+  useEffect(() => {
+    setWindowTitle(currentProject?.name)
+  }, [currentProject?.name, locale])
+
+  // 写作自动化调度器（D 档）：项目打开时启动、关闭/切换时停止。
+  // 执行宿主 = 渲染进程（应用开着才跑）；关窗中断的 run 由 checkpoint 机制在下次启动续跑。
+  useEffect(() => {
+    if (!currentProject?.path || projectLoading) return
+    const { startScheduler, stopScheduler } = useAutomationStore.getState()
+    startScheduler()
+    return () => stopScheduler()
+  }, [currentProject?.path, projectLoading])
+
+
+  // 初始化：主题 + LLM 模型 + 最近项目 + 缩放级别
+  useEffect(() => {
+    const t0 = performance.now()
+    initTheme()
+    console.log(`[Startup] initTheme 完成: ${(performance.now() - t0).toFixed(0)}ms`)
+    const t1 = performance.now()
+    initLLM()
+    console.log(`[Startup] initLLM 触发: ${(performance.now() - t1).toFixed(0)}ms`)
+    // 全局思考等级（温度 + Agent 提示词强度）：与 initLLM 同批启动，读盘失败回退默认档
+    void useThinkingStore.getState().init()
+    const t2 = performance.now()
+    loadRecentProjects()
+    console.log(`[Startup] loadRecentProjects 触发: ${(performance.now() - t2).toFixed(0)}ms`)
+    // 加载全局自定义 Prompt 覆盖（Issue #19：此前从未调用导致自定义保存后回退内置模板）
+    loadCustomPrompts()
+    // 初始化 MCP Store
+    useMCPStore.getState().init().catch(e => console.warn('[MCP] 初始化失败:', e))
+    if (ipc.isElectron) {
+      const savedZoom = localStorage.getItem('vela-zoom-level')
+      if (savedZoom) ipc.setZoomLevel(parseFloat(savedZoom))
+    }
+    // 渲染层门禁：未启用时隐藏命令面板/设置页入口
+    void useDevConsoleStore.getState().refresh()
+
+    // 初始化 ProjectService — 注册全局事件监听（生命周期与 App 一致）
+    import('./services/project-service').then(({ initProjectService }) => {
+      initProjectService()
+      // 自动化/CLI 入口：主进程通过 --project=<路径> / --dev-console 注入 query；
+      // 打开后清掉 query，避免刷新重复打开。
+      const params = new URLSearchParams(window.location.search)
+      const requestedProject = params.get('project')
+      const openDevConsoleOnStart = params.get('devconsole') === '1'
+      const isolatedInstanceId = params.get('instance')
+      if (requestedProject || openDevConsoleOnStart || isolatedInstanceId) {
+        window.history.replaceState({}, '', window.location.pathname)
+      }
+      if (requestedProject) {
+        void useProjectStore.getState().openProject(requestedProject)
+          .catch(e => console.warn('[Startup] 打开指定项目失败:', e))
+      }
+      if (openDevConsoleOnStart) {
+        useLayoutStore.getState().openDevConsole()
+      }
+    }).catch(e => console.warn('[ProjectService] 初始化失败:', e))
+
+    // 初始化 TransferHub — 中枢消息路由（中间件管道 + 请求响应）
+    import('./services/hub-service').then(({ initializeHub }) => {
+      initializeHub()
+    }).catch(e => console.warn('[HubService] 初始化失败:', e))
+
+    // C) 工作流完成时弹出 ActionToast 通知（不依赖任何面板状态）+ 线② 2b D5 注入对话内完成回执卡片
+    const unsubActionToast = globalEventBus.on('WORKFLOW_COMPLETE', (payload) => {
+      const { activeRuns, history } = useWorkflowStore.getState()
+      // emit 早于「移入 history」：刚完成的 run 此刻仍在 activeRuns（status=completed/failed）
+      const latest = payload.runId
+        ? (activeRuns.find(r => r.id === payload.runId) ?? history.find(r => r.id === payload.runId))
+        : history.find(r => r.status === 'completed')
+      if (!latest) return
+      const shortTitle = latest.title.replace(/^[^\s]+\s/, '')
+      // D5：对话内卡片为主——往活跃会话追加 workflow_completed 产物（无活跃会话时静默 no-op）
+      useAgentStore.getState().appendWorkflowCompletion(latest.title, payload.status ?? 'success', latest.id)
+      // 线③ 第 3 条：错误面统一——失败弹失败提示（此前无论成败都弹「✅ 完成」，误导用户）
+      if (payload.status === 'failed') {
+        toast.error(`「${shortTitle}」${t('agent.taskFailed')}`)
+      } else {
+        toast.workflowComplete(
+          `「${shortTitle}」${t('agent.taskComplete')}`,
+          () => {
+            useWorkflowStore.getState().selectRun(latest.id)
+            useLayoutStore.getState().openRightPanel('ai-output')
+          }
+        )
+      }
+    })
+
+    return () => {
+      // App 卸载时销毁 ProjectService（开发环境 HMR 时会触发）
+      import('./services/project-service').then(({ disposeProjectService }) => {
+        disposeProjectService()
+      }).catch(() => {})
+      // 销毁 TransferHub
+      import('./services/hub-service').then(({ destroyHub }) => {
+        destroyHub()
+      }).catch(() => {})
+      unsubActionToast()
+    }
+  }, [initTheme, initLLM, loadRecentProjects])
+
+  // 全局快捷键：命令面板优先，其后是工作台导航与原有缩放/项目操作。
+  // F11 专注模式本身不带修饰键，须在 mod 判断之前拦截。
+  useEffect(() => {
+    const isTypingTarget = (target: EventTarget | null): boolean => {
+      if (!(target instanceof HTMLElement)) return false
+      const tag = target.tagName.toLowerCase()
+      return tag === 'input' || tag === 'textarea' || tag === 'select' || target.isContentEditable
+    }
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      const binding = (id: string) => shortcutBinding(id)
+      if (matchesBinding(e, binding('focus-mode'))) {
+        e.preventDefault()
+        useLayoutStore.getState().toggleFocusMode()
+        return
+      }
+      // 命令面板（所有工作台操作的键盘入口）
+      if (matchesBinding(e, binding('command-palette'))) {
+        e.preventDefault()
+        useCommandStore.getState().togglePalette('commands')
+        return
+      }
+      // 快捷键速查（输入框/正文内不抢字符）
+      if (matchesBinding(e, binding('shortcuts-help')) && !isTypingTarget(e.target)) {
+        e.preventDefault()
+        useCommandStore.getState().openPalette('shortcuts')
+        return
+      }
+      if (matchesBinding(e, binding('zoom-in'))) {
+        e.preventDefault()
+        useThemeStore.getState().zoomIn()
+      } else if (matchesBinding(e, binding('zoom-out'))) {
+        e.preventDefault()
+        useThemeStore.getState().zoomOut()
+      } else if (matchesBinding(e, binding('zoom-reset'))) {
+        e.preventDefault()
+        useThemeStore.getState().zoomReset()
+      } else if (matchesBinding(e, binding('new-project'))) {
+        e.preventDefault()
+        useLayoutStore.getState().openNewProject()
+      } else if (matchesBinding(e, binding('open-project'))) {
+        e.preventDefault()
+        const folder = await ipc.invoke('dialog:select-folder')
+        if (folder) {
+          useProjectStore.getState().openProject(folder)
+        }
+      } else if (matchesBinding(e, binding('toggle-sidebar'))) {
+        e.preventDefault()
+        useLayoutStore.getState().toggleSidebar()
+      } else if (matchesBinding(e, binding('toggle-bottom'))) {
+        e.preventDefault()
+        useLayoutStore.getState().toggleBottomPanel()
+      } else if (matchesBinding(e, binding('toggle-agent'))) {
+        e.preventDefault()
+        useLayoutStore.getState().toggleAIPanel()
+      } else if (matchesBinding(e, binding('settings'))) {
+        e.preventDefault()
+        useLayoutStore.getState().openSettings()
+      } else if (matchesBinding(e, binding('check-updates'))) {
+        // 检查更新（原原生菜单 accelerator CmdOrCtrl+U，菜单已迁移至设置界面）
+        e.preventDefault()
+        useUpdateStore.getState().checkForUpdates()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  return (
+    <div className="flex flex-col w-full h-full overflow-hidden">
+      {/* 顶栏：系统窗口按钮留位 + 拖拽区 + 应用标识（见 TitleStrip 的说明） */}
+      <TitleStrip />
+
+      {/* 全局 title 悬停提示代理 — 原生 title 属性 → 现代化 Tooltip UI */}
+      <GlobalTitleTooltip />
+
+      {/*
+        主体：flex 行 = LeftBar | 纵向PanelGroup | RightBar
+        ┌───┬──────────────────────────────┬───┐
+        │   │  Sidebar | Editor | AIPanel  │   │
+        │ L │──────────────────────────────│ R │
+        │   │     BottomPanel (全宽)        │   │
+        └───┴──────────────────────────────┴───┘
+      */}
+      {/* 键盘导航跳过链接（仅 focus 时可见），直达编辑区主内容 */}
+      <a
+        href="#main-editor-area"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:px-4 focus:py-2 focus:bg-[var(--color-accent)] focus:text-white focus:rounded"
+      >
+        {t('tip.skipToContent')}
+      </a>
+
+      {/* 整块内容区就是「画布」：padding 3px = 外围缝隙，恰为卡片之间内部缝隙（6px）的一半，
+          且与内部缝隙同为画布色、连成一体。图标栏与相邻面板之间不留缝——它们绑定成一张卡片。
+          （标题栏已于 2026-09-22 移除，四边缝因此等宽对称。） */}
+      <div
+        className="flex flex-1 overflow-hidden"
+        style={{ backgroundColor: 'var(--color-canvas)', padding: 3 }}
+      >
+
+        {/* 左侧工具窗口栏（全高，包括底部面板区域）— 专注模式下隐藏（与其余面板一致） */}
+        {!focusMode && <LeftToolWindowBar />}
+
+        {/* 卡片层：卡片之间的缝隙露出的就是画布底色 */}
+        <div data-canvas="true" className="flex-1 min-w-0 flex overflow-hidden">
+
+          {/* 横向 PanelGroup：侧边栏 | 中列（编辑区 + 底栏） | AI 面板。
+              ⚠️ 底栏只占**中列**（编辑区正下方），两侧面板向下延伸到底——2026-09-22 用户定的布局；
+              此前底栏是全宽（挂在纵向 group 的下层），侧栏/AI 够不到底部。 */}
+          <PanelGroup
+            orientation="horizontal"
+            className="flex-1"
+            defaultLayout={horizontalLayout.defaultLayout}
+            onLayoutChanged={horizontalLayout.onLayoutChanged}
+          >
+
+            {/* 左侧边栏 — 专注模式下隐藏 */}
+            {(sidebarOpen && !focusMode) && (
+              <>
+                <Panel
+                  id="sidebar"
+                  defaultSize={SIDEBAR_DEFAULT}
+                  minSize={REGION_MIN_PX.sidebar}
+                  maxSize={REGION_MAX_PX.sidebar}
+                  aria-label={t('panel.sidebar')}
+                >
+                  {/* data-region 是**我们自己**的标记：`closeIfAtFloor` 靠它量尺寸。
+                      ⚠️ 不要改用库的 `data-panel` —— 那是无值属性（渲染成 data-panel="true"），
+                      拿 id 去选永远匹配不到（2026-09-20 实测踩过）。 */}
+                  <div data-region="sidebar" className="h-full">
+                    <ErrorBoundary fallbackLabel={t('error.sidebarFailed')}>
+                      <Sidebar />
+                    </ErrorBoundary>
+                  </div>
+                </Panel>
+                {/* 松手时若侧栏已贴到内容下限 → 关闭它（见组件内 closeIfAtFloor 注释） */}
+                <PanelResizeHandle onPointerUp={() => closeIfAtFloor('sidebar')} />
+              </>
+            )}
+
+            {/* 中列：编辑区（上）+ 底栏（下）。这一列的宽度下限就是编辑区下限（EDITOR_MIN_PX） */}
+            <Panel id="middle" defaultSize={EDITOR_DEFAULT} minSize={EDITOR_MIN_PX}>
+              <PanelGroup
+                orientation="vertical"
+                className="h-full"
+                defaultLayout={verticalLayout.defaultLayout}
+                onLayoutChanged={verticalLayout.onLayoutChanged}
+              >
+
+                {/* 编辑区 — 专注模式下居中 + 大字号 */}
+                <Panel id="editor" defaultSize="75%" minSize="25%" aria-label={t('panel.editor')}>
+                  <div id="main-editor-area" />
+                  <div data-region="editor" className={focusMode ? 'max-w-[720px] mx-auto h-full text-[18px]' : 'h-full'}>
+                    <ErrorBoundary fallbackLabel={t('error.editorFailed')}>
+                      <EditorArea onNewProject={() => useLayoutStore.getState().openNewProject()} />
+                    </ErrorBoundary>
+                  </div>
+                </Panel>
+
+                {/* 底栏 — bottomPanelOpen 控制显隐（镜像右侧 aiPanelOpen 模式） */}
+                {(bottomPanelOpen && !focusMode) && <PanelResizeHandle onPointerUp={() => closeIfAtFloor('bottom')} />}
+                {(bottomPanelOpen && !focusMode) && (
+                  <Panel
+                    id="bottom"
+                    defaultSize="25%"
+                    minSize={REGION_MIN_PX.bottom}
+                    maxSize="55%"
+                    aria-label={t('panel.bottom')}
+                  >
+                    <div data-region="bottom" className="h-full">
+                      <ErrorBoundary fallbackLabel={t('error.taskPanelFailed')}>
+                        <BottomPanel />
+                      </ErrorBoundary>
+                    </div>
+                  </Panel>
+                )}
+              </PanelGroup>
+            </Panel>
+
+            {/* 右侧面板（Agent 对话 / AI 输出）— 专注模式下隐藏 */}
+            {(aiPanelOpen && !focusMode) && (
+              <>
+                {/* 松手时若 AI 面板已贴到内容下限 → 关闭它 */}
+                <PanelResizeHandle onPointerUp={() => closeIfAtFloor('ai')} />
+                <Panel
+                  id="ai-panel"
+                  defaultSize={AI_PANEL_DEFAULT}
+                  minSize={REGION_MIN_PX.ai}
+                  maxSize={REGION_MAX_PX.ai}
+                  aria-label={t('panel.ai')}
+                >
+                  <div data-region="ai" className="h-full">
+                    <ErrorBoundary fallbackLabel={t('error.aiPanelFailed')}>
+                      {rightView === 'ai-output' ? <AIOutputPanel /> : <AIPanel />}
+                    </ErrorBoundary>
+                  </div>
+                </Panel>
+              </>
+            )}
+          </PanelGroup>
+        </div>
+
+        {/* 右侧工具窗口栏 — 专注模式下隐藏 */}
+        {!focusMode && <RightToolWindowBar />}
+      </div>
+
+
+      {/* 状态栏（全宽） */}
+      <StatusBar />
+
+      {/* 全局对话框 — 由 layout-store 控制开关，每个包裹独立 ErrorBoundary 防止单点崩溃 */}
+      <ErrorBoundary fallbackLabel={t('error.dialogFailed')}>
+        <NewProjectDialog
+          open={newProjectOpen}
+          onClose={closeNewProject}
+        />
+      </ErrorBoundary>
+      <ErrorBoundary fallbackLabel={t('error.dialogFailed')}>
+        <ImportNovelDialog
+          open={importNovelOpen}
+          onClose={closeImportNovel}
+        />
+      </ErrorBoundary>
+      <ErrorBoundary fallbackLabel={t('error.dialogFailed')}>
+        <ChapterCreationDialog
+          isOpen={chapterCreationOpen}
+          prefill={chapterCreationPrefill}
+          onClose={closeChapterCreation}
+        />
+      </ErrorBoundary>
+      {/* 写作统计弹窗（2026-09-22 由"编辑区页面"改为弹窗） */}
+      <ErrorBoundary fallbackLabel={t('error.dialogFailed')}>
+        <ActivityDialog
+          open={activityDialogOpen}
+          onClose={closeActivityDialog}
+        />
+      </ErrorBoundary>
+      {/* 开发者控制台（仅开发态/显式开启；内部有门禁） */}
+      <ErrorBoundary fallbackLabel={t('error.dialogFailed')}>
+        <DevConsoleDialog
+          open={devConsoleOpen}
+          onClose={closeDevConsole}
+        />
+      </ErrorBoundary>
+      {/* 全屏设置弹窗 — key 随开关变化重新挂载，保证每次打开回到默认分区 */}
+      <ErrorBoundary fallbackLabel={t('error.dialogFailed')}>
+        <SettingsModal
+          key={String(settingsOpen)}
+          open={settingsOpen}
+          onClose={closeSettings}
+        />
+      </ErrorBoundary>
+
+      {/* Cmd+K 命令面板 — 全局键盘入口，层级高于面板、低于确认框 */}
+      <ErrorBoundary fallbackLabel={t('error.dialogFailed')}>
+        <CommandPalette />
+      </ErrorBoundary>
+
+    </div>
+  )
+}

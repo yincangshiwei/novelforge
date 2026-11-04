@@ -1,0 +1,436 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
+
+// 临时假 home：vi.hoisted 在 mock 注册前求值（真实临时目录，fs 操作真实发生）
+const fakeHome = vi.hoisted(() => {
+  const base = process.env.TEMP ?? process.env.TMP ?? process.cwd()
+  return `${base}/vela-dir-rename-config-test-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+})
+
+vi.mock('node:os', () => ({
+  homedir: () => fakeHome,
+  default: { homedir: () => fakeHome },
+}))
+
+// config-utils 模块级计算 VELA_HOME = path.join(os.homedir(), '.novelforge')——
+// 静态 import 在 vi.mock 生效后求值，拿到的是 mock home
+import {
+  VELA_HOME,
+  GLOBAL_CONFIG_PATH,
+  migrateLegacyDirs,
+  getProjectVelaDir,
+  readJsonFile,
+  backupFileOnce,
+  CREDENTIAL_MIGRATION_BACKUP_SUFFIX,
+  DEFAULT_GLOBAL_CONFIG,
+  DEFAULT_LOCAL_EMBEDDING,
+  readLocalEmbeddingConfig,
+} from './config-utils'
+
+const legacyHome = path.join(fakeHome, '.vela')
+
+beforeEach(() => {
+  vi.restoreAllMocks()
+  // 确保每个用例从空目录开始（afterEach 已清理，首用例目录尚不存在）
+  fs.rmSync(fakeHome, { recursive: true, force: true })
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  fs.rmSync(fakeHome, { recursive: true, force: true })
+})
+
+describe('全局迁移 ~/.vela → ~/.novelforge', () => {
+  it('旧目录存在且新目录不存在 → rename（VELA_HOME 已是新路径）', async () => {
+    expect(VELA_HOME).toBe(path.join(fakeHome, '.novelforge'))
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"dark"}')
+
+    await migrateLegacyDirs()
+
+    expect(fs.existsSync(legacyHome)).toBe(false)
+    expect(fs.existsSync(VELA_HOME)).toBe(true)
+    // 内容随目录整体迁移
+    expect(fs.readFileSync(path.join(VELA_HOME, 'config.json'), 'utf-8')).toBe('{"theme":"dark"}')
+  })
+
+  it('新 home 已有 config.json（用户手动新建过/已迁移）→ 不覆盖，保留双读（双路径兜底）', async () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'old-marker.txt'), 'old')
+    fs.writeFileSync(path.join(VELA_HOME, 'config.json'), '{"theme":"dark"}')
+    fs.writeFileSync(path.join(VELA_HOME, 'new-marker.txt'), 'new')
+
+    await migrateLegacyDirs()
+
+    // config.json 哨兵存在 → 不迁移：新 home 内容未被覆盖
+    expect(fs.readFileSync(path.join(VELA_HOME, 'config.json'), 'utf-8')).toBe('{"theme":"dark"}')
+    expect(fs.readFileSync(path.join(VELA_HOME, 'new-marker.txt'), 'utf-8')).toBe('new')
+    // 旧目录保留（双读兜底，数据不丢）
+    expect(fs.existsSync(legacyHome)).toBe(true)
+    expect(fs.readFileSync(path.join(legacyHome, 'old-marker.txt'), 'utf-8')).toBe('old')
+  })
+
+  it('旧目录不存在（全新安装）→ 无操作', async () => {
+    await migrateLegacyDirs()
+
+    expect(fs.existsSync(legacyHome)).toBe(false)
+    expect(fs.existsSync(VELA_HOME)).toBe(false)
+  })
+
+  it('rename 失败 → 静默回退，不阻塞启动（console.error 后继续用旧路径）', async () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"dark"}')
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw new Error('EPERM') })
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await expect(migrateLegacyDirs()).resolves.toBeUndefined() // 不抛错
+
+    expect(errorSpy).toHaveBeenCalled()
+    expect(fs.existsSync(legacyHome)).toBe(true)   // 旧目录保留
+    expect(fs.existsSync(VELA_HOME)).toBe(false)   // 新目录未创建
+  })
+
+  it('迁移重试：真实失败会话副产物（logs 含当日 .log + dev/ 空或仅 .log）→ 判定 auto → 清理后真实 rename 成功', async () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"light"}')
+    fs.writeFileSync(path.join(legacyHome, 'old-marker.txt'), 'old')
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    // 第一次调用（本启动）：rename 瞬时失败（EBUSY）
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw new Error('EBUSY') })
+    await migrateLegacyDirs()
+    expect(renameSpy).toHaveBeenCalledTimes(1)
+    expect(errorSpy).toHaveBeenCalled()
+    expect(fs.existsSync(legacyHome)).toBe(true)
+
+    // 模拟同次启动后续的运行时副产物（运行时可达状态）：
+    // ensureVelaHome 空建 {path,prompts,logs} + main.ts logger 首写 logs/vela-<date>.log
+    // + Dev 模式 logs/dev/vela-dev-<date>.log。仍无 config.json 哨兵
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.mkdirSync(path.join(VELA_HOME, 'prompts'), { recursive: true })
+    fs.mkdirSync(path.join(VELA_HOME, 'logs'), { recursive: true })
+    fs.writeFileSync(path.join(VELA_HOME, 'logs', 'vela-2026-08-27.log'), '[info] fake session log')
+    fs.mkdirSync(path.join(VELA_HOME, 'logs', 'dev'), { recursive: true })
+    fs.writeFileSync(path.join(VELA_HOME, 'logs', 'dev', 'vela-dev-2026-08-27.log'), '[debug] fake dev log')
+    expect(fs.existsSync(GLOBAL_CONFIG_PATH)).toBe(false)
+
+    // 第二次调用（下次启动）：auto 形态（空 prompts + 仅 .log 的 logs/dev）被识别并通过
+    // isAutoCreatedHome 判定（日志为应用自身副产物）→ 清理 → 真实 rename 成功
+    await migrateLegacyDirs()
+
+    expect(renameSpy).toHaveBeenCalledTimes(2)
+    expect(fs.existsSync(legacyHome)).toBe(false)
+    expect(fs.readFileSync(path.join(VELA_HOME, 'config.json'), 'utf-8')).toBe('{"theme":"light"}')
+    expect(fs.readFileSync(path.join(VELA_HOME, 'old-marker.txt'), 'utf-8')).toBe('old')
+    // 副产物日志随 auto 树清理（oldHome 无 logs——迁移正确性以旧数据为准）
+    expect(fs.existsSync(path.join(VELA_HOME, 'logs'))).toBe(false)
+  })
+
+  it('安全边界：newHome 含用户数据（非 auto 形态）→ 绝不删除，rename 失败静默回退（双读兜底）', async () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"light"}')
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.writeFileSync(path.join(VELA_HOME, 'user-notes.txt'), 'mine') // 用户手工放入的数据
+    fs.mkdirSync(path.join(VELA_HOME, 'prompts'), { recursive: true })
+    fs.writeFileSync(path.join(VELA_HOME, 'prompts', 'premise.json'), '{}')
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await migrateLegacyDirs()
+
+    // 安全边界：含用户数据的新目录未被删除；rename 失败（Win32 目标已存在 EPERM 实测）→
+    // 静默回退——旧目录保留（双路径兜底，数据不丢）
+    expect(fs.readFileSync(path.join(VELA_HOME, 'user-notes.txt'), 'utf-8')).toBe('mine')
+    expect(fs.readFileSync(path.join(VELA_HOME, 'prompts', 'premise.json'), 'utf-8')).toBe('{}')
+    expect(fs.existsSync(legacyHome)).toBe(true)
+    expect(fs.readFileSync(path.join(legacyHome, 'config.json'), 'utf-8')).toBe('{"theme":"light"}')
+  })
+
+  it('迁移重试：空建 skills/templates/agent-archive（应用面板列表或归档自动创建）→ auto → 清理后真实 rename 成功', async () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"light"}')
+    fs.writeFileSync(path.join(legacyHome, 'old-marker.txt'), 'old')
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    // 第一次调用（本启动）：rename 瞬时失败（EBUSY）
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw new Error('EBUSY') })
+    await migrateLegacyDirs()
+    expect(renameSpy).toHaveBeenCalledTimes(1)
+    expect(errorSpy).toHaveBeenCalled()
+    expect(fs.existsSync(legacyHome)).toBe(true)
+
+    // 模拟失败会话中的运行时副产物：skills:list 空建 skills/、templates:list 空建 templates/、
+    // agent-archive-list 空建 agent-archive/（仍无 config.json 哨兵）
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.mkdirSync(path.join(VELA_HOME, 'skills'), { recursive: true })
+    fs.mkdirSync(path.join(VELA_HOME, 'templates'), { recursive: true })
+    fs.mkdirSync(path.join(VELA_HOME, 'agent-archive'), { recursive: true })
+    expect(fs.existsSync(GLOBAL_CONFIG_PATH)).toBe(false)
+
+    // 第二次调用（下次启动）：空建目录均在 auto 形态白名单（应用自有空目录）→ 清理 → 真实 rename 成功
+    await migrateLegacyDirs()
+
+    expect(renameSpy).toHaveBeenCalledTimes(2)
+    expect(fs.existsSync(legacyHome)).toBe(false)
+    expect(fs.readFileSync(path.join(VELA_HOME, 'config.json'), 'utf-8')).toBe('{"theme":"light"}')
+    expect(fs.readFileSync(path.join(VELA_HOME, 'old-marker.txt'), 'utf-8')).toBe('old')
+  })
+
+  it('安全边界：skills/ 含用户导入技能（非空）→ 判定非 auto → 绝不删除，双读兜底', async () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"light"}')
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.mkdirSync(path.join(VELA_HOME, 'skills'), { recursive: true })
+    fs.writeFileSync(path.join(VELA_HOME, 'skills', 'my-skill.md'), 'imported skill') // 用户导入的技能
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await migrateLegacyDirs()
+
+    // 非空 skills → 非 auto（应用副产物判定失败）→ 绝不删除 → rename 失败静默回退
+    expect(fs.readFileSync(path.join(VELA_HOME, 'skills', 'my-skill.md'), 'utf-8')).toBe('imported skill')
+    expect(fs.existsSync(legacyHome)).toBe(true)
+    expect(fs.readFileSync(path.join(legacyHome, 'config.json'), 'utf-8')).toBe('{"theme":"light"}')
+  })
+
+  it('安全边界：logs 含用户文件（非 .log，如 memo.txt）→ 判定非 auto → 不删，双读兜底', async () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"light"}')
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.mkdirSync(path.join(VELA_HOME, 'logs'), { recursive: true })
+    fs.writeFileSync(path.join(VELA_HOME, 'logs', 'memo.txt'), 'user memo') // 用户放入 logs 的非日志文件
+
+    await migrateLegacyDirs()
+
+    // logs 含非 .log 文件 → 非 auto（应用副产物判定失败）→ 绝不删除 → rename 失败静默回退
+    expect(fs.readFileSync(path.join(VELA_HOME, 'logs', 'memo.txt'), 'utf-8')).toBe('user memo')
+    expect(fs.existsSync(legacyHome)).toBe(true)
+    expect(fs.readFileSync(path.join(legacyHome, 'config.json'), 'utf-8')).toBe('{"theme":"light"}')
+  })
+})
+
+describe('readJsonFile 全局配置旧路径回读（迁移失败残留兜底）', () => {
+  it('新路径文件缺失 + ~/.vela 旧文件存在（迁移失败）→ 回读旧文件', () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"dark"}')
+
+    expect(readJsonFile(GLOBAL_CONFIG_PATH, { fallback: true })).toEqual({ theme: 'dark' })
+  })
+
+  it('新路径存在 → 读新的（不回读旧）', () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"dark"}')
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.writeFileSync(path.join(VELA_HOME, 'config.json'), '{"theme":"light"}')
+
+    expect(readJsonFile(GLOBAL_CONFIG_PATH, { fallback: true })).toEqual({ theme: 'light' })
+  })
+
+  it('全新安装（~/.vela 无配置文件）→ 无回读，返回 fallback', () => {
+    expect(readJsonFile(GLOBAL_CONFIG_PATH, { fallback: true })).toEqual({ fallback: true })
+  })
+
+  it('新路径存在但 JSON 损坏 → 不回退旧路径（仅对「文件不存在」回退，保持现状）', () => {
+    fs.mkdirSync(legacyHome, { recursive: true })
+    fs.writeFileSync(path.join(legacyHome, 'config.json'), '{"theme":"dark"}')
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.writeFileSync(path.join(VELA_HOME, 'config.json'), '{broken')
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    expect(readJsonFile(GLOBAL_CONFIG_PATH, { fallback: true })).toEqual({ fallback: true })
+  })
+})
+
+describe('项目目录迁移 + 双路径（getProjectVelaDir）', () => {
+  it('.vela 存在且 .novelforge 不存在 → 惰性迁移后返回新路径', () => {
+    const proj = path.join(fakeHome, 'proj-a')
+    fs.mkdirSync(path.join(proj, '.vela'), { recursive: true })
+    fs.writeFileSync(path.join(proj, '.vela', 'vela.db'), 'sqlite')
+
+    const result = getProjectVelaDir(proj)
+
+    expect(result).toBe(path.join(proj, '.novelforge'))
+    expect(fs.existsSync(path.join(proj, '.vela'))).toBe(false)
+    expect(fs.existsSync(path.join(proj, '.novelforge', 'vela.db'))).toBe(true)
+  })
+
+  it('.novelforge 已存在 → 直接返回新路径，旧 .vela 不动（双路径兜底）', () => {
+    const proj = path.join(fakeHome, 'proj-b')
+    fs.mkdirSync(path.join(proj, '.novelforge'), { recursive: true })
+    fs.mkdirSync(path.join(proj, '.vela'), { recursive: true })
+    fs.writeFileSync(path.join(proj, '.vela', 'legacy-db'), 'old')
+
+    const result = getProjectVelaDir(proj)
+
+    expect(result).toBe(path.join(proj, '.novelforge'))
+    expect(fs.existsSync(path.join(proj, '.vela', 'legacy-db'))).toBe(true) // 旧目录未被清
+  })
+
+  it('rename 失败 → 回退旧路径（直开点 existsSync 检查不静默漏读）', () => {
+    const proj = path.join(fakeHome, 'proj-c')
+    fs.mkdirSync(path.join(proj, '.vela'), { recursive: true })
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => { throw new Error('EPERM') })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const result = getProjectVelaDir(proj)
+
+    // 回退旧路径而非新路径——激活上述直开点 existsSync 检查继续读到旧库
+    expect(result).toBe(path.join(proj, '.vela'))
+    expect(fs.existsSync(path.join(proj, '.vela'))).toBe(true)
+    expect(fs.existsSync(path.join(proj, '.novelforge'))).toBe(false)
+  })
+
+  it('新项目（无任何目录）→ 用 .novelforge 创建（返回新路径）', () => {
+    const proj = path.join(fakeHome, 'proj-d')
+    fs.mkdirSync(proj, { recursive: true })
+
+    const result = getProjectVelaDir(proj)
+
+    expect(result).toBe(path.join(proj, '.novelforge'))
+    // 函数本身只返回路径，实际创建由调用方（database.ts mkdirSync）负责
+    expect(fs.existsSync(path.join(proj, '.novelforge'))).toBe(false)
+  })
+})
+
+// ============================================================
+// T4：GlobalConfig.localEmbedding 默认值 + 读取（单一真源）
+// ============================================================
+
+describe('T4 默认值：DEFAULT_GLOBAL_CONFIG.localEmbedding', () => {
+  it('默认值 = { enabled:false, baseUrl:http://localhost:11434, model:bge-m3, preferLocal:true }', () => {
+    expect(DEFAULT_GLOBAL_CONFIG.localEmbedding).toEqual({
+      enabled: false,
+      baseUrl: 'http://localhost:11434',
+      model: 'bge-m3',
+      preferLocal: true,
+    })
+  })
+
+  it('与 DEFAULT_LOCAL_EMBEDDING 同值（单一真源：不是两份会漂移的字面量）', () => {
+    expect(DEFAULT_GLOBAL_CONFIG.localEmbedding).toEqual(DEFAULT_LOCAL_EMBEDDING)
+  })
+
+  it('默认 enabled=false（改造前行为：本地档完全不参与，默认路径用户无感）', () => {
+    expect(DEFAULT_GLOBAL_CONFIG.localEmbedding?.enabled).toBe(false)
+  })
+})
+
+describe('readLocalEmbeddingConfig（读失败/缺字段 → 回退默认）', () => {
+  const writeGlobalConfig = (value: unknown) => {
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.writeFileSync(GLOBAL_CONFIG_PATH, JSON.stringify(value), 'utf-8')
+  }
+
+  it('文件不存在（全新安装）→ 默认值（enabled=false）', () => {
+    expect(fs.existsSync(GLOBAL_CONFIG_PATH)).toBe(false)
+    expect(readLocalEmbeddingConfig()).toEqual(DEFAULT_LOCAL_EMBEDDING)
+  })
+
+  it('配置存在但缺 localEmbedding 字段 → 默认值', () => {
+    writeGlobalConfig({ theme: 'light', defaultModelId: null })
+    expect(readLocalEmbeddingConfig()).toEqual(DEFAULT_LOCAL_EMBEDDING)
+  })
+
+  it('JSON 损坏 → 默认值（不抛，不阻塞 IPC）', () => {
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.writeFileSync(GLOBAL_CONFIG_PATH, '{ this is not json', 'utf-8')
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    expect(readLocalEmbeddingConfig()).toEqual(DEFAULT_LOCAL_EMBEDDING)
+  })
+
+  it('localEmbedding 不是对象（如字符串）→ 默认值', () => {
+    writeGlobalConfig({ localEmbedding: 'on' })
+    expect(readLocalEmbeddingConfig()).toEqual(DEFAULT_LOCAL_EMBEDDING)
+  })
+
+  it('部分字段 → 逐字段回退；preferLocal 缺省为 true（本地优先）', () => {
+    writeGlobalConfig({ localEmbedding: { enabled: true } })
+    expect(readLocalEmbeddingConfig()).toEqual({
+      enabled: true,
+      baseUrl: 'http://localhost:11434',
+      model: 'bge-m3',
+      preferLocal: true,
+    })
+  })
+
+  it('baseUrl/model 为空白串 → 回退默认（不向空 URL 发请求）', () => {
+    writeGlobalConfig({ localEmbedding: { enabled: true, baseUrl: '   ', model: '' } })
+    const cfg = readLocalEmbeddingConfig()
+    expect(cfg.baseUrl).toBe('http://localhost:11434')
+    expect(cfg.model).toBe('bge-m3')
+  })
+
+  it('enabled 非严格真值（字符串 "true"）→ false（不误开本地档、不向用户机器发起网络探测）', () => {
+    writeGlobalConfig({ localEmbedding: { enabled: 'true', baseUrl: 'http://127.0.0.1:11434', model: 'bge-m3' } })
+    expect(readLocalEmbeddingConfig().enabled).toBe(false)
+  })
+
+  it('preferLocal 显式 false → 保留 false（顺序变为 api 优先、本地兜底）', () => {
+    writeGlobalConfig({ localEmbedding: { enabled: true, preferLocal: false } })
+    expect(readLocalEmbeddingConfig().preferLocal).toBe(false)
+  })
+
+  it('返回副本：调用方改动不污染 DEFAULT_LOCAL_EMBEDDING（防跨调用/跨模块污染）', () => {
+    const first = readLocalEmbeddingConfig()
+    first.model = 'mutated'
+    first.enabled = true
+
+    expect(DEFAULT_LOCAL_EMBEDDING.model).toBe('bge-m3')
+    expect(DEFAULT_LOCAL_EMBEDDING.enabled).toBe(false)
+    expect(readLocalEmbeddingConfig()).toEqual(DEFAULT_LOCAL_EMBEDDING)
+  })
+})
+
+/**
+ * `backupFileOnce`（T4 迁移留档）—— 终审小修②：直写 `dest` 会留下截断的 .bak，
+ * 而下次运行只看「目标存在」即 skipped → 回退点永久坏在半截。
+ * 本组钉住：字节一致、已存在不覆盖、中转文件不残留、**写的是 tmp 再 rename**。
+ */
+describe('backupFileOnce（*.pre-credentials.bak）', () => {
+  const srcPath = () => path.join(VELA_HOME, 'providers.json')
+  const bakPath = () => srcPath() + CREDENTIAL_MIGRATION_BACKUP_SUFFIX
+
+  const seedSource = (text: string) => {
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    fs.writeFileSync(srcPath(), text, 'utf-8')
+  }
+
+  it('首次 → copied（按原始字节）；目标已存在 → skipped 且不覆盖（第一次的回退点更珍贵）', () => {
+    seedSource('{"version":2,\n  "revision":3}\n')
+    expect(backupFileOnce(srcPath())).toBe('copied')
+    // 字节级一致（不是「解析后再写」：注释/格式/换行都要原样）
+    expect(fs.readFileSync(bakPath(), 'utf-8')).toBe('{"version":2,\n  "revision":3}\n')
+
+    seedSource('{"version":2,"revision":9}')
+    expect(backupFileOnce(srcPath())).toBe('skipped')
+    expect(fs.readFileSync(bakPath(), 'utf-8')).toBe('{"version":2,\n  "revision":3}\n')
+  })
+
+  it('原子写：先复制到 dest.tmp.…，再 rename 到 dest（目录里不留中转文件）', () => {
+    seedSource('{"a":1}')
+    const copySpy = vi.spyOn(fs, 'copyFileSync')
+    const renameSpy = vi.spyOn(fs, 'renameSync')
+
+    expect(backupFileOnce(srcPath())).toBe('copied')
+
+    const [copySrc, copyDest] = copySpy.mock.calls[0] as unknown as [string, string]
+    expect(copySrc).toBe(srcPath())
+    expect(copyDest).not.toBe(bakPath())            // 绝不直写 .bak（崩溃 = 截断的回退点）
+    expect(copyDest.startsWith(bakPath() + '.tmp.')).toBe(true)
+    expect(renameSpy).toHaveBeenCalledWith(copyDest, bakPath())
+    // 中转产物不残留（成功路径）
+    expect(fs.readdirSync(VELA_HOME).filter((n) => n.includes('.tmp.'))).toEqual([])
+  })
+
+  it('源不存在 → missing（不产生 .bak）；目标已存在时源消失也只是 skipped', () => {
+    fs.mkdirSync(VELA_HOME, { recursive: true })
+    expect(backupFileOnce(srcPath())).toBe('missing')
+    expect(fs.existsSync(bakPath())).toBe(false)
+
+    seedSource('{"a":1}')
+    expect(backupFileOnce(srcPath())).toBe('copied')
+    fs.rmSync(srcPath())
+    expect(backupFileOnce(srcPath())).toBe('skipped')
+  })
+})

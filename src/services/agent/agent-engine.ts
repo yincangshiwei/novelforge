@@ -1,0 +1,1059 @@
+/**
+ * Agent 核心引擎 — ReAct（Reasoning + Acting）循环
+ *
+ * 这是 Agent 的大脑，负责：
+ * 1. 将用户消息、系统提示、Tool 描述组装为 LLM 输入
+ * 2. 解析 LLM 输出中的 <tool_call> 标签
+ * 3. 执行 Tool 并将结果注入为 observation
+ * 4. 循环直到 LLM 不再调用 Tool 或达到最大循环次数
+ *
+ * 参考 Claude Code 的 query.ts 和 QueryEngine 设计，
+ * 但简化为 NovelForge 的 Electron + React 架构。
+ */
+
+import { t } from '../../shared/locale'
+import { toolRegistry, type AgentTool, type ToolResult, type ToolArtifact } from './tool-registry'
+import type { ApprovalDecision } from './approval'
+import { outputPostProcessor } from './output-post-processor'
+import { looksMultiStep } from './task-anchor'
+import { unsupportedWorkflowClaims, removeUnsupportedWorkflowClaims } from './workflow-claims'
+import { ProgressTracker, type AgentProgress } from './progress-tracker'
+import { estimateTokens, truncateToTokenBudget } from './token-budget'
+// 只读批并发上限的唯一来源（2026-10-17 起抽到 tool-scheduling.ts，提示词 {maxParallel} 同源注入）
+import { MAX_PARALLEL_READ_TOOLS } from './tool-scheduling'
+import { createToolProtocolStreamFilter } from './tool-protocol-stream-filter'
+import { parseBareJsonToolCalls } from './bare-json-tool-calls'
+import {
+  buildUnparsedDsmlError,
+  containsDsmlMarkup,
+  createDsmlStreamFilter,
+  parseDsmlToolCalls,
+  stripDsmlMarkup,
+  stripDsmlTokens,
+} from './dsml-tool-calls'
+
+// ===== 常量 =====
+
+/**
+ * 单次用户轮次（turn）内允许的**步骤（step）**上限（防止死循环）。
+ *
+ * 术语对齐 DSH `packages/core/agent-loop`：
+ * - **turn / 轮次** = 一条用户输入驱动的整个过程（可含多个 step，到最终回复为止）；
+ * - **step / 步骤** = 一次模型请求 + 该次回复里全部工具调用的执行与结果回填。
+ * 同一步可包含**多个**工具调用（只读并行、写/确认串行）；本常量限制的是**步数**，不是调用个数。
+ */
+const MAX_STEPS = 8
+
+/** Tool 执行超时（毫秒） */
+const TOOL_TIMEOUT_MS = 30_000
+
+/** Tool 返回内容最大 Token 数（read-file.tool 的 READ_MAX_CHARS 按此校准，见其锁定用例） */
+export const TOOL_RESULT_MAX_TOKENS = 800
+
+/** 默认消息压缩预算（无模型窗口信息 / 小窗口模型）——与既有行为一致 */
+const DEFAULT_MESSAGE_BUDGET_TOKENS = 16_000
+/**
+ * 动态预算上限的**兜底默认值** = 最小上下文挡位 300K（2026-10-17 百万上下文时代）。
+ * 正常链路由 `context-policy.resolveContextBudgetCeiling` 按模型窗口给 300K / 600K / 1M，
+ * 经 `AgentEngineOptions.maxMessageBudgetTokens` 传入；只有不读策略的调用方才落到这里。
+ */
+const MAX_MESSAGE_BUDGET_TOKENS = 300_000
+/** 启用动态预算的最小模型窗口（小窗口模型压缩语义不变——压缩是成本控制非防超窗） */
+const MIN_DYNAMIC_WINDOW_TOKENS = 16_000
+/** 恢复阶梯降档预算下限（对话质量底线） */
+const MIN_RECOVERY_BUDGET_TOKENS = 8_000
+/** 连续可恢复失败熔断阈值（CC 遥测 MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES=3 简化） */
+const MAX_CONSECUTIVE_RECOVERY_FAILURES = 3
+
+/** 写盘引用摘要上限（tokens）——路径+摘要合计 ≤ ~250 tokens，远小于 800 截断注入 */
+const RESULT_SUMMARY_MAX_TOKENS = 200
+/** 写盘内容上限（字符）——超出回退截断注入（read_file 再读受 fs:read-external-file 1MB 限制） */
+const MAX_SPILL_CHARS = 512 * 1024
+
+// ===== 类型 =====
+
+/** Tool 调用信息 */
+export interface ToolCallInfo {
+  id: string
+  toolName: string
+  arguments: Record<string, unknown>
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'waiting_confirm'
+  result?: string
+  error?: string
+  /** Tool 来源标记 */
+  source?: string
+  /** 执行耗时（毫秒；store 在 complete 回调写入，旧归档可能没有） */
+  duration_ms?: number
+  /**
+   * 审批决策（A 档）：waiting_confirm 时由 agent-store 的审批策略层注入，
+   * 供 ConfirmCard 展示风险级别与「本项目内始终允许」提案。
+   */
+  approval?: ApprovalDecision
+  /**
+   * 交错排版元数据（2026-10-17）：该调用**被解析时** `fullAssistantText` 的累计长度，
+   * 即本条 assistant 消息里「这次调用发生前已生成正文」的字符偏移；同一轮多个调用 offset 相同。
+   * 仅渲染层消费（`AgentMessage` 按它把工具批插回对应正文段之后，见 `buildTimeline`）。
+   * 可选字段：旧归档没有它 → 保持「正文在前、工具块在底部」的旧布局；archive 必填形状不变。
+   */
+  contentOffset?: number
+}
+
+/** Agent Engine 回调 */
+export interface AgentEngineCallbacks {
+  /** 流式文本片段 */
+  onTextChunk: (chunk: string) => void
+  onTextReplace?: (text: string) => void
+  /** Tool 调用开始 */
+  onToolCallStart: (toolCall: ToolCallInfo) => void
+  /** Tool 调用完成 */
+  onToolCallComplete: (toolCall: ToolCallInfo, artifacts?: ToolArtifact[]) => void
+  /** Tool 需要用户确认 */
+  onToolCallConfirmRequired: (toolCall: ToolCallInfo) => Promise<boolean>
+  /** 进度更新 */
+  onProgress?: (progress: AgentProgress) => void
+  /** 全部完成 */
+  onDone: (fullText: string, toolCalls: ToolCallInfo[], artifacts: ToolArtifact[]) => void
+  /** 错误 */
+  onError: (error: string) => void
+}
+
+/** 引擎依赖注入（保持 agent-engine 无 electron 依赖可单测；agent-store 注入真实 IPC 实现） */
+export interface AgentEngineDeps {
+  getWorkflowStatus?: (runId: string) => string | undefined
+  /** 长工具结果写盘（>800 tokens 落盘引用；失败返回 success:false 时引擎回退截断注入） */
+  writeResult?: (content: string) => Promise<{ success: boolean; path?: string; error?: string }>
+  /**
+   * 与 `AgentEngineOptions.allowedTools` **同源**（C 档第二轮）：仅供「未知工具 / 不在白名单」
+   * 两条观察文案列出可用集合。运行路径不读它（执行与否由 options 决定）。
+   */
+  allowedTools?: string[]
+}
+
+/** Agent 引擎选项（D6/D7：动态压缩预算等） */
+export interface AgentEngineOptions {
+  /** 模型上下文窗口（tokens，来自 `ModelProfile.contextWindow`）；用于动态压缩预算（Task D7-1 消费） */
+  modelContextWindow?: number
+  /** 上下文预算百分比（预算 = 窗口 × %，默认 80 = 留 20% 余量防单轮超窗） */
+  budgetPercent?: number
+  /** 消息预算绝对上限（W1 批 2：`context-policy` 按档位给出；缺省 = 64k，与引入前一致） */
+  maxMessageBudgetTokens?: number
+  /**
+   * W4（批 3）：弱档"未完成自检"——模型在**多步请求**上返回"无工具调用"时，注入一次提醒再走一轮。
+   * 每会话至多一次；缺省关闭（强/标准档不注入：它们自己会检查）。
+   */
+  unfinishedCheck?: boolean
+  /**
+   * 委派白名单（C 档第二轮）：给定后**只允许**名单内的工具执行（fail-closed —— 不在名单里的
+   * 工具不执行，注入「不在白名单」观察）。缺省 undefined = 全量，父 agent 行为与现状逐字一致。
+   */
+  allowedTools?: string[]
+}
+
+/** LLM 消息格式 */
+export interface LLMMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+/** LLM 生成函数签名（由 agent-store 提供实际实现）
+ * 第三个参数 onChunk：可选流式回调。若提供且被调用，引擎将不再重复推送文本
+ * （流式已实时显示），但 fullAssistantText 仍从返回的完整文本拼接。
+ */
+export type LLMGenerateFn = (
+  messages: LLMMessage[],
+  modelId: string,
+  onChunk?: (chunk: string) => void,
+  /** 底层流式请求 id 回填（C 档第二轮：子 agent 的飞行中请求要能被取消） */
+  onRequestId?: (requestId: string) => void,
+) => Promise<string>
+
+// ===== 核心引擎 =====
+
+/**
+ * 执行 Agent ReAct 循环
+ *
+ * 流程：
+ * 1. 将系统提示（含 Tool 描述）+ 历史消息 + 用户消息发送给 LLM
+ * 2. 解析 LLM 回复中的 <tool_call> 标签
+ * 3. 如果有 tool_call → 执行 Tool → 将结果作为 observation 追加到消息历史 → 重新调用 LLM
+ * 4. 循环直到 LLM 不再调用 Tool 或达到 MAX_STEPS（单步可含多个工具调用）
+ * 5. 返回最终文本回复
+ */
+export async function runAgentLoop(
+  systemPrompt: string,
+  historyMessages: LLMMessage[],
+  userMessage: string,
+  modelId: string,
+  generateFn: LLMGenerateFn,
+  callbacks: AgentEngineCallbacks,
+  abortSignal?: AbortSignal,
+  options?: AgentEngineOptions, // 动态压缩预算：modelContextWindow（Task D7-1）
+  deps?: AgentEngineDeps,
+): Promise<void> {
+  const allToolCalls: ToolCallInfo[] = []
+  const allArtifacts: ToolArtifact[] = []
+
+  // 构建消息列表
+  const messages: LLMMessage[] = [
+    { role: 'system', content: systemPrompt },
+    ...historyMessages,
+    { role: 'user', content: userMessage },
+  ]
+
+  // 初始化进度追踪
+  const progress = new ProgressTracker()
+  progress.start(MAX_STEPS)
+
+  let steps = 0
+  let fullAssistantText = ''
+  let workflowClaimCorrectionUsed = false
+  const claimEvidence = { toolCalls: allToolCalls, artifacts: allArtifacts, getWorkflowStatus: deps?.getWorkflowStatus }
+  const finish = (text: string, calls: ToolCallInfo[], artifacts: ToolArtifact[]) => {
+    const claims = unsupportedWorkflowClaims(text, claimEvidence)
+    const verified = claims.length > 0
+      ? `${removeUnsupportedWorkflowClaims(text, claims)}\n\n${t('engine.workflowClaimUnverified')}`.trim()
+      : text
+    const trustedArtifacts = artifacts.filter(a => !a.type.startsWith('workflow_') || allArtifacts.includes(a)
+      || allArtifacts.some(real => real.type === a.type && real.name === a.name && real.metadata?.runId === a.metadata?.runId))
+    callbacks.onDone(verified, calls, trustedArtifacts)
+  }
+
+  // 恢复阶梯状态（withhold-then-recover，P0-2）：可恢复错误先恢复后放行；
+  // 单次调用生命周期（跨调用持久化 deferred）；重试消耗 steps 计数（最多 3 次恢复，MAX_STEPS=8 仍剩 5 步工具循环）
+  type RecoveryStage = 'none' | 'compacting' | 'meta-injected'
+  let recoveryStage: RecoveryStage = 'none'
+  let consecutiveRecoveryFailures = 0
+  /** W4（批 3）：未完成自检是否已用过（每会话/每次 runAgentLoop 至多一次） */
+  let unfinishedCheckUsed = false
+  /**
+   * DSML 诊断是否已用过（2026-10-17）：DeepSeek V4 系列会把原生工具标记当正文回传，
+   * 若解析器没能还原出可执行调用，注入一次诊断让模型改用规定的 XML 协议；一次性防烧步骤。
+   */
+  let dsmlDiagnosticUsed = false
+  let currentBudget = computeMessageBudget(
+    options?.modelContextWindow, options?.budgetPercent, options?.maxMessageBudgetTokens,
+  )
+
+  while (steps < MAX_STEPS) {
+    // 检查中止信号
+    if (abortSignal?.aborted) {
+      finish(fullAssistantText + '\n\n_' + t('agent.stoppedGenerating') + '_', allToolCalls, allArtifacts)
+      return
+    }
+
+    steps++
+
+    // 调用 LLM（支持流式：onChunk 实时推送文本，引擎收到流式文本后不再重复输出）
+    // 发送前按当前预算压缩消息副本（完整 messages 仍保留给后处理使用）
+    let budgetedMessages = compressMessagesToBudget(messages, currentBudget)
+    let llmResponse: string
+    let streamed = false
+    // DSML 流式守卫（2026-10-17）：DeepSeek V4.1 会把原生工具调用标记（<｜｜DSML｜｜ ...>）
+    // 当正文流回来。先在本层截住，避免 Markdown 面板闪现原始标记；全文解析在生成返回后做。
+    // 过滤器按步新建（每次模型请求一份）；本步残余（未闭合 DSML 残片）由全文 parse/strip 兜底。
+    const dsmlStreamFilter = createDsmlStreamFilter()
+    const xmlStreamFilter = createToolProtocolStreamFilter()
+    try {
+      llmResponse = await generateFn(budgetedMessages, modelId, (chunk) => {
+        streamed = true
+        const safe = dsmlStreamFilter.push(xmlStreamFilter.push(chunk))
+        if (safe) callbacks.onTextChunk(safe)
+      })
+      const xmlTail = xmlStreamFilter.flush()
+      const streamTail = dsmlStreamFilter.push(xmlTail) + dsmlStreamFilter.flush()
+      if (streamTail) callbacks.onTextChunk(streamTail)
+      // 调用成功：恢复计数清零、预算复原（下次调用生效）
+      consecutiveRecoveryFailures = 0
+      recoveryStage = 'none'
+      currentBudget = computeMessageBudget(
+        options?.modelContextWindow, options?.budgetPercent, options?.maxMessageBudgetTokens,
+      )
+    } catch (error) {
+      // 取消导致的生成中断走"已停止"而不是错误提示
+      if (abortSignal?.aborted) {
+        finish(fullAssistantText + '\n\n_' + t('agent.stoppedGenerating') + '_', allToolCalls, allArtifacts)
+        return
+      }
+      // 可恢复错误（上下文超限类）→ withhold-then-recover：降档压缩 → meta 注入 → 熔断放行。
+      // 非可恢复错误直接放行（无额外调用 = 无额外费用）。
+      const errText = String(error)
+      // 已到最后一步（steps >= MAX_STEPS）：continue 会退出循环 → 走 maxStepsReached
+      // 误报并吞掉真实错误——重试无意义时错误透传（final review 回归：工具循环后段超限错误最高发）
+      if (steps >= MAX_STEPS) {
+        callbacks.onError(t('agent.llmCallFailed').replace('{error}', errText))
+        return
+      }
+      // 连续失败计数先增后判：第 MAX(3) 次连续失败即熔断（本阶梯仅 2 个可恢复动作：
+      // compacting / meta-injected，第 3 次失败 = 熔断，不再发起调用——与测试契约一致）
+      consecutiveRecoveryFailures++
+      if (isRecoverableError(errText) && consecutiveRecoveryFailures < MAX_CONSECUTIVE_RECOVERY_FAILURES) {
+        if (recoveryStage === 'none') {
+          recoveryStage = 'compacting'
+          console.warn(`[AgentEngine] 恢复重试 compacting（失败 ${consecutiveRecoveryFailures}/${MAX_CONSECUTIVE_RECOVERY_FAILURES}）：${errText}`)
+        } else if (recoveryStage === 'compacting') {
+          recoveryStage = 'meta-injected'
+          messages.push({ role: 'user', content: t('engine.resumeDirectly') })
+          console.warn(`[AgentEngine] 恢复重试 meta-injected（失败 ${consecutiveRecoveryFailures}/${MAX_CONSECUTIVE_RECOVERY_FAILURES}）：${errText}`)
+        }
+        // 降档压缩重试（决策冻结：压缩只从尾部加深截断，前缀稳定）
+        currentBudget = Math.max(MIN_RECOVERY_BUDGET_TOKENS, Math.floor(currentBudget / 2))
+        budgetedMessages = compressMessagesToBudget(messages, currentBudget)
+        continue
+      }
+      callbacks.onError(t('agent.llmCallFailed').replace('{error}', errText))
+      return
+    }
+
+    // 检查中止
+    if (abortSignal?.aborted) {
+      finish(fullAssistantText + '\n\n_' + t('agent.stoppedGenerating') + '_', allToolCalls, allArtifacts)
+      return
+    }
+
+    // 解析 LLM 回复：分离文本和 tool_call（含 DeepSeek DSML 原生标记 repair，见 dsml-tool-calls.ts）
+    const parsed = parseToolCalls(llmResponse)
+    let { textParts, toolCalls } = parsed
+    const { parseErrors } = parsed
+    // 裸 JSON 工具调用兜底（Qwen 等 OpenAI-compatible 模型）
+    if (toolCalls.length === 0) {
+      const bare = parseBareJsonToolCalls(llmResponse, (name) => !!toolRegistry.get(name))
+      if (bare) {
+        textParts = bare.textParts
+        toolCalls = bare.toolCalls
+      }
+    }
+    if (containsDsmlMarkup(llmResponse)) {
+      // 留诊断证据：模型回退到原生格式是上游行为（issue #1678），日志里应可追踪修复发生
+      console.warn(`[AgentEngine] 检测到 DeepSeek DSML 工具标记，已解析为 ${toolCalls.length} 个工具调用`)
+    }
+    // 部分失败场景的诊断反馈（每步重置；仅部分成功 + 部分解析失败时被赋值，
+    // 延迟到 observation 组装时注入，避免与全失败路径重复 push）
+    let parseFeedbackForObservation: string | undefined
+
+    // 输出文本部分（清理可能残留的 tool_call/tool_result 标记）
+    let textContent = textParts.join('')
+    // DSML 兜底清洗：解析阶段已摘除常规块，这里再清残留/半截标记（无 DSML 时逐字不变）
+    textContent = stripDsmlMarkup(textContent)
+    textContent = textContent
+      .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+      .replace(/<tool_result[\s\S]*?<\/tool_result>/g, '')
+      .replace(/<\/?tool_call>/g, '')      // 清理孤立的开/闭标签
+      .replace(/<\/?tool_result>/g, '')     // 清理孤立的 result 标签
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+    if (textContent) {
+      // 流式模式下文本已通过 onChunk 实时推送，避免重复输出
+      if (!streamed) callbacks.onTextChunk(textContent)
+      fullAssistantText += textContent
+    }
+
+    // ★ 工具调用解析失败诊断（逐条反馈，不静默）：
+    //    部分成功 + 部分解析失败时，失败项也注入 observation，让 LLM 知道哪些调用没被理解
+    if (parseErrors.length > 0) {
+      const errorFeedback = formatParseErrorsForLLM(parseErrors)
+      if (toolCalls.length === 0) {
+        // 全失败：独立 user 消息触发自我修正（既有行为）
+        messages.push({ role: 'assistant', content: llmResponse })
+        messages.push({
+          role: 'user',
+          content: t('engine.parseDiagnosis').replace('{feedback}', errorFeedback),
+        })
+        console.warn('[AgentEngine] 注入解析错误反馈给 LLM，触发自我修正')
+        continue
+      }
+      // 部分失败：解析诊断追加到本轮 observation 头部（toolCalls 继续正常执行）
+      // 诊断段延迟到 observation 组装时注入——此处仅保存，避免重复 push
+      parseFeedbackForObservation = errorFeedback
+    }
+
+    // ===== DeepSeek DSML 兜底（2026-10-17）=====
+    // 上游行为（deepseek-ai/DeepSeek-V3 issue #1678）：V4 系列在没有 tools 参数但历史带工具痕迹时，
+    // 会把原生 DSML 工具标记当正文回传（finish_reason=stop、tool_calls=null）。常规块已由
+    // parseDsmlToolCalls 还原；若仍没还原出调用，**不能当最终回复收尾**——注入一次诊断让模型
+    // 改用规定的 <tool_call> XML 重新调用（一次性，避免反复消耗步骤）。
+    if (
+      toolCalls.length === 0
+      && parseErrors.length === 0
+      && !dsmlDiagnosticUsed
+      && containsDsmlMarkup(llmResponse)
+    ) {
+      dsmlDiagnosticUsed = true
+      messages.push({ role: 'assistant', content: llmResponse })
+      messages.push({
+        role: 'user',
+        content: t('engine.parseDiagnosis').replace(
+          '{feedback}',
+          formatParseErrorsForLLM([buildUnparsedDsmlError(llmResponse)]),
+        ),
+      })
+      console.warn('[AgentEngine] DSML 标记未能还原为工具调用，注入一次性诊断后重试')
+      continue
+    }
+
+    // ===== W4（批 3，弱档）：未完成自检 =====
+    // 模型"自认为完成"时没有任何信号，弱模型很容易在多步请求上过早收尾（只答一半就停）。
+    // 条件全部满足才注入一次提醒：启用（弱档）**且**本轮无工具调用**且**请求像多步**且**尚未用过。
+    // 刻意一次性：反复提醒会变成新的循环风险与 token 浪费。
+    if (
+      toolCalls.length === 0
+      && options?.unfinishedCheck
+      && !unfinishedCheckUsed
+      && looksMultiStep(userMessage)
+    ) {
+      unfinishedCheckUsed = true
+      // 保留本轮回复（与解析失败分支同构）：历史里不能丢掉模型已经说过的话
+      messages.push({ role: 'assistant', content: llmResponse })
+      messages.push({ role: 'user', content: t('engine.unfinishedCheckNudge') })
+      console.warn('[AgentEngine] 弱档未完成自检：注入一次性提醒并继续一轮')
+      continue
+    }
+
+    if (toolCalls.length === 0) {
+      const claims = unsupportedWorkflowClaims(fullAssistantText, claimEvidence)
+      if (claims.length > 0 && !workflowClaimCorrectionUsed && steps < MAX_STEPS) {
+        workflowClaimCorrectionUsed = true
+        fullAssistantText = removeUnsupportedWorkflowClaims(fullAssistantText, claims)
+        callbacks.onTextReplace?.(fullAssistantText)
+        messages.push({ role: 'assistant', content: llmResponse })
+        messages.push({ role: 'user', content: t('engine.workflowClaimDiagnosis').replace('{claims}', () => claims.join('\n')) })
+        continue
+      }
+    }
+
+    // 如果没有 tool_call，循环结束
+    if (toolCalls.length === 0) {
+      // 空响应守卫：模型返回 0 可见文本且无工具调用时，不能静默 onDone（UI 只剩用户消息）
+      if (!fullAssistantText.trim()) {
+        callbacks.onError(t('engine.emptyResponse'))
+        return
+      }
+      progress.setPhase('generating')
+      callbacks.onProgress?.(progress.getProgress())
+
+      // 运行后处理管道
+      try {
+        const processed = await outputPostProcessor.process(fullAssistantText, {
+          artifacts: allArtifacts,
+          messages: messages,
+          modelId,
+        })
+        progress.complete()
+        callbacks.onProgress?.(progress.getProgress())
+        // 在最终文本前附加思考内容（可选）
+        const finalText = processed.thinkingContent
+          ? `_${t('agent.thinkingPrefix')}_\n> ${processed.thinkingContent.replace(/\n/g, '\n> ')}\n\n${processed.cleanedOutput}`
+          : processed.cleanedOutput
+        finish(finalText, allToolCalls, processed.extractedArtifacts)
+      } catch {
+        // 后处理失败不影响主流程
+        progress.complete()
+        finish(fullAssistantText, allToolCalls, allArtifacts)
+      }
+      return
+    }
+
+    // 将 LLM 的完整回复加入历史（包含 tool_call 标签）
+    messages.push({ role: 'assistant', content: llmResponse })
+
+    const observationParts: string[] = []
+
+    progress.setPhase('tool_execution')
+    progress.setCurrentTool(toolCalls[0].name, toolCalls.length)
+    callbacks.onProgress?.(progress.getProgress())
+
+    // === M1 工具分批并发（对齐 CC toolOrchestration.ts）===
+    // 预扫描：全部 tool_call 建 job（保持原始顺序注册 toolCallInfo——UI 列表与产物顺序 = 调用顺序）
+    const allowed = options?.allowedTools
+    const jobs: ToolCallJob[] = toolCalls.map(tc => {
+      const info: ToolCallInfo = {
+        id: crypto.randomUUID(),
+        toolName: tc.name,
+        arguments: tc.arguments,
+        status: 'pending',
+        // 交错排版（2026-10-17）：记录解析时刻的正文累计长度——同一轮多个调用 offset 相同；
+        // 渲染层据此把这一轮工具批插到「本轮正文」之后（旧归档无此字段 → 保持底部布局）
+        contentOffset: fullAssistantText.length,
+      }
+      allToolCalls.push(info)
+      const registered = toolRegistry.get(tc.name)
+      // 白名单 fail-closed：名单外的工具按「不可用」处理（不执行、走拒绝观察）。
+      // tool 置 undefined 后，分批器已按「未知工具」单独成批（不会与只读批并行）——无需另改分批逻辑。
+      const permitted = !allowed || allowed.includes(tc.name)
+      const tool = permitted ? registered : undefined
+      if (tool) info.source = tool.source
+      return { tc, tool, deniedByAllowlist: Boolean(registered) && !permitted, info }
+    })
+    // 白名单与 options 同源透传给执行层（供「不在白名单」观察文案列可用集合）——
+    // 两条执行路径（单元素批 / 只读并行批）共用同一个 execDeps，避免只补一处
+    const execDeps: AgentEngineDeps | undefined = options?.allowedTools
+      ? { ...deps, allowedTools: options.allowedTools }
+      : deps
+
+    // 分批规则（分类依据 = tool.isReadOnly，勿按 source——read_file 等 builtin 只读，
+    // index-content/embed-text/compare-texts 同属 builtin 但语义经 isReadOnly 已正确区分：
+    // embed/compare 纯计算只读；index_content 写库 conf=true → isReadOnly=false 归写）：
+    // 1. 连续只读工具归入当前只读批，满 MAX_PARALLEL_READ_TOOLS 封批（批内并发上限）
+    // 2. 写工具 / 需确认工具 / 未知工具：先封只读批，再各自单元素批——逐个串行、不与
+    //    任何工具并行；确认流程（onToolCallConfirmRequired）先于并行决策完成——批内绝不
+    //    混入需确认工具（防御：requiresConfirmation 工具即使误标 isReadOnly 也单独成批）
+    // 3. 批序 = tool_call 首次出现顺序：写工具前的只读批先并行、之后的只读批不会越过写
+    //    工具提前执行（语义与串行一致，仅批内并行加速）
+    const batches: ToolCallJob[][] = []
+    let openReadBatch: ToolCallJob[] = []
+    const flushReadBatch = (): void => {
+      if (openReadBatch.length > 0) {
+        batches.push(openReadBatch)
+        openReadBatch = []
+      }
+    }
+    for (const job of jobs) {
+      const tool = job.tool
+      const parallelEligible = tool !== undefined && tool.isReadOnly && !tool.requiresConfirmation
+      if (parallelEligible) {
+        openReadBatch.push(job)
+        if (openReadBatch.length >= MAX_PARALLEL_READ_TOOLS) flushReadBatch()
+      } else {
+        flushReadBatch()
+        batches.push([job])
+      }
+    }
+    flushReadBatch()
+
+    // 批执行：观察注入顺序 = 各批内 job 原始顺序（并行完成先后不影响拼接顺序——严格保持
+    // tool_call 出现顺序，与现状 <tool_result name=...> 顺序一致）
+    for (const batch of batches) {
+      if (batch.length === 1) {
+        // 单工具批（写/需确认/未知工具 + 单个只读——现状串行路径逐字节等价）
+        const outcome = await executeToolJob(batch[0], callbacks, execDeps)
+        observationParts.push(outcome.observation)
+        if (outcome.artifacts.length > 0) allArtifacts.push(...outcome.artifacts)
+        continue
+      }
+      // 只读并行批：Promise.all 并发执行（引擎无 electron 依赖，无新并行基础设施）；
+      // 单工具失败由 executeToolJob 内部 try/catch 隔离——失败项照旧注入 error observation，
+      // 不影响同批其他工具；每个工具仍走 executeToolWithTimeout 超时包装
+      const outcomes = await Promise.all(batch.map(job => executeToolJob(job, callbacks, execDeps)))
+      for (const outcome of outcomes) {
+        observationParts.push(outcome.observation)
+        if (outcome.artifacts.length > 0) allArtifacts.push(...outcome.artifacts)
+      }
+    }
+
+    // 将所有 tool 结果作为 user role 的 observation 注入
+    // 加上明确提示，防止 LLM 误以为这是用户新发言
+    const observationPartsWithDiagnosis = parseFeedbackForObservation
+      ? [`${t('engine.parsePartialDiagnosis')}\n${parseFeedbackForObservation}`, ...observationParts]
+      : observationParts
+    const observation = `${t('engine.observationHeader')}\n\n${observationPartsWithDiagnosis.join('\n\n')}\n\n${t('engine.observationFooter')}`
+    messages.push({ role: 'user', content: observation })
+  }
+
+  // 达到单次轮次的步骤上限
+  if (steps >= MAX_STEPS) {
+    // 文案占位符 {maxSteps}：步数上限的唯一来源是 MAX_STEPS（不在文案里硬编码 8）
+    fullAssistantText += '\n\n⚠️ ' + t('agent.maxStepsReached').replace('{maxSteps}', String(MAX_STEPS))
+  }
+
+  // 运行后处理管道
+  try {
+    const processed = await outputPostProcessor.process(fullAssistantText, {
+      artifacts: allArtifacts,
+      messages: messages,
+      modelId,
+    })
+    progress.complete()
+    callbacks.onProgress?.(progress.getProgress())
+    const finalText = processed.thinkingContent
+      ? `_${t('agent.thinkingPrefix')}_\n> ${processed.thinkingContent.replace(/\n/g, '\n> ')}\n\n${processed.cleanedOutput}`
+      : processed.cleanedOutput
+    finish(finalText, allToolCalls, processed.extractedArtifacts)
+  } catch {
+    progress.complete()
+    finish(fullAssistantText, allToolCalls, allArtifacts)
+  }
+}
+
+// ===== 工具函数 =====
+
+/** 解析的 Tool 调用 */
+interface ParsedToolCall {
+  name: string
+  arguments: Record<string, unknown>
+}
+
+/** 单条 tool_call 的执行 job（M1 预扫描阶段创建，保持原始顺序） */
+interface ToolCallJob {
+  tc: ParsedToolCall
+  /** 未注册 或 被白名单拒绝 → undefined（走「未知工具」/「不在白名单」两条观察） */
+  tool: AgentTool | undefined
+  /** 存在于注册表但被白名单拒绝（文案与「未知工具」区分，C 档第二轮） */
+  deniedByAllowlist?: boolean
+  info: ToolCallInfo
+}
+
+/** 单工具执行产出（供分批器按 tool_call 原始顺序拼接 observation / 产物） */
+interface ToolJobOutcome {
+  observation: string
+  artifacts: ToolArtifact[]
+}
+
+/**
+ * 执行单个 tool_call 的完整管线（M1 从原串行 for 循环体抽取）：
+ * 未知工具 → 需确认工具确认（确认流程先于并行决策——requiresConfirmation 工具已由分批器
+ * 单独成批，此处仅单飞批走到）→ 执行（executeToolWithTimeout 超时包装）→ 成功结果截断 /
+ * 长结果写盘引用 / 空占位 / 失败与异常注入。
+ *
+ * 并行批内每个 job 独立调用：状态与观察互不共享、各自 try/catch（失败隔离），
+ * observation 与 artifacts 由返回值带回，调用方按 tool_call 出现顺序拼接——
+ * 观察注入顺序恒 = tool_call 顺序（与现状 <tool_result name=...> 顺序一致）。
+ */
+async function executeToolJob(
+  job: ToolCallJob,
+  callbacks: AgentEngineCallbacks,
+  deps: AgentEngineDeps | undefined,
+): Promise<ToolJobOutcome> {
+  const { tc, tool, info } = job
+  const artifacts: ToolArtifact[] = []
+
+  // 查找 Tool（预扫描已定位；此处 tool 不存在走「不在白名单」/「未知工具」两条错误注入）
+  if (!tool) {
+    info.status = 'failed'
+    // 委派白名单（C 档第二轮）：可用集合取白名单（给定）而非全量注册表 ——
+    // 否则等于告诉子 agent 去调它调不了的工具
+    const availableNames = (deps?.allowedTools ?? toolRegistry.listAll().map(x => x.name)).join(', ')
+    const reason = job.deniedByAllowlist
+      ? t('engine.toolNotDelegated').replace('{name}', tc.name).replace('{tools}', availableNames)
+      : t('engine.unknownToolAvailable').replace('{name}', tc.name).replace('{tools}', availableNames)
+    info.error = job.deniedByAllowlist
+      ? t('engine.toolNotDelegated').replace('{name}', tc.name).replace('{tools}', availableNames)
+      : t('agent.unknownTool').replace('{name}', tc.name)
+    callbacks.onToolCallComplete(info)
+    return {
+      observation: `<tool_result name="${tc.name}" error="true">\n${reason}\n</tool_result>`,
+      artifacts,
+    }
+  }
+
+  // 需要用户确认的 Tool
+  if (tool.requiresConfirmation) {
+    info.status = 'waiting_confirm'
+    callbacks.onToolCallStart(info)
+
+    const confirmed = await callbacks.onToolCallConfirmRequired(info)
+    if (!confirmed) {
+      info.status = 'failed'
+      info.error = t('agent.userRejected')
+      callbacks.onToolCallComplete(info)
+      return {
+        observation: `<tool_result name="${tc.name}" error="true">\n${t('engine.userRejectedAction')}\n</tool_result>`,
+        artifacts,
+      }
+    }
+  }
+
+  // 执行 Tool
+  info.status = 'running'
+  callbacks.onToolCallStart(info)
+  const executeStartedAt = Date.now()
+
+  try {
+    // 工具级超时覆盖（C 档第二轮 C1）：`task` 派子 agent 的设计上限 300s + 审批卡 120s，
+    // 用全局 30s 会把所有 >30s 的子任务腰斩（结论永远回不到父端，子 agent 还在空烧 token）
+    const result = await executeToolWithTimeout(tool.execute, tc.arguments, tool.timeoutMs ?? TOOL_TIMEOUT_MS)
+
+    // 截断过长的结果
+    const truncatedContent = truncateResult(result.content, TOOL_RESULT_MAX_TOKENS)
+
+    info.status = result.success ? 'completed' : 'failed'
+    info.result = truncatedContent
+    info.duration_ms = Date.now() - executeStartedAt
+    if (result.error) info.error = result.error
+    if (result.artifacts) artifacts.push(...result.artifacts)
+
+    if (artifacts.length > 0) callbacks.onToolCallComplete(info, artifacts)
+    else callbacks.onToolCallComplete(info)
+
+    if (result.success) {
+      // 长结果写盘引用（P0-1）：原始内容 > 注入上限且 ≤ 512KB → 全文落盘，
+      // 上下文只进「路径 + 摘要」，LLM 按需用 read_file 再读（绝对路径分支）。
+      // read_file 工具天然豁免：自身按引擎截断线校准（READ_MAX_CHARS=440），结果永不超限。
+      // M1 并行批多个大结果可并发 spill——fs:agent-result-write 内容寻址（sha1-12 定名 +
+      // wx 防重：同内容 EEXIST 幂等成功，异内容异文件），并发写盘无竞态（见 D6 注）。
+      const rawContent = result.content ?? ''
+      const shouldSpill = estimateTokens(rawContent) > TOOL_RESULT_MAX_TOKENS && rawContent.length <= MAX_SPILL_CHARS
+      if (shouldSpill && deps?.writeResult) {
+        const writeRes = await deps.writeResult(rawContent)
+        if (writeRes.success && writeRes.path) {
+          const summary = truncateToTokenBudget(rawContent, RESULT_SUMMARY_MAX_TOKENS)
+          return {
+            observation: `<tool_result name="${tc.name}">\n${t('engine.resultSpilledToDisk').replace('{total}', String(estimateTokens(rawContent))).replace('{path}', writeRes.path)}\n\n${sanitizeObservation(summary)}\n</tool_result>`,
+            artifacts,
+          }
+        }
+        return {
+          observation: `<tool_result name="${tc.name}">\n${sanitizeObservation(truncatedContent)}\n</tool_result>`,
+          artifacts,
+        }
+      }
+      // 空结果占位（D6-1）：成功但无内容（或纯空白）→ 注入占位文本，防模型把空 <tool_result>
+      // 当回合边界停止生成（CC 事故：capybara 对空结果误判 \n\nHuman: 停止序列）
+      const content = truncatedContent.trim() === ''
+        ? t('engine.emptyToolResult').replace('{toolName}', tc.name)
+        : sanitizeObservation(truncatedContent)
+      return {
+        observation: `<tool_result name="${tc.name}">\n${content}\n</tool_result>`,
+        artifacts,
+      }
+    }
+    return {
+      observation: `<tool_result name="${tc.name}" error="true">\n${sanitizeObservation(result.error ?? truncatedContent)}\n</tool_result>`,
+      artifacts,
+    }
+  } catch (error) {
+    info.status = 'failed'
+    info.duration_ms = Date.now() - executeStartedAt
+    info.error = t('agent.executionError').replace('{error}', sanitizeErrorText(error))
+    callbacks.onToolCallComplete(info)
+    return {
+      observation: `<tool_result name="${tc.name}" error="true">\n${t('agent.executionError').replace('{error}', sanitizeErrorText(error))}\n</tool_result>`,
+      artifacts,
+    }
+  }
+}
+
+/** Tool 调用解析错误详情（供 AI 自检反馈） */
+export interface ToolParseError {
+  /** 原始 tool_call 内容（截断到 300 字符） */
+  rawContent: string
+  /** 错误原因 */
+  reason: string
+  /** 修复建议 */
+  suggestion: string
+}
+
+/**
+ * 从 LLM 输出中解析 <tool_call>...</tool_call> 标签（既有 XML 协议，内部实现）
+ *
+ * 返回分离后的文本片段、tool 调用列表和解析错误详情。
+ * 增强版：支持 JSON 前后有多余文字的容错解析 + 详细错误诊断。
+ */
+function parseXmlToolCalls(text: string): {
+  textParts: string[]
+  toolCalls: ParsedToolCall[]
+  /** AI 自检：解析失败的错误详情，可反馈给 LLM 让其自我修正 */
+  parseErrors: ToolParseError[]
+} {
+  const toolCalls: ParsedToolCall[] = []
+  const textParts: string[] = []
+  const parseErrors: ToolParseError[] = []
+
+  // 匹配 <tool_call>...</tool_call> 标签
+  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null = null
+
+  while ((match = regex.exec(text)) !== null) {
+    // 收集标签前的文本
+    if (match.index > lastIndex) {
+      const before = text.slice(lastIndex, match.index).trim()
+      if (before) textParts.push(before)
+    }
+    lastIndex = regex.lastIndex
+
+    // 解析 JSON（增强容错 + 详细错误诊断）
+    const rawContent = match[1].trim()
+    let parsed = false
+
+    // 策略 1：直接解析整个内容
+    try {
+      const data = JSON.parse(rawContent)
+      if (data.name && typeof data.name === 'string') {
+        toolCalls.push({ name: data.name, arguments: data.arguments ?? {} })
+        parsed = true
+      } else {
+        parseErrors.push({
+          rawContent: rawContent.slice(0, 300),
+          reason: t('engine.parseReasonMissingName'),
+          suggestion: t('engine.parseSuggestionMissingName'),
+        })
+      }
+    } catch (e1) {
+      const errMsg1 = e1 instanceof SyntaxError ? e1.message : String(e1)
+      // 策略 2：从内容中提取 JSON 对象（LLM 可能在 JSON 前后加了额外文字）
+      const jsonMatch = rawContent.match(/\{[\s\S]*\}/)
+      if (jsonMatch) {
+        try {
+          const data = JSON.parse(jsonMatch[0])
+          if (data.name && typeof data.name === 'string') {
+            toolCalls.push({ name: data.name, arguments: data.arguments ?? {} })
+            parsed = true
+          } else {
+            parseErrors.push({
+              rawContent: rawContent.slice(0, 300),
+              reason: t('engine.parseReasonExtractedMissingName').replace('{detail}', jsonMatch[0].slice(0, 100)),
+              suggestion: t('engine.parseSuggestionObjectFields'),
+            })
+          }
+        } catch (e2) {
+          const errMsg2 = e2 instanceof SyntaxError ? e2.message : String(e2)
+          parseErrors.push({
+            rawContent: rawContent.slice(0, 300),
+            reason: t('engine.parseReasonJsonFailed').replace('{e1}', errMsg1.slice(0, 80)).replace('{e2}', errMsg2.slice(0, 80)),
+            suggestion: t('engine.parseSuggestionJsonRules'),
+          })
+        }
+      } else {
+        parseErrors.push({
+          rawContent: rawContent.slice(0, 300),
+          reason: t('engine.parseReasonNoJson').replace('{detail}', errMsg1.slice(0, 80)),
+          suggestion: t('engine.parseSuggestionNeedJson'),
+        })
+      }
+    }
+
+    if (!parsed) {
+      console.warn('[AgentEngine] tool_call 标签解析失败，已诊断:', {
+        content: rawContent.slice(0, 100),
+        error: parseErrors[parseErrors.length - 1]?.reason,
+      })
+    }
+  }
+
+  // 收集最后一个标签后的文本
+  if (lastIndex < text.length) {
+    const after = text.slice(lastIndex).trim()
+    if (after) textParts.push(after)
+  }
+
+  // 如果没有匹配到任何标签，整个文本都是 textParts
+  if (toolCalls.length === 0 && textParts.length === 0) {
+    textParts.push(text)
+  }
+
+  return { textParts, toolCalls, parseErrors }
+}
+
+/**
+ * 从 LLM 输出中解析工具调用（对外统一入口）。
+ *
+ * 历史协议是 `<tool_call>{"name","arguments"}</tool_call>` 文本块；2026-10-17 起追加
+ * DeepSeek V4 系列原生 DSML 标记的 repair（`<｜｜DSML｜｜ calls>` / `<｜DSML｜function_calls>`，
+ * 见 `dsml-tool-calls.ts` 与上游 issue deepseek-ai/DeepSeek-V3#1678）。
+ *
+ * **快路径保证**：不含 DSML token 时逐字复用既有 XML 解析，行为与历史完全一致（零回归）。
+ * 命中 DSML 时先由 DSML 解析器摘标记/收集调用，再对剩余正文跑 XML 解析后合并。
+ * ⚠️ 合并顺序固定为「DSML 调用在前、XML 调用在后」，**不保证与正文出现顺序一致**；
+ * 同一回合混用两种协议极罕见，若两个调用存在先后依赖需注意（核查报告反例 B，已知限制）。
+ */
+export function parseToolCalls(text: string): {
+  textParts: string[]
+  toolCalls: ParsedToolCall[]
+  parseErrors: ToolParseError[]
+} {
+  if (!containsDsmlMarkup(text)) return parseXmlToolCalls(text)
+
+  const dsml = parseDsmlToolCalls(text)
+  // DSML 块先摘除，剩余正文里可能还混有既有 XML 协议的工具块
+  const xml = parseXmlToolCalls(dsml.textParts.join(''))
+  return {
+    textParts: xml.textParts,
+    toolCalls: [...dsml.toolCalls, ...xml.toolCalls],
+    parseErrors: [...dsml.parseErrors, ...xml.parseErrors],
+  }
+}
+
+/**
+ * 将解析错误格式化为 LLM 可理解的反馈消息
+ * 用于注入到 observation 中，让 LLM 自我修正
+ */
+export function formatParseErrorsForLLM(parseErrors: ToolParseError[]): string {
+  if (parseErrors.length === 0) return ''
+
+  const parts = parseErrors.map((err, i) =>
+    t('engine.parseErrorBlock')
+      .replace('{n}', String(i + 1))
+      .replace('{raw}', err.rawContent)
+      .replace('{reason}', err.reason)
+      .replace('{suggestion}', err.suggestion)
+  )
+
+  return `${t('engine.parseFeedbackHeader')}
+
+${parts.join('\n\n')}
+
+${t('engine.parseFeedbackCommon')}
+${t('engine.parseBulletQuotes')}
+${t('engine.parseBulletTrailingComma')}
+${t('engine.parseBulletStructure')}
+${t('engine.parseBulletNoExtraText')}`
+}
+
+/**
+ * 带超时的 Tool 执行
+ *
+ * 注意：Promise.race 超时后工具本身无法中止（副作用可能已发生），
+ * 这里仅确保等待不无限期挂起，并在 settle 后清理计时器。
+ */
+async function executeToolWithTimeout(
+  executeFn: (args: Record<string, unknown>) => Promise<ToolResult>,
+  args: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<ToolResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      executeFn(args),
+      new Promise<ToolResult>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(t('agent.toolTimeout').replace('{n}', String(timeoutMs / 1000)))), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/**
+ * 错误文本脱敏（P3 修复）：截断 + 去除绝对路径——原始异常常含绝对路径/DB 栈，
+ * 直接注入 LLM 上下文会泄漏本机路径信息。
+ */
+function sanitizeErrorText(err: unknown): string {
+  const s = err instanceof Error ? err.message : String(err)
+  const masked = s
+    .replace(/[a-zA-Z]:[\\/][^"'\s,;]+/g, '[path]')          // Windows 绝对路径
+    .replace(/\/(?:Users|home|root|tmp|Users)\/[^"'\s,;]+/g, '[path]') // Unix/家目录路径
+  return masked.length > 300 ? masked.slice(0, 300) + '…' : masked
+}
+
+/**
+ * 清洗注入 observation 的工具结果，防止结果内容包含
+ * <tool_result> / <tool_call> 标签时破坏 XML 结构（注入污染，P2 修复）。
+ * 历史事故：只剥离 tool_result 未剥离 tool_call——读到含 <tool_call> 指令的不可信文件
+ * （外部导入草稿/知识库文档）原样回喂 LLM，下一轮可能被 parseToolCalls 当真实工具调用执行。
+ *
+ * 2026-10-17 补 DSML token（安全核查反例 A）：DSML repair 让「工具结果 → 模型回吐」这条
+ * 既有防守路径多了一种可被解析的调用格式；只剥 token、不整块删（不污染 read_file 正文）。
+ */
+function sanitizeObservation(content: string): string {
+  return stripDsmlTokens(content)
+    .replace(/<\/tool_result>/gi, '')
+    .replace(/<tool_result/gi, '')
+    .replace(/<\/tool_call>/gi, '')
+    .replace(/<tool_call/gi, '')
+}
+
+/**
+ * 按模型窗口计算消息压缩预算（线③ 后续：百分比压缩，有上下阈值）：
+ * 预算 = clamp(窗口 × percent%, 16k 下阈值, 上限)。
+ * 无窗口 / 窗口 < 16k → 默认 16_000（现状不变）。
+ * percent 默认 80 = 留 20% 余量，防止单轮对话（输入+输出）把上下文推过窗口。
+ *
+ * @param maxBudgetTokens 上限（2026-10-17 起由 `context-policy` 按窗口给挡位：
+ *   300K / 600K / 1M；默认 300K = 最小挡位）
+ */
+export function computeMessageBudget(
+  modelContextWindow?: number,
+  percent = 80,
+  maxBudgetTokens: number = MAX_MESSAGE_BUDGET_TOKENS,
+): number {
+  if (!modelContextWindow || modelContextWindow < MIN_DYNAMIC_WINDOW_TOKENS) return DEFAULT_MESSAGE_BUDGET_TOKENS
+  const percentBudget = Math.floor(modelContextWindow * (percent / 100))
+  return Math.min(Math.max(percentBudget, DEFAULT_MESSAGE_BUDGET_TOKENS), maxBudgetTokens)
+}
+
+/** 可恢复错误识别（上下文超限类——压缩后重试真实有效；白名单收紧防误判烧钱）。 */
+const RECOVERABLE_ERROR_PATTERNS: RegExp[] = [
+  /context length/i,
+  /maximum context/i,
+  /context window/i,
+  /too many tokens/i,
+  /token limit/i,
+  /context_length_exceeded/i,
+  /\b413\b/,
+  /request entity too large/i,
+  /上下文长度/,
+  /超(出|过).{0,4}(上限|限制|长度)/,
+  /长度.{0,4}(超|超过)/,
+]
+
+export function isRecoverableError(message: string): boolean {
+  return RECOVERABLE_ERROR_PATTERNS.some(p => p.test(message))
+}
+
+/**
+ * 将消息列表压缩到 token 预算内（ReAct 多轮 observation 的上下文整体防线）。
+ *
+ * 压缩策略（保证 role 交替与最近上下文）：
+ * 1. system 提示恒保留
+ * 2. 从尾部向前保留最近的 (user, assistant) 轮次对，直到预算耗尽
+ * 3. 末尾独立的 user（当前问题 / observation）单独保留
+ *
+ * 注意：仅作用于发送给 LLM 的副本，不修改引擎的完整消息记录。
+ */
+function compressMessagesToBudget(messages: LLMMessage[], budget: number): LLMMessage[] {
+  const total = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+  if (total <= budget) return messages
+
+  const out: LLMMessage[] = []
+  let used = 0
+
+  // 1. system 提示恒保留（即使超预算也不能丢）
+  if (messages[0]?.role === 'system') {
+    out.push(messages[0])
+    used += estimateTokens(messages[0].content)
+  }
+
+  const tail: LLMMessage[] = []
+  const kept = new Set<number>()
+
+  // 2a. 最后一条 user 消息无条件保留（当前问题/observation——丢弃会致 LLM
+  //     无题可答、凭空编造；超预算时截断它本身而非跳过，H 级降幻觉）
+  const last = messages.length - 1
+  if (last >= 1 && messages[last].role === 'user') {
+    let content = messages[last].content
+    let tokens = estimateTokens(content)
+    if (used + tokens > budget && budget - used > 64) {
+      const maxChars = Math.max(64, Math.floor((budget - used) * 4))
+      content = content.slice(0, maxChars) + '\n[内容已截断]'
+      tokens = estimateTokens(content)
+    }
+    tail.unshift({ ...messages[last], content })
+    used += tokens
+    kept.add(last)
+  }
+
+  // 2b. 从尾部向前保留最近的轮次（user, assistant 对 / 独立 user）
+  //     kept 防重复：工具轮 [assistant(tool_call), user(observation)] 中
+  //     observation 已在 2a 保留——配对分支此前会再次 unshift 同一条（重复注入）
+  for (let i = messages.length - 1; i >= 1; i--) {
+    if (kept.has(i)) continue
+    const m = messages[i]
+    if (m.role === 'assistant' && messages[i - 1]?.role === 'user' && !kept.has(i - 1)) {
+      const pairTokens = estimateTokens(messages[i - 1].content) + estimateTokens(m.content)
+      if (used + pairTokens > budget) break
+      tail.unshift(messages[i - 1], m)
+      used += pairTokens
+      kept.add(i - 1)
+      kept.add(i)
+      i--
+    } else if (m.role === 'user') {
+      // 末尾独立的 user（observation / 当前问题）：单独保留后继续向前配对
+      const msgTokens = estimateTokens(m.content)
+      if (used + msgTokens > budget) break
+      tail.unshift(m)
+      used += msgTokens
+      kept.add(i)
+    }
+  }
+  out.push(...tail)
+
+  return out
+}
+
+/**
+ * 截断过长的 Tool 结果（基于 Token 数）
+ */
+function truncateResult(content: string, maxTokens: number): string {
+  if (estimateTokens(content) <= maxTokens) return content
+  return truncateToTokenBudget(content, maxTokens) +
+    '\n\n' + t('engine.resultTruncatedNotice').replace('{tokens}', String(estimateTokens(content)))
+}

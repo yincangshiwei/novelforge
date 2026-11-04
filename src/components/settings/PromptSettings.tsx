@@ -1,0 +1,426 @@
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { ChevronDown, ChevronRight, Globe, FolderOpen, RotateCcw, AlertTriangle } from 'lucide-react'
+import {
+  BUILTIN_PROMPTS,
+  EDITABLE_PROMPT_KEYS,
+  PROMPT_NAME_KEYS,
+  PROMPT_DESC_KEYS,
+  PROMPT_VAR_KEYS,
+  getPromptTemplate,
+  getPromptSource,
+  saveCustomPrompt,
+  saveProjectCustomPrompt,
+  deleteCustomPrompt,
+  deleteProjectCustomPrompt,
+  loadProjectCustomPrompts,
+  type PromptTemplate,
+} from '../../services/prompt-templates'
+import { useProjectStore } from '../../stores/project-store'
+import { useTranslation } from '../../hooks/useTranslation'
+import type { TextKey } from '../../shared/locale'
+import { Button } from '../ui/Button'
+import { Textarea } from '../ui/Textarea'
+import { confirm } from '../ui/Confirm'
+import { renderLog } from '../../services/render-logger'
+
+// ==================== 来源标签配置 ====================
+
+function getSourceConfig(t: (key: TextKey) => string) {
+  return {
+    builtin: { label: t('prompt.builtin'), color: 'var(--color-text-muted)', bg: 'var(--color-hover)' },
+    global: { label: t('prompt.global'), color: 'var(--color-info)', bg: 'rgba(var(--color-info-rgb), 0.1)' },
+    project: { label: t('prompt.project'), color: 'var(--color-warning)', bg: 'rgba(var(--color-warning-rgb), 0.1)' },
+  }
+}
+
+// ==================== 主组件 ====================
+
+/** 提示词模板设置面板 */
+export default function PromptSettings() {
+  const project = useProjectStore((s) => s.currentProject)
+  const { t } = useTranslation()
+  const [expandedKey, setExpandedKey] = useState<string | null>(null)
+  // 强制刷新用（保存/恢复后 getPromptSource 的结果会变）
+  const [refreshKey, setRefreshKey] = useState(0)
+
+  // 项目变更时重新加载项目级覆盖
+  useEffect(() => {
+    if (project?.path) {
+      loadProjectCustomPrompts(project.path).then(() => setRefreshKey((k) => k + 1))
+    }
+  }, [project?.path])
+
+  // 获取可编辑的模板列表
+  const editableTemplates = BUILTIN_PROMPTS.filter((t) => EDITABLE_PROMPT_KEYS.includes(t.key))
+
+  const handleToggle = (key: string) => {
+    setExpandedKey((prev) => (prev === key ? null : key))
+  }
+
+  const triggerRefresh = useCallback(() => setRefreshKey((k) => k + 1), [])
+
+  return (
+    <div className="space-y-2" key={refreshKey}>
+      {/* 说明 */}
+      <div
+        className="flex items-start gap-2 px-3 py-2.5 rounded-lg text-xs mb-4"
+        style={{ backgroundColor: 'var(--color-hover)', color: 'var(--color-text-muted)' }}
+      >
+        <span className="flex-shrink-0 mt-0.5" style={{ color: 'var(--color-text-muted)' }}>{t('prompt.tip')}</span>
+        <span>{t('prompt.description')}</span>
+      </div>
+
+      {editableTemplates.map((builtinTemplate) => {
+        const source = getPromptSource(builtinTemplate.key)
+        const currentTemplate = getPromptTemplate(builtinTemplate.key) ?? builtinTemplate
+        const isExpanded = expandedKey === builtinTemplate.key
+
+        return (
+          <TemplateItem
+            key={builtinTemplate.key}
+            builtinTemplate={builtinTemplate}
+            currentTemplate={currentTemplate}
+            source={source}
+            isExpanded={isExpanded}
+            onToggle={() => handleToggle(builtinTemplate.key)}
+            projectPath={project?.path ?? null}
+            onSaved={triggerRefresh}
+            t={t}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+// ==================== 单个模板条目 ====================
+
+function TemplateItem({
+  builtinTemplate,
+  currentTemplate,
+  source,
+  isExpanded,
+  onToggle,
+  projectPath,
+  onSaved,
+  t,
+}: {
+  builtinTemplate: PromptTemplate
+  currentTemplate: PromptTemplate
+  source: 'builtin' | 'global' | 'project'
+  isExpanded: boolean
+  onToggle: () => void
+  projectPath: string | null
+  onSaved: () => void
+  t: (key: TextKey) => string
+}) {
+  const [editContent, setEditContent] = useState(currentTemplate.content)
+  const [saving, setSaving] = useState(false)
+  const [saveResult, setSaveResult] = useState<{ type: 'success' | 'error'; msg: string } | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  const [prevExpanded, setPrevExpanded] = useState(isExpanded)
+  const [prevContent, setPrevContent] = useState(currentTemplate.content)
+
+  // 展开时重置编辑内容
+  if (isExpanded !== prevExpanded || currentTemplate.content !== prevContent) {
+    if (isExpanded) {
+      setEditContent(currentTemplate.content)
+      setSaveResult(null)
+    }
+    setPrevExpanded(isExpanded)
+    setPrevContent(currentTemplate.content)
+  }
+
+  // 检查是否有被删除的变量
+  const missingVars = Object.keys(builtinTemplate.variables).filter(
+    (v) => builtinTemplate.content.includes(`{{${v}}}`) && !editContent.includes(`{{${v}}}`)
+  )
+
+  // 检查是否新增了模板未定义的变量（拼写错误/臆造变量渲染时不会被替换，会原样发给 LLM）
+  const unknownVars = [...editContent.matchAll(/\{\{([^{}]+)\}\}/g)]
+    .map(m => m[1])
+    .filter(v => !builtinTemplate.variables[v])
+
+  const sourceConf = getSourceConfig(t)[source]
+
+  // 插入变量到光标位置
+  const insertVariable = (varName: string) => {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    const start = textarea.selectionStart
+    const end = textarea.selectionEnd
+    const text = `{{${varName}}}`
+    const newContent = editContent.slice(0, start) + text + editContent.slice(end)
+    setEditContent(newContent)
+    // 恢复光标
+    requestAnimationFrame(() => {
+      textarea.focus()
+      textarea.setSelectionRange(start + text.length, start + text.length)
+    })
+  }
+
+  // 保存到全局
+  const handleSaveGlobal = async () => {
+    setSaving(true)
+    setSaveResult(null)
+    const template: PromptTemplate = {
+      ...builtinTemplate,
+      content: editContent,
+      // 不保存 systemSuffix（渲染时自动从内置取）与 contentLocales（自定义模板单语言，content 是唯一事实）
+    }
+    delete (template as Partial<PromptTemplate>).systemSuffix
+    delete (template as Partial<PromptTemplate>).contentLocales
+    const ok = await saveCustomPrompt(template)
+    setSaving(false)
+    setSaveResult(ok ? { type: 'success', msg: t('prompt.savedGlobal') } : { type: 'error', msg: t('prompt.saveFailed') })
+    // 保存行为日志流（视觉反馈已有 saveResult 局部文本）
+    if (ok) {
+      renderLog('info', 'Save:Prompt', t('log.render.promptSaveSuccessGlobal').replace('{key}', () => builtinTemplate.key))
+      onSaved()
+    } else {
+      renderLog('error', 'Save:Prompt', t('log.render.promptSaveFailedGlobal').replace('{key}', () => builtinTemplate.key))
+    }
+    setTimeout(() => setSaveResult(null), 3000)
+  }
+
+  // 保存到项目
+  const handleSaveProject = async () => {
+    if (!projectPath) return
+    setSaving(true)
+    setSaveResult(null)
+    const template: PromptTemplate = {
+      ...builtinTemplate,
+      content: editContent,
+    }
+    delete (template as Partial<PromptTemplate>).systemSuffix
+    delete (template as Partial<PromptTemplate>).contentLocales
+    const ok = await saveProjectCustomPrompt(projectPath, template)
+    setSaving(false)
+    setSaveResult(ok ? { type: 'success', msg: t('prompt.savedProject') } : { type: 'error', msg: t('prompt.saveFailed') })
+    // 保存行为日志流（视觉反馈已有 saveResult 局部文本）
+    if (ok) {
+      renderLog('info', 'Save:Prompt', t('log.render.promptSaveSuccessProject').replace('{key}', () => builtinTemplate.key))
+      onSaved()
+    } else {
+      renderLog('error', 'Save:Prompt', t('log.render.promptSaveFailedProject').replace('{key}', () => builtinTemplate.key))
+    }
+    setTimeout(() => setSaveResult(null), 3000)
+  }
+
+  // 恢复默认 — 破坏性操作（删除全局+项目级自定义内容），先确认（用户困惑点：曾不知
+  // 「恢复默认」会删除自定义、以及自定义模板为何不随语言切换——确认文案明确行为）
+  const handleReset = async () => {
+    const ok = await confirm(t('prompt.restoreDefaultConfirm'), {
+      title: t('prompt.restoreDefaultTitle'),
+      confirmText: t('prompt.restoreDefaultBtn'),
+      danger: true,
+    })
+    if (!ok) return
+    setSaving(true)
+    setSaveResult(null)
+    // 依次删除项目级和全局级覆盖
+    if (projectPath) await deleteProjectCustomPrompt(projectPath, builtinTemplate.key)
+    await deleteCustomPrompt(builtinTemplate.key)
+    // 重置为当前语言的默认模板（删除自定义后 getPromptTemplate 返回内置语言版）
+    setEditContent(getPromptTemplate(builtinTemplate.key)?.content ?? builtinTemplate.content)
+    setSaving(false)
+    setSaveResult({ type: 'success', msg: t('prompt.restoredDefault') })
+    // 保存行为日志流（视觉反馈已有 saveResult 局部文本）
+    renderLog('info', 'Save:Prompt', t('log.render.promptResetDefault').replace('{key}', () => builtinTemplate.key))
+    onSaved()
+    setTimeout(() => setSaveResult(null), 3000)
+  }
+
+  return (
+    <div
+      className="rounded-xl overflow-hidden transition-colors"
+      style={{
+        border: `1px solid ${isExpanded ? 'var(--color-accent)' : 'var(--color-border)'}`,
+        backgroundColor: 'var(--color-panel)',
+      }}
+    >
+      {/* 折叠头部 */}
+      <button
+        className="w-full flex items-center gap-2.5 px-4 py-3 text-left transition-colors hover:bg-[var(--color-hover)] outline-none focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[var(--color-accent)]"
+        onClick={onToggle}
+      >
+        {isExpanded ? (
+          <ChevronDown size={14} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+        ) : (
+          <ChevronRight size={14} style={{ color: 'var(--color-text-muted)', flexShrink: 0 }} />
+        )}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+              {PROMPT_NAME_KEYS[builtinTemplate.key]
+                ? t(PROMPT_NAME_KEYS[builtinTemplate.key])
+                : builtinTemplate.name}
+            </span>
+            <span
+              className="text-micro px-1.5 py-0.5 rounded-full font-medium flex-shrink-0"
+              style={{ color: sourceConf.color, backgroundColor: sourceConf.bg }}
+              title={source !== 'builtin' ? t('prompt.customLangTip') : undefined}
+            >
+              {sourceConf.label}
+            </span>
+          </div>
+          <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text-muted)' }}>
+            {PROMPT_DESC_KEYS[builtinTemplate.key]
+              ? t(PROMPT_DESC_KEYS[builtinTemplate.key])
+              : builtinTemplate.description}
+          </p>
+        </div>
+      </button>
+
+      {/* 展开编辑区 */}
+      {isExpanded && (
+        <div className="px-4 pb-4 space-y-3" style={{ borderTop: '1px solid var(--color-border)' }}>
+          {/* 变量标签栏 */}
+          <div className="pt-3">
+            <p className="text-micro font-medium mb-1.5" style={{ color: 'var(--color-text-muted)' }}>
+              {t('prompt.variables')}
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {Object.entries(builtinTemplate.variables).map(([varName, desc]) => {
+                const descText = PROMPT_VAR_KEYS[desc] ? t(PROMPT_VAR_KEYS[desc]) : desc
+                return (
+                <button
+                  key={varName}
+                  onClick={() => insertVariable(varName)}
+                  title={descText}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-micro transition-colors hover:bg-[var(--color-accent)] hover:text-white outline-none focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--color-accent)]"
+                  style={{
+                    backgroundColor: 'var(--color-hover)',
+                    color: 'var(--color-text-secondary)',
+                    border: '1px solid var(--color-border)',
+                  }}
+                >
+                  <code className="font-mono">{`{{${varName}}}`}</code>
+                  <span className="opacity-60 max-w-[120px] truncate">{descText}</span>
+                </button>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* 编辑 textarea */}
+          <div>
+            {/* 描边/正文色/焦点环（含聚焦时描边转 accent）/禁用态走 ui/Textarea——
+                原先靠 onFocus/onBlur 手工改 borderColor，现由 focus:border-[var(--color-accent)] 承担。
+                这里只留提示词编辑器特有的：编辑器底色、圆角、等宽字体与高度区间 */}
+            <Textarea
+              ref={textareaRef}
+              value={editContent}
+              onChange={(e) => setEditContent(e.target.value)}
+              className="rounded-lg px-3 py-2.5 font-mono"
+              style={{
+                backgroundColor: 'var(--color-editor-bg)',
+                minHeight: '200px',
+                maxHeight: '500px',
+                lineHeight: 1.6,
+              }}
+              spellCheck={false}
+            />
+          </div>
+
+          {/* 变量缺失警告 */}
+          {missingVars.length > 0 && (() => {
+            const missingText = t('prompt.missingVars')
+            const [before, after] = missingText.split('{vars}')
+            return (
+            <div
+              className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs"
+              style={{ backgroundColor: 'color-mix(in srgb, var(--color-warning) 10%, transparent)', color: 'var(--color-warning)' }}
+            >
+              <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+              <span>
+                {before}
+                {missingVars.map((v) => (
+                  <code key={v} className="mx-1 font-mono">{`{{${v}}}`}</code>
+                ))}
+                {after}
+              </span>
+            </div>
+            )
+          })()}
+
+          {/* 未知变量警告（新增的 {{变量}} 不在模板变量列表中，渲染时不会被替换） */}
+          {unknownVars.length > 0 && (() => {
+            const unknownText = t('prompt.unknownVars')
+            const [before, after] = unknownText.split('{vars}')
+            return (
+            <div
+              className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs"
+              style={{ backgroundColor: 'color-mix(in srgb, var(--color-info) 10%, transparent)', color: 'var(--color-info)' }}
+            >
+              <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+              <span>
+                {before}
+                {unknownVars.map((v) => (
+                  <code key={v} className="mx-1 font-mono">{`{{${v}}}`}</code>
+                ))}
+                {after}
+              </span>
+            </div>
+            )
+          })()}
+
+
+          {/* 操作按钮 */}
+          <div className="flex items-center gap-2 pt-1">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleSaveGlobal}
+              disabled={saving}
+              title={t('tip.saveGlobal')}
+            >
+              <Globe size={12} />
+              {t('prompt.saveGlobalBtn')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleSaveProject}
+              disabled={saving || !projectPath}
+              title={projectPath ? t('tip.saveProject') : t('prompt.needProjectTip')}
+            >
+              <FolderOpen size={12} />
+              {t('prompt.saveProjectBtn')}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleReset}
+              disabled={saving || source === 'builtin'}
+              title={t('tip.restoreDefault')}
+            >
+              <RotateCcw size={12} />
+              {t('prompt.restoreDefaultBtn')}
+            </Button>
+          </div>
+
+          {/* 保存结果反馈 */}
+          {saveResult && (
+            <div
+              className="text-xs px-3 py-1.5 rounded-lg border"
+              style={{
+                backgroundColor: saveResult.type === 'success'
+                  ? 'color-mix(in srgb, var(--color-success) 10%, transparent)'
+                  : 'color-mix(in srgb, var(--color-error) 10%, transparent)',
+                color: saveResult.type === 'success' ? 'var(--color-success)' : 'var(--color-error)',
+                borderColor: saveResult.type === 'success'
+                  ? 'color-mix(in srgb, var(--color-success) 20%, transparent)'
+                  : 'color-mix(in srgb, var(--color-error) 20%, transparent)',
+              }}
+            >
+              {saveResult.type === 'success' ? '✅ ' : '❌ '}
+              {saveResult.msg}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

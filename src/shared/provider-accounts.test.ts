@@ -1,0 +1,391 @@
+import { describe, it, expect } from 'vitest'
+import { deriveModelId, isModelOfAccount, syncAccountModels, findModelReferences } from './provider-accounts'
+import { BUILTIN_PRESETS, builtinCatalogFor, presetModelDefaults } from './provider-presets'
+import { PI_AI_MODEL_SPECS } from './model-specs.generated'
+import type { ModelProfile, ProviderAccount } from './ipc-channels'
+
+const ACCOUNT: ProviderAccount = {
+  id: 'acc-1',
+  provider: 'deepseek',
+  protocol: 'openai',
+  apiKeyRef: 'DEEPSEEK_API_KEY',
+  baseUrl: 'https://api.deepseek.com',
+  modelNames: ['deepseek-v4-pro', 'deepseek-v4-flash'],
+}
+
+function mkModel(over: Partial<ModelProfile> & { id: string }): ModelProfile {
+  return {
+    name: over.id,
+    provider: 'openai',
+    protocol: 'openai',
+    modelName: 'gpt-4o',
+    baseUrl: '',
+    maxTokens: 4096,
+    contextWindow: 131072,
+    purposes: ['generation'],
+    ...over,
+  }
+}
+
+const DEFAULTS = {
+  maxTokens: 8192,
+  contextWindow: 128000,
+  purposes: ['generation'] as ModelProfile['purposes'],
+}
+const newModelDefaults = () => ({ ...DEFAULTS })
+
+describe('deriveModelId / isModelOfAccount', () => {
+  it('id 由 accountId 与模型名确定性派生（反复勾选/取消后仍可重现）', () => {
+    expect(deriveModelId('acc-1', 'deepseek-v4-pro')).toBe('acc-1::deepseek-v4-pro')
+    expect(deriveModelId('acc-1', 'deepseek-v4-pro')).toBe(deriveModelId('acc-1', 'deepseek-v4-pro'))
+  })
+
+  it('能判定某条目属于哪个账户', () => {
+    expect(isModelOfAccount(deriveModelId('acc-1', 'm'), 'acc-1')).toBe(true)
+    expect(isModelOfAccount(deriveModelId('acc-2', 'm'), 'acc-1')).toBe(false)
+    expect(isModelOfAccount('手工条目-uuid', 'acc-1')).toBe(false)
+  })
+
+  it('手工条目的 uuid 不会被误判为派生条目', () => {
+    // uuid 里没有 `::`，故不会被任何账户认领
+    expect(isModelOfAccount('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'f47ac10b')).toBe(false)
+  })
+})
+
+describe('syncAccountModels', () => {
+  it('勾选 → 为每个模型新建派生条目，凭据取自账户', () => {
+    const out = syncAccountModels(ACCOUNT, [], newModelDefaults)
+    expect(out).toHaveLength(2)
+    expect(out[0].id).toBe('acc-1::deepseek-v4-pro')
+    expect(out[0].modelName).toBe('deepseek-v4-pro')
+    expect(out[0].baseUrl).toBe('https://api.deepseek.com')
+    expect(out[0].provider).toBe('deepseek')
+    expect(out[0].maxTokens).toBe(8192)
+    expect(out[0].apiKeyRef, '凭据副本必须带上账户的 ref（T5 删 apiKey 后它是唯一通路）').toBe('DEEPSEEK_API_KEY')
+  })
+
+  it('新条目的显示名初值取模型名（之后用户在卡片里改的就是权威值）', () => {
+    expect(syncAccountModels(ACCOUNT, [], newModelDefaults)[0].name).toBe('deepseek-v4-pro')
+  })
+
+  describe('⚠️ 合并语义（不是覆盖）：逐模型设置必须保留', () => {
+    it('改账户凭据 → 只更新连通字段（ref/地址/协议/家），用户改过的显示名/上限/窗口/用途原样保留', () => {
+      const mine = mkModel({
+        id: 'acc-1::deepseek-v4-pro',
+        name: '我的主力模型',
+        maxTokens: 16384,
+        contextWindow: 200000,
+        purposes: ['generation', 'refinement'],
+        baseUrl: 'https://old',
+      })
+      const changed: ProviderAccount = { ...ACCOUNT, apiKeyRef: 'CUSTOM_API_KEY', baseUrl: 'https://new', protocol: 'gemini', provider: 'custom' }
+      const out = syncAccountModels(changed, [mine], newModelDefaults)
+      const got = out.find(m => m.id === 'acc-1::deepseek-v4-pro')!
+
+      expect(got.apiKeyRef).toBe('CUSTOM_API_KEY')
+      expect(got.baseUrl).toBe('https://new')
+      expect(got.protocol).toBe('gemini')
+      expect(got.provider).toBe('custom')
+
+      expect(got.name, '显示名被同步冲掉了').toBe('我的主力模型')
+      expect(got.maxTokens).toBe(16384)
+      expect(got.contextWindow).toBe(200000)
+      expect(got.purposes).toEqual(['generation', 'refinement'])
+    })
+  })
+
+  describe('目录三态（v3 §3.4）：undefined / 空数组 = 继承内置目录', () => {
+    /** 有完整手写目录的 provider（models + embeddingModels 都有） */
+    const heir: ProviderAccount = {
+      id: 'heir-1',
+      provider: 'openai',
+      protocol: 'openai',
+      apiKeyRef: 'OPENAI_API_KEY',
+      baseUrl: 'https://api.openai.com',
+      modelNames: [],
+    }
+
+    it('modelNames 空数组 = 继承内置目录全集（名序 = models 序 + embeddingModels 序 + 生成表键）', () => {
+      const out = syncAccountModels(heir, [], (n) => presetModelDefaults(heir.provider, n))
+
+      expect(out.map(m => m.modelName)).toEqual(builtinCatalogFor('openai'))
+      // 名序 = 预设 models 序 + embeddingModels 序 + pi-ai 生成表键（按 builtinCatalogFor 同款去重）
+      const preset = BUILTIN_PRESETS.find(p => p.provider === 'openai')!
+      const expected = [...new Set([
+        ...preset.models.map(m => m.name),
+        ...preset.embeddingModels,
+        ...Object.keys(PI_AI_MODEL_SPECS['openai'] ?? {}),
+      ])]
+      expect(out.map(m => m.modelName)).toEqual(expected)
+      expect(out.length).toBeGreaterThan(preset.models.length) // 其它来源的模型确实进来了
+    })
+
+    it('继承而来的派生条目只带凭据**引用**（apiKeyRef 随账户走；条目上没有密钥值）', () => {
+      const out = syncAccountModels(heir, [], (n) => presetModelDefaults(heir.provider, n))
+      expect(out.every(m => m.apiKeyRef === 'OPENAI_API_KEY')).toBe(true)
+      expect(out.every(m => !('apiKey' in m))).toBe(true) // v3 T5：派生条目不再持有凭据副本
+      expect(out.every(m => m.provider === 'openai')).toBe(true)
+    })
+
+    it('modelNames 缺省（undefined）与空数组同义', () => {
+      const undef: ProviderAccount = { ...heir, modelNames: undefined }
+      const a = syncAccountModels(undef, [], (n) => presetModelDefaults(heir.provider, n))
+      const b = syncAccountModels(heir, [], (n) => presetModelDefaults(heir.provider, n))
+      expect(a.map(m => m.id)).toEqual(b.map(m => m.id))
+      expect(a).toHaveLength(builtinCatalogFor('openai').length)
+    })
+
+    it('继承态下已有条目的逐模型设置仍原样保留（合并语义不因继承而变）', () => {
+      const mine = mkModel({
+        id: deriveModelId(heir.id, 'gpt-5.6-sol'),
+        modelName: 'gpt-5.6-sol',
+        name: '我的主力',
+      })
+      const out = syncAccountModels(heir, [mine], (n) => presetModelDefaults(heir.provider, n))
+      const got = out.find(m => m.id === mine.id)!
+      expect(got.name).toBe('我的主力')
+      expect(got.apiKeyRef).toBe('OPENAI_API_KEY')
+      expect(out).toHaveLength(builtinCatalogFor('openai').length) // 不重复追加
+    })
+
+    it('生成表（PI_AI_MODEL_SPECS）的键并入继承目录，排在两个手写来源之后', () => {
+      // 找一个「生成表带来手写来源之外新键」的 provider（pi-ai 升级后 deepseek 已全被手写覆盖，
+      // 不能写死 provider —— 否则断言会随目录数据漂移变成空转/误报）
+      const handwrittenOf = (provider: string): string[] => {
+        const preset = BUILTIN_PRESETS.find(p => p.provider === provider)
+        return [...(preset?.models.map(m => m.name) ?? []), ...(preset?.embeddingModels ?? [])]
+      }
+      const provider = Object.keys(PI_AI_MODEL_SPECS).find((candidate) => {
+        const handwritten = new Set(handwrittenOf(candidate))
+        return Object.keys(PI_AI_MODEL_SPECS[candidate] ?? {}).some(id => !handwritten.has(id))
+      })
+      expect(provider, '应有 provider 的生成表键超出 NF 手写来源').toBeTruthy()
+
+      const handwritten = handwrittenOf(provider!)
+      const generated = Object.keys(PI_AI_MODEL_SPECS[provider!] ?? {})
+
+      expect(builtinCatalogFor(provider!)).toEqual([...new Set([...handwritten, ...generated])])
+      expect(builtinCatalogFor(provider!).length).toBeGreaterThan(handwritten.length) // 生成表确实带来新键
+    })
+
+    it('手写 models 刻意留空的 provider 由生成表兜住（继承不再为空）', () => {
+      for (const provider of ['moonshot', 'xiaomi', 'groq', 'openrouter']) {
+        expect(BUILTIN_PRESETS.find(p => p.provider === provider)!.models, provider).toEqual([])
+        expect(builtinCatalogFor(provider), provider).toEqual(Object.keys(PI_AI_MODEL_SPECS[provider] ?? {}))
+        expect(builtinCatalogFor(provider).length, provider).toBeGreaterThan(0)
+      }
+    })
+
+    it('自定义清单只需要所列模型（非空 = 自定义态，不再继承）', () => {
+      const out = syncAccountModels(ACCOUNT, [], (n) => presetModelDefaults(ACCOUNT.provider, n))
+      expect(out.map(m => m.modelName)).toEqual(['deepseek-v4-pro', 'deepseek-v4-flash'])
+      expect(out).toHaveLength(2) // 内置目录里还有别的 deepseek 规格项 → 证明未继承
+    })
+
+    it('未知/自定义 provider 的内置目录为空 → 继承态下不产生条目', () => {
+      const custom: ProviderAccount = { ...heir, provider: 'custom', protocol: 'openai', modelNames: undefined }
+      expect(builtinCatalogFor('custom')).toEqual([])
+      expect(syncAccountModels(custom, [], (n) => presetModelDefaults(custom.provider, n))).toEqual([])
+    })
+  })
+
+  describe('modelOverrides（v3 T7 目录区）：只覆盖所列字段，其它用户字段原样保留', () => {
+    it('新建条目：override 覆盖 preset 默认（容量/显示名/输入类型）', () => {
+      const out = syncAccountModels(ACCOUNT, [], newModelDefaults, {
+        'deepseek-v4-pro': { name: '主力', contextWindow: 256_000, maxTokens: 24_576, inputTypes: ['text', 'image'] },
+      })
+      const got = out.find(m => m.modelName === 'deepseek-v4-pro')!
+      expect(got.name).toBe('主力')
+      expect(got.contextWindow).toBe(256_000)
+      expect(got.maxTokens).toBe(24_576)
+      expect(got.inputTypes).toEqual(['text', 'image'])
+      expect(got.modelName).toBe('deepseek-v4-pro') // id 语义不变
+      // 未列出的字段仍取 preset 默认（purposes）
+      expect(got.purposes).toEqual(DEFAULTS.purposes)
+      // 没被 overrides 提到的另一行完全不受影响
+      expect(out.find(m => m.modelName === 'deepseek-v4-flash')!.name).toBe('deepseek-v4-flash')
+    })
+
+    it('⚠️ 已有条目：override 叠加在**用户已改的值**之上，只覆盖所列字段', () => {
+      const mine = mkModel({
+        id: deriveModelId(ACCOUNT.id, 'deepseek-v4-pro'),
+        modelName: 'deepseek-v4-pro',
+        name: '我的主力',
+        contextWindow: 65_536,
+        purposes: ['generation', 'refinement'],
+      })
+      const out = syncAccountModels(
+        ACCOUNT,
+        [mine],
+        newModelDefaults,
+        { 'deepseek-v4-pro': { contextWindow: 256_000 } }, // 只改窗口
+      )
+      const got = out.find(m => m.id === mine.id)!
+      expect(got.contextWindow).toBe(256_000)   // 所列字段：覆盖
+      expect(got.name).toBe('我的主力')          // 未列出的用户设置：原样保留
+      expect(got.purposes).toEqual(['generation', 'refinement'])
+    })
+
+    it('构造出的 override 里值为 undefined 的键不落盘（不能把已有值抹成 undefined）', () => {
+      const mine = mkModel({
+        id: deriveModelId(ACCOUNT.id, 'deepseek-v4-pro'),
+        modelName: 'deepseek-v4-pro',
+        name: '我的主力',
+        maxTokens: 4_096,
+      })
+      const out = syncAccountModels(ACCOUNT, [mine], newModelDefaults, {
+        'deepseek-v4-pro': { name: '我的主力', maxTokens: undefined, inputTypes: undefined },
+      })
+      const got = out.find(m => m.id === mine.id)!
+      expect(got.maxTokens).toBe(4_096)                      // 未被抹掉
+      expect('inputTypes' in got).toBe(false)                // 没凭空多出键
+      expect(got.apiKeyRef).toBe('DEEPSEEK_API_KEY')         // 凭据引用照常同步
+    })
+
+    it('缺省（undefined）= 旧行为：一个字段都不动', () => {
+      const withOut = syncAccountModels(ACCOUNT, [], newModelDefaults)
+      const withEmpty = syncAccountModels(ACCOUNT, [], newModelDefaults, {})
+      expect(withEmpty).toEqual(withOut)
+    })
+
+    it('⚠️ 三态之 null = **移除覆盖**：字段回到 preset 默认，用户旧值消失', () => {
+      const mine = mkModel({
+        id: deriveModelId(ACCOUNT.id, 'deepseek-v4-pro'),
+        modelName: 'deepseek-v4-pro',
+        contextWindow: 9_999,
+        maxTokens: 4_096,
+        purposes: ['generation', 'refinement'],
+      })
+      const out = syncAccountModels(
+        ACCOUNT,
+        [mine],
+        newModelDefaults,
+        { 'deepseek-v4-pro': { contextWindow: null } }, // 目录区清空该框
+      )
+      const got = out.find(m => m.id === mine.id)!
+
+      expect(got.contextWindow).toBe(DEFAULTS.contextWindow) // 回落内置规格（= 新建条目时的值）
+      expect(got.contextWindow).not.toBe(9_999)
+      expect(got.maxTokens).toBe(4_096)                      // 未列出的字段零影响
+      expect(got.purposes).toEqual(['generation', 'refinement'])
+    })
+
+    it('三态并存：null 回默认 / undefined 不动 / 有值覆盖（同一份 overrides 里各走各的）', () => {
+      const mine = mkModel({
+        id: deriveModelId(ACCOUNT.id, 'deepseek-v4-pro'),
+        modelName: 'deepseek-v4-pro',
+        contextWindow: 9_999,
+        maxTokens: 4_096,
+      })
+      const out = syncAccountModels(ACCOUNT, [mine], newModelDefaults, {
+        'deepseek-v4-pro': { contextWindow: null, maxTokens: 65_536 },
+        'deepseek-v4-flash': { maxTokens: undefined, contextWindow: undefined }, // 空壳 = 没改
+      })
+      const pro = out.find(m => m.modelName === 'deepseek-v4-pro')!
+      expect(pro.contextWindow).toBe(DEFAULTS.contextWindow) // null → 回默认
+      expect(pro.maxTokens).toBe(65_536)                     // 有值 → 覆盖
+      expect(out.find(m => m.modelName === 'deepseek-v4-flash')!.maxTokens).toBe(DEFAULTS.maxTokens)
+    })
+
+    it('新条目：null 覆盖 = 与「不传 override 的新建」同值（默认值的唯一来源仍是 defaults）', () => {
+      const withNull = syncAccountModels(ACCOUNT, [], newModelDefaults, {
+        'deepseek-v4-pro': { contextWindow: null, maxTokens: null },
+      })
+      const plain = syncAccountModels(ACCOUNT, [], newModelDefaults)
+      const a = withNull.find(m => m.modelName === 'deepseek-v4-pro')!
+      const b = plain.find(m => m.modelName === 'deepseek-v4-pro')!
+
+      expect(a.contextWindow).toBe(b.contextWindow)
+      expect(a.maxTokens).toBe(b.maxTokens)
+      expect(Number.isFinite(a.contextWindow)).toBe(true) // 落盘字段仍是有意义的数（不是 null/缺键）
+      expect(Number.isFinite(a.maxTokens)).toBe(true)
+    })
+  })
+
+  it('取消勾选 → 删除该条目', () => {
+    const existing = syncAccountModels(ACCOUNT, [], newModelDefaults)
+    const shrunk: ProviderAccount = { ...ACCOUNT, modelNames: ['deepseek-v4-pro'] }
+    const out = syncAccountModels(shrunk, existing, newModelDefaults)
+    expect(out.map(m => m.id)).toEqual(['acc-1::deepseek-v4-pro'])
+  })
+
+  it('⚠️ 语义变更（v3）：空 modelNames 现在是「继承」而非「清空」——删除账户不再走它', () => {
+    const existing = syncAccountModels(ACCOUNT, [], newModelDefaults)
+    const out = syncAccountModels({ ...ACCOUNT, modelNames: [] }, existing, newModelDefaults)
+    // 旧语义（空 = 删光派生条目）已废弃：现在空 = 继承内置目录 → 条目按目录重建
+    // （既有条目仍按 existing 序保留 —— 合并语义不变，只有**新建**条目才取目录序）
+    expect(out.map(m => m.id).sort()).toEqual(
+      builtinCatalogFor('deepseek').map(n => deriveModelId(ACCOUNT.id, n)).sort(),
+    )
+    expect(out).not.toHaveLength(0)
+  })
+
+  describe('不越界', () => {
+    it('手工添加的条目不受任何影响', () => {
+      const hand = mkModel({ id: 'uuid-hand', name: '手工模型' })
+      const out = syncAccountModels(ACCOUNT, [hand], newModelDefaults)
+      expect(out.find(m => m.id === 'uuid-hand')).toEqual(hand)
+    })
+
+    it('别的账户的条目不受影响', () => {
+      const other = mkModel({ id: 'acc-2::m', name: '别的' })
+      const out = syncAccountModels(ACCOUNT, [other], newModelDefaults)
+      expect(out.find(m => m.id === 'acc-2::m')).toEqual(other)
+    })
+
+    it('保持既有条目顺序，新条目追加在后', () => {
+      const hand = mkModel({ id: 'uuid-hand' })
+      const kept = syncAccountModels({ ...ACCOUNT, modelNames: ['deepseek-v4-pro'] }, [hand], newModelDefaults)
+      const added = syncAccountModels(ACCOUNT, kept, newModelDefaults)
+      expect(added.map(m => m.id)).toEqual(['uuid-hand', 'acc-1::deepseek-v4-pro', 'acc-1::deepseek-v4-flash'])
+    })
+  })
+})
+
+describe('findModelReferences（取消勾选 / 删账户前的引用保护）', () => {
+  const MODEL = 'acc-1::deepseek-v4-pro'
+
+  it('无引用 → 空数组', () => {
+    expect(findModelReferences(MODEL, {})).toEqual([])
+  })
+
+  it('命中默认生成模型', () => {
+    const refs = findModelReferences(MODEL, { defaultModelId: MODEL })
+    expect(refs).toHaveLength(1)
+    expect(refs[0].kind).toBe('default')
+  })
+
+  it('命中默认向量模型 / 向量化配置', () => {
+    expect(findModelReferences(MODEL, { defaultEmbeddingModelId: MODEL })[0].kind).toBe('defaultEmbedding')
+    expect(findModelReferences(MODEL, { llmEmbeddingModelId: MODEL })[0].kind).toBe('llmEmbedding')
+  })
+
+  it('命中三层路由的某一层（要指出是哪一层）', () => {
+    const refs = findModelReferences(MODEL, {
+      modelRoutes: { elite: [], standard: [MODEL], budget: [] },
+    })
+    expect(refs).toHaveLength(1)
+    expect(refs[0].kind).toBe('route')
+    expect(refs[0].label).toContain('standard')
+  })
+
+  it('命中会话（要指出是哪个会话）', () => {
+    const refs = findModelReferences(MODEL, {
+      conversations: [
+        { id: 'c1', title: '无关会话', modelId: 'other' },
+        { id: 'c2', title: '第一章', modelId: MODEL },
+      ],
+    })
+    expect(refs).toHaveLength(1)
+    expect(refs[0].label).toContain('第一章')
+  })
+
+  it('多处引用时全部列出', () => {
+    const refs = findModelReferences(MODEL, {
+      defaultModelId: MODEL,
+      modelRoutes: { elite: [MODEL], standard: [], budget: [] },
+      conversations: [{ id: 'c2', title: 'T', modelId: MODEL }],
+    })
+    expect(refs.map(r => r.kind).sort()).toEqual(['conversation', 'default', 'route'])
+  })
+})

@@ -1,0 +1,118 @@
+import type { AgentMessage } from '../../stores/agent-store'
+import { useLLMStore } from '../../stores/llm-store'
+import { t } from '../../shared/locale'
+import { ipc } from '../ipc-client'
+import { calculateCost } from '../llm/prompt-cache'
+import { parseSharedFacts, upsertSharedFacts } from '../memory/shared-memory'
+
+/** 组装 CCR 摘要 prompt：第 N 次压缩输入 = 旧 rollingSummary + 新压缩批原文（迭代规则见设计 §4.2）
+ *  @param maxTokens 摘要**生成长度指令**（W1 批 2：与注入上限同源，由 `context-policy.m1BudgetTokens` 给；
+ *         缺省 250 = 引入前文案。只调注入端会出现"给了 400 额度、摘要仍按 250 生成"的死额度。） */
+export function buildCcrSummaryPrompt(
+  oldSummary: string,
+  batchText: string,
+  hints?: string[],
+  maxTokens?: number,
+): string {
+  // P1-1：固定分节的标题字符串单一来源——prompt 里的 {facts}/{instructions}/{tasks}/{decisions}
+  // 由分节标题键填充；注入端（context-builder.trimSessionSummary）按同源值跨语言裁剪
+  const maxT = maxTokens ?? SUMMARY_DEFAULT_MAX_TOKENS
+  // cl100k 中文实测 ≈1.6 字/token（原文案 250 tokens ↔ 约 400 汉字）——保留字数提示，帮模型估长
+  const maxChars = Math.round(maxT * 1.6)
+  const parts = [t('ccr.summaryPrompt')
+    .replace('{facts}', t('ccr.summarySectionFacts'))
+    .replace('{instructions}', t('ccr.summarySectionInstructions'))
+    .replace('{tasks}', t('ccr.summarySectionTasks'))
+    .replace('{decisions}', t('ccr.summarySectionDecisions'))
+    .replace('{maxTokens}', String(maxT))
+    .replace('{maxChars}', String(maxChars))]
+  // 自学习压缩 v1：激活规则的保留/省略提示（规则文本为 i18n 键，零注入风险）
+  if (hints && hints.length > 0) {
+    parts.push(`${t('ccr.learnedHintsHeader')}\n${hints.map(h => `- ${h}`).join('\n')}`)
+  }
+  if (oldSummary) {
+    parts.push(`${t('ccr.oldSummaryLabel')}\n${oldSummary}`)
+  }
+  parts.push(`${t('ccr.batchLabel')}\n${batchText}`)
+  // P3 SharedContext：提取指令追在批文本之后（机器锚点 [可复用事实] 三语字面量一致）
+  parts.push(t('ccr.sharedFactsInstruction'))
+  return parts.join('\n\n')
+}
+
+/** 摘要生成长度指令的缺省值（与 `SESSION_SUMMARY_BUDGET_TOKENS` 300 的注入上限留余量） */
+export const SUMMARY_DEFAULT_MAX_TOKENS = 250
+
+/** 生成对话摘要（budget 路由 + purpose 'ccr_summary' 落库）；失败 throw 由调用方降级硬截断 */
+export async function generateConversationSummary(opts: {
+  oldSummary: string
+  batch: AgentMessage[]
+  modelId: string
+  /** 自学习压缩：激活规则的提示（缺省 = 不追加，行为与引入前一致） */
+  hints?: string[]
+  /** W1 批 2：摘要生成长度指令上限（缺省 250；与注入上限同源，由档位策略给出） */
+  maxTokens?: number
+}): Promise<string> {
+  const batchText = opts.batch
+    .map(m => `${m.role === 'user' ? t('ccr.roleUser') : t('ccr.roleAssistant')}: ${m.content}`)
+    .join('\n\n')
+  const prompt = buildCcrSummaryPrompt(opts.oldSummary, batchText, opts.hints, opts.maxTokens)
+
+  // ⚠️ P0 修复：压缩摘要必须走 budget 路由（summarize→budget，设计 §7/计划 Global
+  //    Constraints）——此前直接传 opts.modelId（Agent 的 elite/standard 模型），
+  //    摘要成本高且与路由策略冲突。getModelForPurpose 无配置时返回 null，
+  //    回退 opts.modelId（调用方语义不变）。
+  const mid = useLLMStore.getState().getModelForPurpose('summarize') ?? opts.modelId
+
+  const startTime = Date.now()
+  const response = await useLLMStore.getState().generate(
+    [{ role: 'user', content: prompt }],
+    mid,
+    { temperature: 0.2, priority: 12 },
+  )
+  const duration = Date.now() - startTime
+  const model = useLLMStore.getState().models.find(m => m.id === mid)
+  const usage = response.usage
+
+  if (!response.success) {
+    // 失败落库 success:0（对照 agent-store.ts 失败分支惯例）
+    try {
+      await ipc.invoke('db:log-llm-call', {
+        model_id: mid,
+        model_name: model?.name ?? model?.modelName ?? '',
+        purpose: 'ccr_summary',
+        prompt_tokens: 0, completion_tokens: 0, total_tokens: 0,
+        duration_ms: duration, success: 0,
+        error_message: response.error ?? 'ccr summary failed',
+      })
+    } catch { /* 日志失败不影响主流程 */ }
+    throw new Error(response.error ?? 'ccr summary failed')
+  }
+
+  // 落库 purpose 'ccr_summary'（区别于 agent 面板调用，P2 缓存命中/成本统计可区分）
+  try {
+    const cost = usage && model
+      ? calculateCost(model, usage.promptTokens, usage.completionTokens, (usage.cachedTokens ?? 0) > 0).totalCost
+      : 0
+    await ipc.invoke('db:log-llm-call', {
+      model_id: mid,
+      model_name: model?.name ?? model?.modelName ?? '',
+      purpose: 'ccr_summary',
+      prompt_tokens: usage?.promptTokens ?? 0,
+      completion_tokens: usage?.completionTokens ?? 0,
+      total_tokens: usage?.totalTokens ?? 0,
+      cached_tokens: usage?.cachedTokens ?? 0,
+      duration_ms: duration,
+      success: 1,
+      error_message: '',
+      cost,
+    })
+  } catch {
+    // 日志失败不影响压缩主流程
+  }
+
+  // P3 SharedContext：摘要成功 → 提取「[可复用事实]」段 → 合并写项目级 shared.md（跨会话复用）。
+  // 无锚点/无事实/读写失败均不阻断压缩主流程（upsertSharedFacts 内部 catch 返回 false）。
+  await upsertSharedFacts(parseSharedFacts(response.content))
+
+  return response.content
+}

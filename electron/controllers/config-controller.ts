@@ -1,0 +1,177 @@
+import { BrowserWindow, shell } from 'electron'
+import fs from 'node:fs'
+import path from 'node:path'
+import { readJsonFile, writeJsonFile, GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG, VELA_HOME } from '../utils/config-utils'
+import { logger, LogLevel, LogEnvironment, LOG_DIRS, getLogPathFor } from '../utils/logger'
+import { safeErrorMessage } from '../utils/error-utils'
+import { t, setCurrentLocale, type SupportedLocale } from '../../src/shared/locale'
+import { GlobalConfig, type LogEnvMode, type LogFileInfo } from '../../src/shared/ipc-channels'
+import { guardedHandle } from '../security/ipc-guard'
+import { refreshOutboundProxy } from '../net/proxy-fetch'
+
+/** 窗口控件覆盖层高度（px）—— 与 main.ts 建窗时的取值必须一致，否则按钮条与内容错位 */
+export const TITLEBAR_OVERLAY_HEIGHT = 32
+
+/** 渲染进程日志等级字符串 → 主进程 LogLevel 映射 */
+const RENDER_LOG_LEVELS: Record<'debug' | 'info' | 'warn' | 'error', LogLevel> = {
+  debug: LogLevel.DEBUG,
+  info: LogLevel.INFO,
+  warn: LogLevel.WARN,
+  error: LogLevel.ERROR,
+}
+
+/** IPC 环境参数 → 主进程日志环境（缺省用当前环境） */
+function envFromMode(mode: LogEnvMode | undefined): LogEnvironment {
+  return mode === 'dev' ? LogEnvironment.Dev : LogEnvironment.Release
+}
+
+/** 读取日志目录下的 vela-*.log 文件列表（新→旧） */
+function listLogFilesIn(dir: string, env: LogEnvMode): LogFileInfo[] {
+  try {
+    return fs.readdirSync(dir)
+      .filter(f => f.startsWith('vela-') && f.endsWith('.log'))
+      .map(name => {
+        try {
+          const stat = fs.statSync(path.join(dir, name))
+          return { env, name, size: stat.size, mtime: stat.mtimeMs }
+        } catch {
+          return { env, name, size: 0, mtime: 0 }
+        }
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+  } catch {
+    return []
+  }
+}
+
+export function registerConfigController() {
+  /** 读取全局配置 */
+  guardedHandle('config:get', async () => {
+    return readJsonFile<GlobalConfig>(GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG)
+  })
+
+  /** 保存全局配置 */
+  guardedHandle('config:set', async (_event, config: Partial<GlobalConfig>) => {
+    try {
+      const existing = readJsonFile<GlobalConfig>(GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG)
+      const updated = { ...existing, ...config }
+      writeJsonFile(GLOBAL_CONFIG_PATH, updated)
+      // 代理配置经此通道写入 → 立即同步出站链路，用户改完设置**下一次请求**即生效
+      // （否则要等下一次 LLM 调用触发 applyProxyConfig，Embedding 路径会有一段用旧代理）
+      refreshOutboundProxy()
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: safeErrorMessage(error) }
+    }
+  })
+
+  /** 获取 ~/.novelforge 路径 */
+  guardedHandle('config:get-vela-home', async () => {
+    return VELA_HOME
+  })
+
+  /** 同步 UI 语言到主进程（主进程对话框/菜单用 t() 读取当前 locale） */
+  guardedHandle('config:set-locale', async (_event, locale: SupportedLocale) => {
+    setCurrentLocale(locale)
+    // ⚠️ 这里**不再**设窗口标题。原先是 `win.setTitle(t('window.title'))` 做「兜底」，
+    // 但渲染层的标题现在是「项目名 — NovelForge」，主进程只写应用名 → 每次切语言
+    // 都把项目名冲掉（且谁后写谁赢）。标题的唯一写入口在渲染层：
+    // src/lib/window-title.ts，document.title 变化由 Electron 自动同步到原生标题。
+    return { success: true }
+  })
+
+  /**
+   * 窗口控件覆盖层（标题栏那条）跟随主题。
+   *
+   * ⚠️ 背景：`titleBarStyle: 'hiddenInset'` 在 Windows 上等价于 `hidden` → 系统会画一条
+   * **窗口控件覆盖层**，其配色默认是白色/系统色，**不跟应用主题**。用户实测「最上面那一条
+   * 主题切换时没变」即此。修法是主题一变就调 `setTitleBarOverlay`。
+   *
+   * ⚠️ 颜色由渲染层算好推来（`getComputedStyle` 的已解析值），主进程**不复制调色板** ——
+   * 否则主题令牌有两份定义，必然漂移（本项目吃过「四主题里某令牌没定义」的亏）。
+   */
+  guardedHandle('window:set-titlebar-overlay', async (event, overlay: { color: string; symbolColor: string }) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win || win.isDestroyed()) return
+    try {
+      win.setTitleBarOverlay({
+        color: overlay.color,
+        symbolColor: overlay.symbolColor,
+        height: TITLEBAR_OVERLAY_HEIGHT,
+      })
+    } catch (error) {
+      // 非 Windows / 未启用覆盖层时该 API 会抛 —— 属预期，降级为一条 warn 即可
+      logger.warn('Config', `[set-titlebar-overlay] skipped: ${safeErrorMessage(error)}`)
+    }
+  })
+
+  // ===== 日志管理（双环境：dev=开发/内测，release=公测/正式） =====
+
+  /** 获取指定环境今天的日志文件内容（默认当前环境） */
+  guardedHandle('log:get-today', async (_event, env?: LogEnvMode, maxLines?: number) => {
+    try {
+      const logPath = getLogPathFor(envFromMode(env))
+      if (!fs.existsSync(logPath)) return ''
+      // 文件一律 UTF-8 编码（logger 写入端保证），读取端统一 utf-8
+      const content = fs.readFileSync(logPath, 'utf-8')
+      if (!maxLines) return content
+      const lines = content.split('\n')
+      return lines.slice(-maxLines).join('\n')
+    } catch (error) {
+      return `读取日志失败: ${error}`
+    }
+  })
+
+  /** 获取两个环境的日志文件列表（新→旧，带环境标记/大小/时间） */
+  guardedHandle('log:list-files', async () => {
+    return [
+      { env: 'release' as const, files: listLogFilesIn(LOG_DIRS[LogEnvironment.Release], 'release') },
+      { env: 'dev' as const, files: listLogFilesIn(LOG_DIRS[LogEnvironment.Dev], 'dev') },
+    ]
+  })
+
+  /** 读取指定环境的日志文件（maxLines 截断为尾部 N 行，防大文件卡 UI） */
+  guardedHandle('log:read-file', async (_event, env: LogEnvMode, fileName: string, maxLines?: number) => {
+    try {
+      // 安全检查：文件名必须合法（basename 防路径遍历）+ 前缀/后缀校验
+      const safeName = path.basename(fileName)
+      if (!safeName.startsWith('vela-') || !safeName.endsWith('.log')) {
+        return { success: false, error: t('error.invalidLogFileName') }
+      }
+      const filePath = path.join(LOG_DIRS[envFromMode(env)], safeName)
+      if (!fs.existsSync(filePath)) {
+        return { success: false, error: t('error.logFileNotFound') }
+      }
+      const lines = fs.readFileSync(filePath, 'utf-8').split('\n')
+      const shown = maxLines && lines.length > maxLines ? lines.slice(-maxLines) : lines
+      return { success: true, content: shown.join('\n'), totalLines: lines.length }
+    } catch (error) {
+      return { success: false, error: safeErrorMessage(error) }
+    }
+  })
+
+  /** 在系统文件管理器中打开日志目录（用户反馈问题时可快速定位日志文件） */
+  guardedHandle('log:open-dir', async () => {
+    try {
+      const dir = logger.getLogDir()
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      const err = await shell.openPath(dir)
+      if (err) return { success: false, error: err }
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: safeErrorMessage(error) }
+    }
+  })
+
+  /** 记录前端日志（渲染进程通过 IPC 写入；level 为字符串，主进程映射到 LogLevel） */
+  guardedHandle('log:write', async (_event, level: 'debug' | 'info' | 'warn' | 'error', source: string, message: string) => {
+    const logLevel = RENDER_LOG_LEVELS[level] ?? LogLevel.INFO
+    switch (logLevel) {
+      case LogLevel.DEBUG: logger.debug(source, message); break
+      case LogLevel.INFO: logger.info(source, message); break
+      case LogLevel.WARN: logger.warn(source, message); break
+      case LogLevel.ERROR: logger.error(source, message); break
+    }
+    return { success: true }
+  })
+}
