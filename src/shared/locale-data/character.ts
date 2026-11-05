@@ -79,7 +79,7 @@ export const characterTexts = {
   'character.aliases': { 'zh-CN': '别名（昵称/称号）', 'en-US': 'Aliases (nicknames)', 'ru-RU': 'Псевдонимы (прозвища)' },
   'character.aliasesHint': { 'zh-CN': '逗号分隔；写稿/定稿/档案提取时匹配这些称呼', 'en-US': 'Comma-separated; matched during drafting, finalization and archive extraction', 'ru-RU': 'Через запятую; учитываются при написании, финализации и извлечении досье' },
   'character.tagsLimit': { 'zh-CN': '标签最多 8 个，超出部分已忽略', 'en-US': 'Up to 8 tags — extras were ignored', 'ru-RU': 'Максимум 8 тегов — лишние проигнорированы' },
-  'character.tier3Hint': { 'zh-CN': '龙套角色仅录入基本信息，其余字段在出场时由 AI 按需扩展。', 'en-US': 'Minor roles only need basic info. AI will expand as needed when they appear.', 'ru-RU': 'Для второстепенных персонажей заполняйте только основное.' },
+  'character.tier3Hint': { 'zh-CN': '等级独立于主角/反派身份：主要角色有长期主线与人物线；关键配角影响阶段事件或支线；次要角色承担局部作用，可先建简卡。', 'en-US': 'Minor roles only need basic info. AI will expand as needed when they appear.', 'ru-RU': 'Для второстепенных персонажей заполняйте только основное.' },
   'character.status': { 'zh-CN': '状态', 'en-US': 'Status', 'ru-RU': 'Статус' },
   'character.statusActive': { 'zh-CN': '活跃', 'en-US': 'Active', 'ru-RU': 'Активен' },
   'character.statusDeparted': { 'zh-CN': '退场', 'en-US': 'Departed', 'ru-RU': 'Ушёл' },
@@ -173,9 +173,9 @@ export const characterTexts = {
   'character.roleLabel.supporting': { 'zh-CN': '👥 配角', 'en-US': '👥 Supporting', 'ru-RU': '👥 Второстепенный' },
   'character.roleLabel.minor': { 'zh-CN': '📌 龙套', 'en-US': '📌 Minor', 'ru-RU': '📌 Эпизодический' },
   // --- 戏份等级（带星标） ---
-  'character.tierLabel.core': { 'zh-CN': '★★★ 核心', 'en-US': '★★★ Core', 'ru-RU': '★★★ Ключевой' },
-  'character.tierLabel.important': { 'zh-CN': '★★☆ 重要', 'en-US': '★★☆ Important', 'ru-RU': '★★☆ Важный' },
-  'character.tierLabel.minor': { 'zh-CN': '★☆☆ 龙套', 'en-US': '★☆☆ Minor', 'ru-RU': '★☆☆ Эпизодический' },
+  'character.tierLabel.core': { 'zh-CN': '主要角色', 'en-US': 'Main character', 'ru-RU': 'Главный персонаж' },
+  'character.tierLabel.important': { 'zh-CN': '关键配角', 'en-US': 'Key supporting character', 'ru-RU': 'Ключевой второстепенный' },
+  'character.tierLabel.minor': { 'zh-CN': '次要角色', 'en-US': 'Minor character', 'ru-RU': 'Эпизодический персонаж' },
   // --- CharacterBacklinks ---
   'character.backlinks.chapters': { 'zh-CN': '出场章节', 'en-US': 'Appearance Chapters', 'ru-RU': 'Главы появления' },
   'character.backlinks.noChapters': { 'zh-CN': '暂无出场记录', 'en-US': 'No appearance records', 'ru-RU': 'Нет записей о появлении' },
@@ -201,9 +201,9 @@ export const characterTexts = {
   'charList.storyArch': { 'zh-CN': '故事架构', 'en-US': 'Story Architecture', 'ru-RU': 'Архитектура' },
   // --- RelationshipGraph ---
   'graph.filterAll': { 'zh-CN': '全部', 'en-US': 'All', 'ru-RU': 'Все' },
-  'graph.tierCore': { 'zh-CN': '核心', 'en-US': 'Core', 'ru-RU': 'Ключевые' },
-  'graph.tierImportant': { 'zh-CN': '重要', 'en-US': 'Important', 'ru-RU': 'Важные' },
-  'graph.tierMinor': { 'zh-CN': '龙套', 'en-US': 'Minor', 'ru-RU': 'Эпизодические' },
+  'graph.tierCore': { 'zh-CN': '主要角色', 'en-US': 'Main characters', 'ru-RU': 'Главные персонажи' },
+  'graph.tierImportant': { 'zh-CN': '关键配角', 'en-US': 'Key supporting', 'ru-RU': 'Ключевые второстепенные' },
+  'graph.tierMinor': { 'zh-CN': '次要角色', 'en-US': 'Minor characters', 'ru-RU': 'Эпизодические' },
   // --- CharactersView ---
   'charList.title': { 'zh-CN': '角色列表', 'en-US': 'Characters', 'ru-RU': 'Персонажи' },
   'charList.refresh': { 'zh-CN': '刷新列表', 'en-US': 'Refresh List', 'ru-RU': 'Обновить' },

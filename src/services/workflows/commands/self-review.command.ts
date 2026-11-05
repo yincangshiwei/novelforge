@@ -40,6 +40,8 @@ export class SelfReviewCommand extends BaseWorkflowCommand<void> {
       return
     }
 
+    const { readWritingConstraints } = await import('../../writing-constraints')
+    const constraints = await readWritingConstraints({ chapterNumber: this.params.chapterNumber, text: full.content })
     let current = full.content
     let rewrote = false
     let rounds = 0
@@ -66,7 +68,7 @@ export class SelfReviewCommand extends BaseWorkflowCommand<void> {
         ? current
         : current.slice(0, 1500) + '\n\n[中段略]...\n\n' + current.slice(-3000)
       const reviewerPrompt =
-        t('prompt.selfReview.reviewerTitle') + '\n' + issueText + '\n\n' +
+        constraints + '\n\n' + t('prompt.selfReview.reviewerTitle') + '\n' + issueText + '\n\n' +
         t('prompt.selfReview.draftPreviewTitle') + '\n' + draftPreview + '\n\n' +
         t('prompt.selfReview.reviewerTask')
       // ⚠️ M 级修复：审稿人路由到独立审稿模型（purpose 分派——同模型自审对判断类纠错效果有限）
@@ -80,7 +82,7 @@ export class SelfReviewCommand extends BaseWorkflowCommand<void> {
 
       // ===== 2. 主 AI 根据清单重写 =====
       const rewritePrompt =
-        t('prompt.selfReview.suggestionTitle') + '\n' + suggestions + '\n\n' +
+        constraints + '\n\n' + t('prompt.selfReview.suggestionTitle') + '\n' + suggestions + '\n\n' +
         t('prompt.selfReview.fullDraftTitle') + '\n' + current + '\n\n' +
         t('prompt.selfReview.rewriteTask')
       const rewritten = await this.callLLM(rewritePrompt, getRewriterSystem(), callbacks)

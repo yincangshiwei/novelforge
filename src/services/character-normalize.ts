@@ -46,6 +46,12 @@ export function normalizeCharacterRole(value: string): string {
   return VALID_CHARACTER_ROLES.has(s) ? s : 'supporting'
 }
 
+export function normalizeCharacterTier(value: unknown, role: unknown): 1 | 2 | 3 {
+  const tier = Number(value)
+  if (tier === 1 || tier === 2 || tier === 3) return tier
+  return role === 'protagonist' ? 1 : role === 'minor' ? 3 : 2
+}
+
 /**
  * 归一化 LLM 输出的 tags 为 JSON 数组字符串（角色列表按 JSON.parse 消费）。
  * 入参可为字符串（逗号/顿号分隔）或数组（元素逐个归一化，含分隔符的元素

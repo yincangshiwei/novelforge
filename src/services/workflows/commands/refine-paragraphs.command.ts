@@ -79,7 +79,10 @@ export class RefineParagraphsCommand extends BaseWorkflowCommand<RefineParagraph
       t('prompt.refine.rule4'),
     ].filter(Boolean).join('\n')
 
+    const { readWritingConstraints } = await import('../../writing-constraints')
+    const constraints = await readWritingConstraints({ text: selectedText + contextBefore + contextAfter })
     const userPrompt = [
+      constraints,
       t('prompt.refine.userIntro'),
       '',
       `[CONTEXT_BEFORE]${contextBefore}`,

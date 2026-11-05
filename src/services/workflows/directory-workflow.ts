@@ -408,6 +408,12 @@ export function createDirectoryWorkflow(params: DirectoryWorkflowParams = { mode
           }
 
           await saveAllBlueprints(merged)
+          try {
+            const { extractPlannedCharacters } = await import('./planned-character-extract')
+            await extractPlannedCharacters(newBlueprints, project.id, callbacks, context)
+          } catch (error) {
+            callbacks.log(`章节蓝图已保存，规划角色建档未完成：${String(error)}`)
+          }
           useProjectStore.getState().refreshFileTree()
           return t('workflow.dirSaved')
         },

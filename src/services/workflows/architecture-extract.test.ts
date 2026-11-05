@@ -66,6 +66,13 @@ describe('extractCharactersFromText 降级路径（无大括号结构 → extrac
 })
 
 describe('assembleCharacterCards（P0-1：初始角色卡组装）', () => {
+  it('透传独立等级和别名，非法等级不透传', () => {
+    const cards = assembleCharacterCards([{ name: '对手', role: 'antagonist', tier: '3', aliases: ['城主'] }, { name: '其他', tier: 9 }], stringifyField)
+    expect(cards[0].tier).toBe(3)
+    expect(cards[0].aliases).toEqual(['城主'])
+    expect(cards[1].tier).toBeUndefined()
+  })
+
   it('currentState 对象透传（不再丢失）', () => {
     const cards = assembleCharacterCards(
       [{ name: '张三', role: 'protagonist', currentState: { location: '青云宗', updatedAtChapter: 0 } }],

@@ -153,6 +153,14 @@ export function registerDatabaseController() {
     }
   })
 
+  guardedHandle('db:character-create-missing', async (_event, items: CharacterData[]) => {
+    try {
+      return { success: true, created: CharacterRepository.createMissing(items) }
+    } catch (err) {
+      return { success: false, created: 0, error: String(err) }
+    }
+  })
+
   guardedHandle('db:character-save-all', async (_event, items: CharacterData[]) => {
     try {
       CharacterRepository.saveAll(items)

@@ -34,6 +34,14 @@ beforeAll(async () => {
 })
 
 describe('buildAgentSystemPrompt 输出语言约束', () => {
+  it('明确教会 Agent 分级、数据库写入工具与全局要求入口', () => {
+    const prompt = buildAgentSystemPrompt('quick')
+    expect(prompt).toContain('manage_character')
+    expect(prompt).toContain('关键配角')
+    expect(prompt).toContain('globalGuidance')
+    expect(prompt).toContain('聊天输出人物介绍不代表已入库')
+  })
+
   it('末尾包含明确输出语言指令', () => {
     const prompt = buildAgentSystemPrompt('quick')
     expect(prompt).toContain('[System] 请始终使用')

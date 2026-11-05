@@ -237,6 +237,21 @@ export class CharacterRepository {
         )
     }
 
+    static createMissing(characters: CharacterData[]): number {
+        const db = getProjectDb()
+        if (!db) throw new Error('Project database is not open')
+        let created = 0
+        db.transaction(() => {
+            const exists = db.prepare('SELECT name FROM characters WHERE name = ?')
+            for (const card of characters) {
+                if (!card.name.trim() || exists.get(card.name)) continue
+                CharacterRepository.upsert(card)
+                created++
+            }
+        })()
+        return created
+    }
+
     /** 批量保存角色（事务） */
     static saveAll(characters: CharacterData[]): void {
         const db = getProjectDb()

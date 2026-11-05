@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { ipc } from '../services/ipc-client'
+import { normalizeCharacterTier } from '../services/character-normalize'
 import { t } from '../shared/locale'
 import { renderLog } from '../services/render-logger'
 import { toast } from '../components/ui/Toast'
@@ -20,18 +21,11 @@ export const EMPTY_STATE: CharacterCurrentState = {
   keyItems: '', recentEvents: '', updatedAtChapter: 0,
 }
 
-/** 按 tier 分组角色，主角/反派强制归入 tier 1
- * ⚠️ 不 mutation 传入对象（P1 修复）：此前 `c.tier = 1` 直接改写 zustand store 中的对象
- *（无 set 通知、严格模式双执行、不落库）——侧栏显示 1、图谱显示 DB 值 2、编辑器 Select 又 1，
- * 三处不一致且取决于组件挂载顺序。tier 非法值（<1 或 >3）归一化到 1-3。 */
+/** 按独立戏份等级分组，不修改传入角色。 */
 export function groupByTier(chars: CharacterCard[]): Record<number, CharacterCard[]> {
   const groups: Record<number, CharacterCard[]> = { 1: [], 2: [], 3: [] }
   for (const c of chars) {
-    // 主角和反派始终 tier=1（副本上修正，不写回原对象）
-    const effectiveTier = (c.role === 'protagonist' || c.role === 'antagonist')
-      ? 1
-      : (c.tier >= 1 && c.tier <= 3 ? c.tier : 2)
-    const t = effectiveTier
+    const t = normalizeCharacterTier(c.tier, c.role)
     if (!groups[t]) groups[t] = []
     groups[t].push(c)
   }

@@ -769,6 +769,7 @@ export interface DatabaseChannels {
   // 3. characters
   'db:character-get-all': { args: []; return: CharacterData[] }
   'db:character-upsert': { args: [data: CharacterData]; return: { success: boolean; error?: string } }
+  'db:character-create-missing': { args: [items: CharacterData[]]; return: { success: boolean; created: number; error?: string } }
   'db:character-save-all': { args: [items: CharacterData[]]; return: { success: boolean; error?: string } }
   'db:character-delete': { args: [name: string]; return: { success: boolean; error?: string } }
   'db:character-merge': { args: [target: string, source: string]; return: { success: boolean; error?: string } }

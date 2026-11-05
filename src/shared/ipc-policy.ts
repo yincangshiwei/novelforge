@@ -109,6 +109,7 @@ export const IPC_CHANNEL_POLICY: Record<InvokeChannel, ChannelPolicy> = {
   'db:character-get-all': { authority: 'read-project' },
   'db:character-merge': { authority: 'write-project' },
   'db:character-merge-fields': { authority: 'write-project' },
+  'db:character-create-missing': { authority: 'write-project' },
   'db:character-save-all': { authority: 'write-project' },
   'db:character-update-appearance-stats': { authority: 'read-project' },
   'db:character-update-state': { authority: 'write-project' },

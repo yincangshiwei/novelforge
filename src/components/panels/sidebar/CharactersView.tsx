@@ -19,7 +19,7 @@ import { useTranslation } from '../../../hooks/useTranslation'
 import { useWorkflowCompletion } from '../../../hooks/useWorkflowCompletion'
 import { openBuiltinEditor } from './SidebarShared'
 import { runCharacterArchive } from '../../../services/workflows/character-archive-workflow'
-import { parseAliases } from '../../../services/character-normalize'
+import { parseAliases, normalizeCharacterTier } from '../../../services/character-normalize'
 import { renderLog } from '../../../services/render-logger'
 
 // 角色定位 / 戏份等级 i18n 映射（不使用 store 硬编码常量，语言切换即时更新）
@@ -272,7 +272,7 @@ function CharItem({ char: c, selected, onClick }: {
         .replace('{end}', String(chaps[chaps.length - 1]))
         .replace('{n}', String(chaps.length))
 
-  const tier = c.tier ?? (c.role === 'protagonist' || c.role === 'antagonist' ? 1 : 2)
+  const tier = normalizeCharacterTier(c.tier, c.role)
 
   /* 2026-09-28 批 0：行容器改「行片」（`.menu-chip`）——圆角/左右外边距/悬停底色/2px 片间距
      全部由片承担，原 `rounded-md`/`hover:bg-*`/`mb-0.5`/`transition-colors` 随之删除。

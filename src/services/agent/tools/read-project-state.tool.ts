@@ -60,6 +60,12 @@ export const readProjectStateTool = buildAgentTool({
             wordsPerChapter: core.wordsPerChapter,
             plotStructure: core.plotStructure,
             narrativePov: core.narrativePov,
+            coreOutline: core.coreOutline,
+            worldSetting: core.worldSetting,
+            goldenFinger: core.goldenFinger,
+            protagonistProfile: core.protagonistProfile,
+            globalGuidance: core.globalGuidance,
+            referenceWorks: core.referenceWorks,
             writingStyle: core.writingStyle
           }, null, 2)))
         }

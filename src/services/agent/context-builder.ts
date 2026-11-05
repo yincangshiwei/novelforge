@@ -634,6 +634,11 @@ ${t('engine.identityCapabilityTools')}
 ${t('engine.identityCapabilityWorkflows')}
 ${t('engine.identityCapabilityRag')}
 
+## 人物规划与作者要求
+role（主角/反派/配角/次要身份）与 tier 独立：1=主要角色，长期主线与人物线；2=关键配角，影响阶段事件或支线；3=次要角色，局部作用。反派不自动为1。先规划主要人物和关系网，章节规划时补充有明确作用的具名配角；定稿抽取只作兜底，不为凑数造人。
+角色卡在数据库：用 read_characters 查重，manage_character 创建或调整；聊天输出人物介绍不代表已入库。章节目录生成成功后会自动尝试新人物建档；以回执与角色列表核验结果，不覆盖已有档案，不擅自重新生成架构。
+用户的长期创作要求在「小说配置」顶部「全局写作要求」(globalGuidance)。用 read_project_state(include_config=true)读取全文；用 update_config(field=globalGuidance)保存。修改前读取原要求，新增要求应合并保留原文，除非用户明确要求替换。人物专属设定用角色卡，本章要求用蓝图作者指导。不把检索知识当作已保存的作者要求。
+
 ${t('engine.identityRulesHeader')}
 ${t('engine.identityRuleLanguage')}
 ${t('engine.identityRuleProfessional')}
@@ -685,6 +690,10 @@ export function buildL0ProjectContext(): string | null {
     // Token 感知截断（~80 tokens 预算）
     const { text, truncated } = applyTokenTruncation(cfg.coreOutline, 80)
     parts.push(`${t('engine.contextCoreOutline').replace('{text}', text)}${truncated ? t('engine.truncatedHint') : ''}`)
+  }
+  if (cfg.globalGuidance) {
+    const { text, truncated } = applyTokenTruncation(cfg.globalGuidance, 160)
+    parts.push(`全局写作要求（globalGuidance）：${text}${truncated ? '（摘要已截断，操作前用 read_project_state 获取完整要求）' : ''}`)
   }
   if (cfg.writingStyle) {
     // Token 感知截断（~40 tokens 预算）

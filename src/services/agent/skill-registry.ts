@@ -74,6 +74,11 @@ class SkillRegistryImpl {
 
   /** 注册一个 Skill */
   register(skill: LoadedSkill): void {
+    const related = new Set(['character-analysis', 'character-arc-designer', 'novel-outline', 'chapter-architect'])
+    const marker = '## NovelForge 人物规划接口'
+    if (related.has(skill.metadata.name) && !skill.content.includes(marker)) {
+      skill = { ...skill, content: `${skill.content}\n\n${marker}\nrole 是身份，与 tier 独立：1主要角色（长期主线/人物线），2关键配角（阶段事件/支线关键作用），3次要角色（局部作用）。反派不自动为1。用 read_characters 查重，用 manage_character 创建或更新数据库角色卡；分析任务默认只读，只有用户要求保存时才写入。全书规划准备主要人物，章节规划按需补充配角；目录工作流保存后自动尝试新人物建档，用回执和角色列表核验。聊天中设计人物不代表保存，不能用 write_file 替代角色卡入库。先 read_project_state(include_config=true) 获取 globalGuidance，遵循作者要求；长期要求通过 update_config 保存。` }
+    }
     this.skills.set(skill.metadata.name, skill)
   }
 

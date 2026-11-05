@@ -70,6 +70,9 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
       .withWritingStyle(writingStyleValue)
       .withNovelConfig(project.novelConfig)
       .withWordNumber(project.novelConfig.wordsPerChapter)
+      .withChapterInfo(this.chapterInfo)
+      .withFutureBlueprints('')
+      .withUserGuidance(this.chapterInfo.userGuidance?.trim() || t('inject.noUserGuidance'))
 
     // 流派特化注入（追加在 writing_style 既有值+输出风格之后——与旧语义「文风 + 流派」一致）
     const genreOverride = (await import('../../genre-overrides')).getGenreOverride(
@@ -160,7 +163,8 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
 
     // ===== 防缺陷注入（伏笔 / 角色声音 / 设定多样性）=====
     let prompt = promptBuilder.build()
-    const antiDefectSections: string[] = []
+    const { readWritingConstraints } = await import('../../writing-constraints')
+    const antiDefectSections: string[] = [await readWritingConstraints({ characterNames: this.chapterInfo.characters, includeGlobal: false })]
 
     // 1. 未回收伏笔（≤5 条，埋设于本章之前）——防止伏笔断裂/提前回收
     try {

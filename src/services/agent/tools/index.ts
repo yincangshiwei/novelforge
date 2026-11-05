@@ -22,6 +22,7 @@ import { editFileTool } from './edit-file.tool'
 import { openEditorTool } from './open-editor.tool'
 import { startWorkflowTool } from './start-workflow.tool'
 import { updateConfigTool } from './update-config.tool'
+import { manageCharacterTool } from './manage-character.tool'
 import { embedTextTool } from './embed-text.tool'
 import { compareTextsTool } from './compare-texts.tool'
 import { indexContentTool } from './index-content.tool'
@@ -75,6 +76,7 @@ export const builtinTools = [
   openEditorTool,
   startWorkflowTool,
   updateConfigTool,
+  manageCharacterTool,
   indexContentTool, // 写入知识库，需确认
   callExternalApiTool, // 开发者模式外部 API（需确认）
 ]

@@ -40,7 +40,9 @@ export class RefineFromReviewCommand extends BaseWorkflowCommand<string> {
       .withGlobalGuidance(project.novelConfig.globalGuidance || '')
       .withUserRefinePrompt(userPromptBlock)
 
-    const refined = await this.callLLMWithBuilder(promptBuilder, callbacks, { purpose: 'refine_chapter' })
+    const { readWritingConstraints } = await import('../../writing-constraints')
+    const constraints = await readWritingConstraints({ chapterNumber: this.params.chapterNumber, text: this.params.draftContent, includeGlobal: false })
+    const refined = await this.callLLM(promptBuilder.build() + '\n\n' + constraints, promptBuilder.getSystemRole(), callbacks, { purpose: 'refine_chapter' })
     const cleanRefined = this.stripThinkingTags(refined)
 
     const { parseDraftMeta } = await import('../chapter-workflow')

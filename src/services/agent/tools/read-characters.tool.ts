@@ -4,6 +4,7 @@
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
 import { ipc } from '../../ipc-client'
+import { normalizeCharacterTier, matchCharacterName } from '../../character-normalize'
 import { useProjectStore } from '../../../stores/project-store'
 
 
@@ -40,7 +41,7 @@ export const readCharactersTool = buildAgentTool({
         // 查找指定角色——精确匹配优先（P1 修复：此前子串 includes 取第一个命中，
         // 查询「林」可能命中「林峰」而非主角「林晓」，返回卡片与意图不符且无提示）
         const query = charName.trim()
-        const exact = chars.find((c) => String(c.name) === query)
+        const exact = matchCharacterName(chars as Array<{ name: unknown }>, query)
         const target = exact ?? chars.find((c) =>
           String(c.name).toLowerCase().includes(query.toLowerCase())
         )
@@ -56,26 +57,12 @@ export const readCharactersTool = buildAgentTool({
         return { success: true, content: t('tool.readCharsCard').replace('{name}', String(target.name)).replace('{formatted}', formatted) }
       }
 
-      // P1-4：列表压缩——主要角色（主角/反派）全量，配角/龙套只给前 10 个 + 总数；
-      // status 标注（退场/死亡）
-      const statusTag = (c: { status?: string }): string =>
-        c.status === 'dead' ? t('tool.readCharsDead')
-          : c.status === 'departed' ? t('tool.readCharsDeparted')
-          : ''
-      const core = chars.filter(c => String(c.role) === 'protagonist' || String(c.role) === 'antagonist')
-      const others = chars.filter(c => String(c.role) !== 'protagonist' && String(c.role) !== 'antagonist')
-      const fmt = (c: Record<string, unknown>): string => `  - ${statusTag(c)}${String(c.name)} (${String(c.role)})`
-      const coreList = core.map(fmt).join('\n')
-      const OTHERS_CAP = 10
-      const shownOthers = others.slice(0, OTHERS_CAP).map(fmt).join('\n')
-      const hiddenOthers = others.length - shownOthers.split('\n').filter(Boolean).length
-      const sections: string[] = []
-      if (coreList) sections.push(t('tool.readCharsCore').replace('{list}', coreList))
-      if (shownOthers) {
-        const suffix = hiddenOthers > 0 ? t('tool.readCharsMore').replace('{n}', String(hiddenOthers)) : ''
-        sections.push(t('tool.readCharsOthers').replace('{n}', String(others.length)).replace('{list}', shownOthers + suffix))
-      }
-      const list = sections.join('\n')
+      const labels = [t('graph.tierCore'), t('graph.tierImportant'), t('graph.tierMinor')]
+      const list = [1, 2, 3].map(tier => {
+        const group = chars.filter(c => normalizeCharacterTier(c.tier, c.role) === tier)
+        const rows = group.map(c => `- ${String(c.name)} (role=${String(c.role)}, tier=${tier}, status=${String(c.status || 'active')})`)
+        return `${labels[tier - 1]}：${group.length}\n${rows.join('\n')}`
+      }).join('\n\n')
       return { success: true, content: t('tool.readCharsList').replace('{count}', String(chars.length)).replace('{list}', list) }
     } catch (error) {
       return { success: false, content: '', error: t('tool.readCharsFailed').replace('{error}', String(error)) }

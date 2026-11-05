@@ -364,7 +364,7 @@ export const settingsTexts = {
   'novelConfig.protagonistDesc': { 'zh-CN': '性格特征、背景故事、成长目标', 'en-US': 'Personality, background, growth goals', 'ru-RU': 'Характер, история, цели роста' },
   'novelConfig.protagonistPlaceholder': { 'zh-CN': '主角的性格特征、背景故事、成长目标...', 'en-US': 'Personality, background, growth goals...', 'ru-RU': 'Характер, история, цели...' },
   'novelConfig.globalWriting': { 'zh-CN': '全局写作要求', 'en-US': 'Global writing requirements', 'ru-RU': 'Общие требования' },
-  'novelConfig.globalWritingDesc': { 'zh-CN': '写作风格、禁忌事项、特殊要求等贯穿全文的指令', 'en-US': 'Style, taboos, special requirements across the whole novel', 'ru-RU': 'Стиль, запреты, особые требования' },
+  'novelConfig.globalWritingDesc': { 'zh-CN': '填写贯穿全书的用户设定与要求：人物表现、服饰与气质、剧情偏好和禁忌。保存后供 Agent、架构、章节规划、写稿和修稿读取；人物专属细节请写角色卡。', 'en-US': 'Style, taboos, special requirements across the whole novel', 'ru-RU': 'Стиль, запреты, особые требования' },
   'novelConfig.globalWritingPlaceholder': { 'zh-CN': '全局的写作风格要求、禁忌、特殊指令...', 'en-US': 'Global style requirements, taboos, special instructions...', 'ru-RU': 'Общие требования к стилю, запреты...' },
   'novelConfig.styleConfig': { 'zh-CN': '文风配置', 'en-US': 'Style configuration', 'ru-RU': 'Настройка стиля' },
   'novelConfig.styleConfigDesc': { 'zh-CN': 'AI 写稿/修稿时会严格遵循以下文风要求', 'en-US': 'AI will strictly follow style requirements below', 'ru-RU': 'ИИ будет следовать этим требованиям' },

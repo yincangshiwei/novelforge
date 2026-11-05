@@ -424,6 +424,8 @@ export function assembleCharacterCards(
     if (!card.name) continue
     const cleaned: Record<string, unknown> = { name: stripNameAlias(String(card.name)) }
     if (card.role !== undefined && String(card.role).trim() !== '') cleaned.role = String(card.role)
+    if ([1, 2, 3].includes(Number(card.tier))) cleaned.tier = Number(card.tier)
+    if (card.aliases !== undefined) cleaned.aliases = card.aliases
     for (const key of ['gender', 'age', 'appearance', 'personality', 'background', 'abilities', 'motivation', 'relationships', 'arc', 'notes']) {
       if (card[key] !== undefined) cleaned[key] = stringifyField(card[key])
     }

@@ -62,7 +62,7 @@ export default function NovelConfigEditor() {
     const t0 = Date.now()
     setSaving(true)
     try {
-      await saveProject()
+      if (!await saveProject()) throw new Error(t('save.failed').replace('{error}', '配置未保存'))
       // 保存行为日志流：成功 info + toast 视觉反馈
       renderLog('info', 'Save:Config', t('log.render.configSaveSuccess').replace('{ms}', String(Date.now() - t0)))
       toast.success(t('save.success'))
@@ -130,6 +130,21 @@ export default function NovelConfigEditor() {
 
         {/* 配置表单 */}
         <div className="space-y-5">
+          <Section
+            title={t('novelConfig.globalWriting')}
+            desc={t('novelConfig.globalWritingDesc')}
+            aiFieldKey="globalGuidance"
+            generatingField={generatingField}
+            onAIGenerate={handleFieldGenerate}
+          >
+            <Textarea
+              aria-label={t('novelConfig.globalWriting')}
+              value={config.globalGuidance}
+              onChange={(e) => update('globalGuidance', e.target.value)}
+              placeholder={t('novelConfig.globalWritingPlaceholder')}
+              rows={6}
+            />
+          </Section>
           {/* 基本信息 */}
           <Section title={t('novelConfig.basicInfo')}>
             <div className="grid grid-cols-3 gap-4">
@@ -264,22 +279,6 @@ export default function NovelConfigEditor() {
             onAIGenerate={handleFieldGenerate}
           >
             <Textarea value={config.protagonistProfile} onChange={(e) => update('protagonistProfile', e.target.value)} placeholder={t('novelConfig.protagonistPlaceholder')} rows={4} />
-          </Section>
-
-          {/* 全局写作要求 */}
-          <Section
-            title={t('novelConfig.globalWriting')}
-            desc={t('novelConfig.globalWritingDesc')}
-            aiFieldKey="globalGuidance"
-            generatingField={generatingField}
-            onAIGenerate={handleFieldGenerate}
-          >
-            <Textarea
-              value={config.globalGuidance}
-              onChange={(e) => update('globalGuidance', e.target.value)}
-              placeholder={t('novelConfig.globalWritingPlaceholder')}
-              rows={6}
-            />
           </Section>
 
           {/* 文风配置 */}

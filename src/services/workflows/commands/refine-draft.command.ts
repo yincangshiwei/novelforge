@@ -75,7 +75,9 @@ export class RefineDraftCommand extends BaseWorkflowCommand<string> {
       .withWordNumber(project.novelConfig.wordsPerChapter)
       .withUserRefinePrompt(userPromptBlock)
 
-    const refined = await this.callLLMWithBuilder(promptBuilder, callbacks, { purpose: 'refine_chapter' })
+    const { readWritingConstraints } = await import('../../writing-constraints')
+    const constraints = await readWritingConstraints({ text: draft, characterNames: this.params.chapterInfo.characters, includeGlobal: false })
+    const refined = await this.callLLM(promptBuilder.build() + '\n\n' + constraints, promptBuilder.getSystemRole(), callbacks, { purpose: 'refine_chapter' })
 
     const cleanRefined = this.stripThinkingTags(refined)
 

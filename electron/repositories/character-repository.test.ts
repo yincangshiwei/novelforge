@@ -78,6 +78,21 @@ function state(location: string, updatedAtChapter = 1) {
   }
 }
 
+describe('CharacterRepository.createMissing', () => {
+  it('只新增，不覆盖已有档案、等级或动态状态，重复候选只保存一次', () => {
+    CharacterRepository.upsert(makeChar('旧人物', { tier: 1, appearance: '手写档案', currentState: state('城门', 5) }))
+    const created = CharacterRepository.createMissing([
+      makeChar('旧人物', { tier: 3, appearance: '规划推测' }),
+      makeChar('新人', { tier: 3 }), makeChar('新人', { tier: 1 }),
+    ])
+    expect(created).toBe(1)
+    expect(CharacterRepository.getByName('旧人物')?.appearance).toBe('手写档案')
+    expect(CharacterRepository.getByName('旧人物')?.tier).toBe(1)
+    expect(CharacterRepository.getByName('旧人物')?.currentState?.location).toBe('城门')
+    expect(CharacterRepository.getByName('新人')?.tier).toBe(3)
+  })
+})
+
 describe('CharacterRepository.updateState 哨兵合并（写时刻以 DB 当前值为基准）', () => {
   it('非空值正常覆盖', () => {
     CharacterRepository.upsert(makeChar('张三'))

@@ -24,6 +24,15 @@ beforeEach(() => {
 })
 
 describe('skill 元工具', () => {
+  it('旧版同名用户技能在加载时带新版角色接口说明，不覆盖用户正文', async () => {
+    skillRegistry.register({ ...mk('chapter-architect', {}, '用户自定义的章节规则'), source: 'user' })
+    const result = await skillTool.execute({ name: 'chapter-architect' })
+    expect(result.content).toContain('用户自定义的章节规则')
+    expect(result.content).toContain('manage_character')
+    expect(result.content).toContain('globalGuidance')
+    expect(result.content).toContain('反派不自动为1')
+  })
+
   it('无参 → 返回技能目录（含 displayName 与 name）', async () => {
     const res = await skillTool.execute({})
     expect(res.success).toBe(true)

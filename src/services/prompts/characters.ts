@@ -23,7 +23,7 @@ export const charactersPrompts: PromptTemplate[] = [
 
 【任务要求】
 1. 分析并在 \`updates\` 中提取已有角色（从提供的现有角色卡中找）发生状态变化的信息。
-2. 分析并在 \`newCharacters\` 中提取本章新出场的重要角色（不要包含路人或已死无后续影响的龙套）。
+2. 在 \`newCharacters\` 中提取新出场且有明确剧情作用的具名人物，排除无名路人和背景群体。tier 独立于 role：1主要角色（长期主线与人物线），2关键配角（阶段事件/支线关键作用），3次要角色（局部作用）；反派不自动为1。
 3. \`currentState\` 字段说明：
    - location: 当前所在位置/阵营（字符串）
    - powerLevel: 修为境界/能力等级（字符串）
@@ -46,9 +46,9 @@ export const charactersPrompts: PromptTemplate[] = [
 | 角色名 | 位置 | 境界 | 身体状态 | 心理状态 | 道具 | 本章事件(50字内) | 标签(逗号分隔) | 当前核心动机 |
 
 ### NEW（新出场角色）
-| name | role | location | powerLevel | physicalState | mentalState | keyItems | recentEvents | tags | motivation | appearance | personality |
-|------|------|----------|------------|---------------|-------------|----------|-------------|------|------------|------------|-------------|
-| 新角色名 | protagonist/antagonist/supporting/minor | 位置 | 境界 | 状态 | 心理 | 道具 | 介绍 | 标签 | 动机 | 外貌 | 性格 |
+| name | role | tier | location | powerLevel | physicalState | mentalState | keyItems | recentEvents | tags | motivation | appearance | personality |
+|------|------|------|----------|------------|---------------|-------------|----------|-------------|------|------------|------------|-------------|
+| 新角色名 | protagonist/antagonist/supporting/minor | 1/2/3 | 位置 | 境界 | 状态 | 心理 | 道具 | 介绍 | 标签 | 动机 | 外貌 | 性格 |
 
 注意：updatedAtChapter 固定为 {{chapter_number}}。老角色只输出状态变化了的；tags/motivation 无变化填"无"。如果本章无任何角色状态变化且无新角色，输出"无变化"。`,
   },
@@ -70,8 +70,8 @@ export const charactersPrompts: PromptTemplate[] = [
 {{genre}}
 
 【任务要求】
-1. 提取所有在图谱中明确描述的角色（主角、反派、重要配角），不要遗漏。
-2. 龙套或仅一笔带过的角色不用提取。
+1. 提取所有明确具名且有剧情作用的主要角色、关键配角和次要角色，不要遗漏；无名路人、背景群体或仅提及且无作用者不独立建档。
+2. tier 与 role 独立：1=主要角色（持续影响主线且有长期人物线），2=关键配角（影响阶段事件或支线走向），3=次要角色（局部作用）。反派不自动归为1；按图谱描述判断。notes 记录分级依据、剧情作用与预计参与阶段。
 3. 所有字段基于图谱内容提取。如果图谱中未明确描写外貌，请务必根据角色的身份背景与性格推测并补充一段丰满的标志性外貌描写（外貌特征绝对不要留空或写未知）。未能确定的其他次要字段可填写空字符串。
 4. role 字段仅限以下取值：protagonist（主角）、antagonist（反派）、supporting（配角）、minor（龙套）。
 5. currentState 是角色的初始状态（故事开始时），updatedAtChapter 固定为 0。
@@ -82,6 +82,7 @@ export const charactersPrompts: PromptTemplate[] = [
   {
     "name": "角色名",
     "role": "protagonist",
+    "tier": 1,
     "gender": "性别",
     "age": "年龄或年龄段",
     "appearance": "外貌特征",
@@ -106,6 +107,19 @@ export const charactersPrompts: PromptTemplate[] = [
 ]
 
 如果图谱中没有任何可提取的角色，返回空数组 []。`,
+  },
+  {
+    key: 'extract_planned_characters',
+    name: '规划阶段角色建档',
+    description: '从已保存的章节蓝图提取具名且有剧情作用的新人物，保留已有角色',
+    systemRole: '你是严谨的人物规划档案员，只记录规划明确支持的事实。',
+    variables: { character_dynamics: '已有姓名与章节蓝图 JSON', genre: '小说类型' },
+    content: `小说类型：{{genre}}
+规划数据：{{character_dynamics}}
+只提取 blueprints.characters 中实际承担 keyEvents 或 purpose 所述行动的新人物。排除 existingNames 中的人物及其别名、无名路人、群体、泛称和仅被提及者。不得另起姓名或编造外貌、能力、背景；未给出的字段留空。
+身份 role 为 protagonist/antagonist/supporting/minor；等级 tier 独立判断：1=长期影响主线并有持续人物线，2=决定阶段事件或支线走向，3=局部作用。新出现不等于主要角色；证据不足时为3。
+notes 必须写出具体剧情作用、分级依据和计划参与的章节/阶段。不要生成 currentState 或实际出场统计，未来规划不是已发生事实。
+仅返回 JSON 数组，每项字段为 name、role、tier、appearance、personality、background、abilities、motivation、relationships、arc、notes、tags。没有新人物返回 []。`,
   },
   {
     key: 'extract_from_finalized',

@@ -17,7 +17,7 @@ import {
 import type { ChapterInfo } from '../chapter-workflow'
 import type { CharacterData } from '../../../../electron/repositories/character-repository'
 import type { StepCallbacks } from '../../../stores/workflow-store'
-import { isNoChangeValue, normalizeCharacterRole, normalizeTagsValue, matchCharacterName, stripNameAlias } from '../../character-normalize'
+import { isNoChangeValue, normalizeCharacterRole, normalizeCharacterTier, normalizeTagsValue, matchCharacterName, stripNameAlias } from '../../character-normalize'
 import { buildNamePositions, hasProximity, closestNamePair, hasDialogueMarker } from '../relation-utils'
 
 export interface FinalizeChapterParams {
@@ -336,8 +336,7 @@ export function buildFinalizePostProcessSteps(
               background: '', abilities: '',
               motivation: cleanOptional(row.motivation ?? '') ?? '',
               relationships: '', arc: '', notes: '',
-              // tier 按 role 推导（P2 修复：此前恒 2——新主角/反派 DB tier=2 与「protagonist/antagonist → tier 1」规则矛盾）
-              tier: role === 'protagonist' || role === 'antagonist' ? 1 : (role === 'minor' ? 3 : 2),
+              tier: normalizeCharacterTier(row.tier, role),
               tags: normalizeTagsValue(row.tags ?? ''),
               appearChapters: JSON.stringify([chapterNumber]), // 登记出场章节
               relations: '[]',

@@ -13,7 +13,7 @@
  *
  * mergeCardRows 为纯函数（可单测）；mergeCharacterCards 走 IPC 写库。
  */
-import { stripNameAlias, matchCharacterName, normalizeCharacterRole, parseAliases } from './character-normalize'
+import { stripNameAlias, matchCharacterName, normalizeCharacterRole, normalizeCharacterTier, parseAliases } from './character-normalize'
 import { ipc } from './ipc-client'
 import type { CharacterData } from '../../electron/repositories/character-repository'
 
@@ -78,10 +78,7 @@ export function mergeCardRows(
       for (const f of STRING_FIELDS) {
         if (newRow[f] === undefined || newRow[f] === null) newRow[f] = ''
       }
-      // tier 按 role 推导（主角/反派 → 1，minor → 3，其余 2）
-      if (newRow.tier === undefined) {
-        newRow.tier = role === 'protagonist' || role === 'antagonist' ? 1 : (role === 'minor' ? 3 : 2)
-      }
+      newRow.tier = normalizeCharacterTier(card.tier, role)
       if (newRow.tags === undefined) newRow.tags = ''
       if (newRow.appearChapters === undefined) newRow.appearChapters = '[]'
       if (newRow.relations === undefined) newRow.relations = '[]'

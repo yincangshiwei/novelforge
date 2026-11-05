@@ -57,6 +57,15 @@ function lastPayload(): { novelConfig: Record<string, unknown> } {
 }
 
 describe('update_config（丢更新回归）', () => {
+  it('保存全局要求后同步当前项目缓存，失败不改缓存', async () => {
+    await updateConfigTool.execute({ field: 'globalGuidance', value: '人物出场须保持服饰与气质一致' })
+    expect(useProjectStore.getState().currentProject?.novelConfig.globalGuidance).toBe('人物出场须保持服饰与气质一致')
+    mockInvoke.mockResolvedValueOnce({ success: false, error: '失败' } as never)
+    const result = await updateConfigTool.execute({ field: 'globalGuidance', value: '不能保存' })
+    expect(result.success).toBe(false)
+    expect(useProjectStore.getState().currentProject?.novelConfig.globalGuidance).not.toBe('不能保存')
+  })
+
   it('载荷只含被改字段（不得回带整份缓存配置）', async () => {
     const res = await updateConfigTool.execute({ field: 'genre', value: '年代' })
     expect(res.success).toBe(true)

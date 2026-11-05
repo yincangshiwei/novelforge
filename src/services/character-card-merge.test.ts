@@ -55,6 +55,15 @@ describe('mergeCardRows 已存在角色', () => {
 })
 
 describe('mergeCardRows 新角色', () => {
+  it('身份不强制等级，尊重反派和长期配角的显式分级', () => {
+    const { rows } = mergeCardRows([], [
+      { name: '阶段对手', role: 'antagonist', tier: 3 },
+      { name: '长期伙伴', role: 'supporting', tier: 1 },
+      { name: '未分级对手', role: 'antagonist' },
+    ])
+    expect(rows.map(row => row.tier)).toEqual([3, 1, 2])
+  })
+
   it('新角色 INSERT 并补默认值（role 归一化 + tier 推导）', () => {
     const { rows, stats } = mergeCardRows([], [{ name: '王五', role: 'Protagonist', personality: '果断' }])
     expect(stats.created).toBe(1)

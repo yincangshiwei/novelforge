@@ -4,7 +4,15 @@
  * - renameMap 改名捕获/级联/重名校验（#34 块 B）
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { useCharacterStore } from './character-store'
+import { useCharacterStore, groupByTier, EMPTY_CARD } from './character-store'
+
+it('角色定位不覆盖显式戏份等级，分组不修改原对象', () => {
+  const cards = [{ ...EMPTY_CARD, name: '阶段反派', role: 'antagonist', tier: 3 }, { ...EMPTY_CARD, name: '长期伙伴', tier: 1 }]
+  const groups = groupByTier(cards)
+  expect(groups[3][0].name).toBe('阶段反派')
+  expect(groups[1][0].name).toBe('长期伙伴')
+  expect(cards[0].tier).toBe(3)
+})
 
 // vi.hoisted：mock 工厂（hoisted）引用共享状态
 const mock = vi.hoisted(() => ({

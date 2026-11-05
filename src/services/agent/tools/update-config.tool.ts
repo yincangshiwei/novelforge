@@ -84,6 +84,10 @@ export const updateConfigTool = buildAgentTool({
       return { success: false, content: '', error: result.error ?? t('tool.updateConfigFailed') }
     }
 
+    if (useProjectStore.getState().currentProject?.id === project.id) {
+      useProjectStore.getState().updateNovelConfig({ [field]: finalValue })
+    }
+
     return {
       success: true,
       content: t('tool.configUpdated')
