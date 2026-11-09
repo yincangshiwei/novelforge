@@ -11,6 +11,18 @@ describe('detectWritingIntent 命中表', () => {
   it('写 → ambiguous（缺章号，hint=chapter；I3 回归：祈使句不被查询护栏误伤）', () => {
     expect(detectWritingIntent('帮我写')).toEqual({ kind: 'ambiguous', hint: 'chapter' })
   })
+  it.each([
+    '因为都是整数，例如900、1000、1300、1400等，一看就是AI写文，没有一些像真人那样，容易被人看出是AI文，但由于也是AI写文，必须要要符合AI的逻辑，如果AI的逻辑处理最好是1600、1500之类的话，就只能按这个方式去弄了，我不确定，我只是跟你探讨一下先。',
+    'AI写文总用整百章作为总章数，我不确定这样是否合适。',
+    '真人创作的小说不一定按整百章结束。',
+    '先讨论一下生成正文的逻辑，暂时不要执行。',
+    '这本小说写到现在节奏太快了。',
+  ])('写作讨论不被本地缺章号提示拦截：%s', input => {
+    expect(detectWritingIntent(input)).toEqual({ kind: 'none' })
+  })
+  it.each(['写', '请帮我写一下', '继续写', '帮我写下一章', '生成正文'])('明确写稿请求仍澄清章号：%s', input => {
+    expect(detectWritingIntent(input)).toEqual({ kind: 'ambiguous', hint: 'chapter' })
+  })
   it('润色第2章 → refine(2)', () => {
     expect(detectWritingIntent('把第2章润色一下')).toEqual({ kind: 'refine', chapter: 2 })
   })

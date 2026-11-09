@@ -102,7 +102,7 @@ export function detectWritingIntent(input: string): WritingIntent {
       if (from !== null && to !== null && from > 0 && to >= from) return { kind: 'chapter_creation', chapter: { from, to } }
     }
     // \s* 支持「第 3 章」带空格（评审覆盖缺口修订：`第?(\d+)` 后无空格容忍时「第 3 章」匹配失败）
-    const single = input.match(/第?\s*(\d+|[一二三四五六七八九十]+)\s*章/)
+    const single = input.match(/(?<![下上前后一二三四五六七八九十\d])第?\s*(\d+|[一二三四五六七八九十]+)\s*章/)
     if (single) {
       const n = parseChapterNum(single[1])
       if (n !== null) return { kind: 'chapter_creation', chapter: n }
@@ -122,7 +122,10 @@ export function detectWritingIntent(input: string): WritingIntent {
       || /(邮件|报告|文案|代码|方案|简历|配置|参数)/.test(input)) {
       return { kind: 'none' }
     }
-    return { kind: 'ambiguous', hint: 'chapter' }
+    const chapterRequest = /^(?:请\s*)?(?:(?:帮我|替我|给我)\s*)?(?:接着写|继续写|写|创作|生成|起草|产出)\s*(?:一下|下)?\s*(?:(?:一|下|下一|新)(?:个|篇|章)|(?:一|下一|新)?章节|正文|草稿|小说)?\s*(?:正文|草稿)?\s*(?:一下|下)?\s*[吧啊呀。！!]*$/
+    return chapterRequest.test(input.trim())
+      ? { kind: 'ambiguous', hint: 'chapter' }
+      : { kind: 'none' }
   }
 
   return { kind: 'none' }
