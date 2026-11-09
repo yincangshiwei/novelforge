@@ -17,6 +17,7 @@ import { logger } from './utils/logger'
 import { safeErrorMessage } from './utils/error-utils'
 import { t } from '../src/shared/locale'
 import { getProjectVelaDir } from './utils/config-utils'
+import { checkOperationCancellation } from './services/agent-operation-journal'
 import { tokenize, tokenizeToSpaceSeparated } from './chinese-tokenizer'
 
 // 懒加载：避免 Electron 启动时同步 require 原生模块导致数秒无日志
@@ -376,6 +377,7 @@ export async function addChunks(
   vectors?: number[][],
   filePath?: string,
   metadata?: { chapterNumber?: number; chapterTitle?: string },
+  options?: { preserveExistingDocuments?: boolean },
 ): Promise<{ success: boolean; chunkCount: number; error?: string }> {
   try {
     const db = await getConnection(projectPath)
@@ -464,14 +466,19 @@ export async function addChunks(
           }
           return cleaned
         })
-        await db.dropTable(TABLE_NAME)
         // L3 T2 加固：本次导入无向量而旧表已有 vector 列时，重建 schema 必须保留该列
         //（沿用旧列维度）——否则存量行的 vector 字段会让 makeArrowTable 报
         //"Found field not in schema: vector" 使整个导入失败、且向量列被整体丢弃
         const rebuildSchema = VECTOR_DIM > 0
           ? targetSchema
           : buildChunksSchema(detectVectorDimFromSchema(existingSchema.fields))
-        await db.createTable(TABLE_NAME, [...cleanRows, ...records], { schema: rebuildSchema })
+        await db.dropTable(TABLE_NAME)
+        try {
+          await db.createTable(TABLE_NAME, [...cleanRows, ...records], { schema: rebuildSchema })
+        } catch (error) {
+          await db.createTable(TABLE_NAME, cleanRows, { schema: existingSchema })
+          throw error
+        }
       }
     } else {
       // 首次创建时使用显式 Schema，确保 vector 列正确识别为 FixedSizeList
@@ -490,10 +497,10 @@ export async function addChunks(
     if (tableNames.includes(DOCS_TABLE_NAME)) {
       const docsTable = await db.openTable(DOCS_TABLE_NAME)
       // 先删除同名文档（幂等性），再添加新的
-      try {
+      if (!options?.preserveExistingDocuments) {
         const safeName = sanitizeFilterValue(fileName, 'fileName')
         await docsTable.delete(`fileName = '${safeName}'`)
-      } catch { /* 表可能为空或无匹配 */ }
+      }
       await docsTable.add([docInfo])
     } else {
       await db.createTable(DOCS_TABLE_NAME, [docInfo])
@@ -516,6 +523,67 @@ export async function addChunks(
   } catch (error) {
     logger.error('VectorStore', t('log.vectorStore.writeFailed').replace('{err}', String(error)))
     return { success: false, chunkCount: 0, error: safeErrorMessage(error) }
+  }
+}
+
+const replacementQueues = new Map<string, Promise<unknown>>()
+
+/** 运行期可恢复替换；两张 LanceDB 表不是崩溃原子事务。 */
+export async function replaceDocumentChunks(
+  projectPath: string,
+  docId: string,
+  fileName: string,
+  chunks: string[],
+  vectors?: number[][],
+  filePath?: string,
+  metadata?: { chapterNumber?: number; chapterTitle?: string },
+): Promise<{ success: boolean; chunkCount: number; error?: string }> {
+  const previous = replacementQueues.get(projectPath) ?? Promise.resolve()
+  const work = previous.catch(() => {}).then(async () => {
+    checkOperationCancellation()
+    const db = await getConnection(projectPath)
+    const names = await db.tableNames()
+    const safeName = sanitizeFilterValue(fileName, 'fileName')
+    const docsTable = names.includes(DOCS_TABLE_NAME) ? await db.openTable(DOCS_TABLE_NAME) : undefined
+    const oldDocs = docsTable ? await docsTable.query().filter(`fileName = '${safeName}'`).toArray() : []
+    const chunksTable = names.includes(TABLE_NAME) ? await db.openTable(TABLE_NAME) : undefined
+    const oldChunks = chunksTable ? await chunksTable.query().filter(`fileName = '${safeName}'`).toArray() : []
+    const snapshots = oldChunks.map(row => {
+      const vector = row.vector as { toArray?: () => ArrayLike<number> } | undefined
+      return { ...row, ...(vector?.toArray ? { vector: Array.from(vector.toArray()) } : {}) }
+    })
+    const oldIds = new Set<string>([
+      ...oldDocs.map(row => String(row.id)),
+      ...oldChunks.map(row => String(row.docId)),
+    ])
+    // 最后一次取消检查；从暂存新数据到清理/恢复旧数据不再中断。
+    checkOperationCancellation()
+    try {
+      const result = await addChunks(projectPath, docId, fileName, chunks, vectors, filePath, metadata, { preserveExistingDocuments: true })
+      if (!result.success) throw new Error(result.error ?? 'Knowledge base write failed')
+      for (const oldId of oldIds) {
+        if (!await removeDocument(projectPath, oldId)) throw new Error('Knowledge base replacement cleanup failed')
+      }
+      return result
+    } catch (error) {
+      try {
+        if (!await removeDocument(projectPath, docId)) throw new Error('New document cleanup failed')
+        for (const oldId of oldIds) {
+          if (!await removeDocument(projectPath, oldId)) throw new Error('Old document cleanup failed')
+        }
+        if (snapshots.length > 0) await (await db.openTable(TABLE_NAME)).add(snapshots)
+        if (oldDocs.length > 0) await (await db.openTable(DOCS_TABLE_NAME)).add(oldDocs)
+      } catch (rollbackError) {
+        return { success: false, chunkCount: 0, error: `${safeErrorMessage(error)}; rollback failed, outcome unknown: ${safeErrorMessage(rollbackError)}` }
+      }
+      return { success: false, chunkCount: 0, error: safeErrorMessage(error) }
+    }
+  })
+  replacementQueues.set(projectPath, work)
+  try {
+    return await work
+  } finally {
+    if (replacementQueues.get(projectPath) === work) replacementQueues.delete(projectPath)
   }
 }
 

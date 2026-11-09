@@ -200,9 +200,10 @@ export class ProjectCoreRepository {
                 setClauses.push("updated_at = unixepoch() * 1000")
                 values.push('main')
 
-                db.prepare(
+                const result = db.prepare(
                     `UPDATE project_core SET ${setClauses.join(', ')} WHERE id = ?`
                 ).run(...values)
+                if (result.changes !== 1) throw new Error('项目配置更新失败：目标记录不存在')
             }
         })
         tx()

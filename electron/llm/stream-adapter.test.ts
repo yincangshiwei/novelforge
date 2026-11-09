@@ -29,6 +29,26 @@ describe('OpenAICompatibleStreamAdapter', () => {
     expect(events.at(-1)).toMatchObject({ type: 'finish', reason: 'tool_use', usage: { promptTokens: 11, completionTokens: 22 } })
   })
 
+  it('缺失结束原因与截断参数都不能产生可执行调用', () => {
+    const tool = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{"}}]}}]}\n\n'
+    for (const tail of ['', 'data: {"choices":[{"finish_reason":"length"}]}\n\n', 'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n']) {
+      const events = collect([tool + tail])
+      expect(events.some(e => e.type === 'tool_call_complete')).toBe(false)
+      expect(events.at(-1)).toMatchObject({ type: 'finish', reason: tail.includes('length') ? 'length' : tail ? 'error' : 'unknown' })
+    }
+  })
+
+  it('usage尾帧被保留，后到调用ID替换临时ID', () => {
+    const events = collect([
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"real","function":{"name":"read"}}]},"finish_reason":"tool_calls"}]}\n\n',
+      'data: {"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10}}\n\n',
+      'data: [DONE]\n\n',
+    ])
+    expect(events).toContainEqual({ type: 'tool_call_complete', id: 'real', name: 'read', args: {} })
+    expect(events.at(-1)).toMatchObject({ usage: { totalTokens: 10 } })
+  })
+
   it('任意字符边界切 SSE 仍得到同一事件', () => {
     const whole = collect([sse.join('')])
     for (let i = 0; i <= sse.join('').length; i += 7) {

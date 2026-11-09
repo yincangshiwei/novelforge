@@ -11,6 +11,38 @@ const makeMsg = (id: string, role: 'user' | 'assistant' | 'system', content: str
 const msgs = (n: number): AgentMessage[] =>
   Array.from({ length: n }, (_, i) => makeMsg(`m${i}`, i % 2 === 0 ? 'user' : 'assistant', `第${i}条消息内容`.repeat(20)))
 
+describe('归档中断工具恢复', () => {
+  it('父消息、压缩原文、撤回分支和子工具均封存，不自动重放', () => {
+    const message: AgentMessage = { ...makeMsg('m', 'assistant', ''), toolCalls: [
+      { id: 'call', turnId: 'turn', step: 1, toolName: 'update_config', arguments: { field: 'globalGuidance' }, status: 'running' },
+    ] }
+    const raw = JSON.stringify({
+      id: 'archive', title: 'test', messages: [message],
+      compressed: [{ summary: 'summary', original: [message] }],
+      rewound: [{ messageId: 'm', messages: [message] }],
+      subSessions: [{ id: 'sub', status: 'running', startedAt: 0, messages: [message], toolCalls: message.toolCalls }],
+    })
+    const conv = parseArchive(raw)!
+    for (const recovered of [conv.messages[0], conv.compressed![0].original[0], conv.rewound![0].messages[0], conv.subSessions![0].messages[0]]) {
+      expect(recovered.toolCalls?.[0]).toMatchObject({ status: 'failed', receipt: { outcome: 'unknown', verified: false } })
+    }
+    expect(conv.subSessions![0].toolCalls[0]).toMatchObject({ status: 'failed', receipt: { outcome: 'unknown' } })
+    expect(parseArchive(serializeArchive(conv))).toEqual(conv)
+    expect(extractSideEffectReceipts(conv.messages)[0].outcome).toBe('unknown')
+  })
+
+  it('已提交回执在崩溃状态下仍抽取为 ok', () => {
+    const conv = parseArchive(JSON.stringify({ id: 'a', title: 't', messages: [{
+      ...makeMsg('m', 'assistant', ''), toolCalls: [{
+        id: 'call', toolName: 'update_config', arguments: {}, status: 'running',
+        receipt: { turnId: 'turn', step: 1, callId: 'call', toolName: 'update_config', target: 'config:globalGuidance', outcome: 'committed', verified: true },
+      }],
+    }] }))!
+    expect(extractSideEffectReceipts(conv.messages)[0].outcome).toBe('ok')
+    expect(conv.messages[0].toolCalls?.[0].receipt?.outcome).toBe('committed')
+  })
+})
+
 describe('selectCompressionBatch', () => {
   it('总 token 在预算内时 batch 为空', () => {
     const { batch, rest } = selectCompressionBatch(msgs(2), 100_000)

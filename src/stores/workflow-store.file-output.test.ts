@@ -3,7 +3,7 @@
  * workflow-store × 输出落盘（M2，CC §三.4 双轨）：
  * - 流式镜像：appendText 经既有 100ms 共享 flush 汇聚点同步镜像到主进程文件
  *   （fs:workflow-output-append），内存 step.result 行为零变化（双轨兼容）；
- * - 任务级清理：run 自然结束（完成/失败 → 移入历史）与取消时 delete-run；
+ * - 任务级清理：正常终态可靠保存后 delete-run；取消时保留输出供恢复；
  * - 崩溃恢复续读：restoreCheckpoint 后 hydrateInterruptedOutputs 把中断步骤落盘
  *   输出（full tail 文件）补回空的 step.result（checkpoint 已有内容零改动，
  *   补填内容走 cleanupMessageText 净化）。
@@ -126,27 +126,31 @@ describe('流式镜像（双轨：内存 step.result 不变 + 文件镜像同文
     expect(run!.steps[0]!.result).toBe('清洗后完整正文')
   })
 
-  it('取消工作流 → delete-run（任务级清理）；未落盘残留不写入', async () => {
-    // 直接放入一个 active run（模拟运行中）再取消
-    const fakeRun = {
-      id: 'cancel-run-001',
-      type: 'chapter_creation' as const,
-      title: '取消测试',
-      status: 'running' as const,
-      currentStepIndex: 0,
-      createdAt: new Date().toISOString(),
-      steps: [
-        { id: 's1', name: '写稿', description: '', status: 'running' as const, logs: [] },
-      ],
-    }
-    useWorkflowStore.setState(s => ({ activeRuns: [...s.activeRuns, fakeRun] }))
-    useWorkflowStore.getState().cancelWorkflow('cancel-run-001')
-
-    const deleteCall = findCall('fs:workflow-output-delete-run')
-    expect(deleteCall).toBeTruthy()
-    expect(deleteCall!.args).toEqual(['cancel-run-001'])
-    // 取消的 run 进入 history 且标记 failed（既有语义）
-    expect(useWorkflowStore.getState().history.some(r => r.id === 'cancel-run-001' && r.status === 'failed')).toBe(true)
+  it('取消工作流保留恢复输出，历史记录可靠保存后仍不删除', async () => {
+    let ready!: () => void
+    let release!: () => void
+    const started = new Promise<void>(resolve => { ready = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const running = useWorkflowStore.getState().startWorkflow({
+      type: 'chapter_creation', title: '取消测试', steps: [{ name: '写稿', description: '',
+        executor: async (_step, _ctx, callbacks) => {
+          callbacks.appendText('取消前缓冲正文')
+          ready()
+          await gate
+        },
+      }],
+    })
+    await started
+    const runId = useWorkflowStore.getState().activeRuns[0].id
+    useWorkflowStore.getState().cancelWorkflow(runId)
+    release()
+    await running
+    expect(await useWorkflowStore.getState().flushCheckpoint()).toBe(true)
+    expect(findCall('fs:workflow-output-delete-run')).toBeUndefined()
+    const run = useWorkflowStore.getState().history.find(r => r.id === runId)!
+    expect(run.status).toBe('failed')
+    expect(run.steps[0].result).toBe('取消前缓冲正文')
+    expect(findCall('fs:workflow-output-append')!.args).toEqual([runId, 0, '取消前缓冲正文'])
   })
 })
 

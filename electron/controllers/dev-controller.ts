@@ -23,6 +23,7 @@ import { isValidHttpUrl, isValidRelativePath, buildDevApiUrl, truncateResponse }
 import type { DevApiRequest, DevApiResponse, DevIpcMetricsData, GlobalConfig } from '../../src/shared/ipc-channels'
 import { guardedHandle } from '../security/ipc-guard'
 import { proxyFetch } from '../net/proxy-fetch'
+import { checkOperationCancellation, currentOperationSignal } from '../services/agent-operation-journal'
 
 /** 响应体最大字节数（1MB，超出截断） */
 const MAX_RESPONSE_BYTES = 1024 * 1024
@@ -73,15 +74,19 @@ async function invokeDevApi(req: DevApiRequest, baseUrlOverride?: string): Promi
   }
 
   const timeoutMs = dev && Number.isFinite(dev.timeoutMs) && dev.timeoutMs > 0 ? dev.timeoutMs : DEFAULT_TIMEOUT_MS
+  checkOperationCancellation()
+  const operationSignal = currentOperationSignal()
   const controller = new AbortController()
+  const signal = operationSignal ? AbortSignal.any([operationSignal, controller.signal]) : controller.signal
   const timer = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
+    checkOperationCancellation()
     const res = await proxyFetch(url, {
       method,
       headers: dev?.headers ?? {},
       body: (method === 'GET' || method === 'DELETE') ? undefined : (req.body ?? undefined),
-      signal: controller.signal,
+      signal,
       // manual：不跟随重定向——3xx 返回原文并附 Location，防重定向链绕过单一端点限制（SSRF 扩展面）
       redirect: 'manual',
     })
@@ -95,8 +100,9 @@ async function invokeDevApi(req: DevApiRequest, baseUrlOverride?: string): Promi
       content: location ? `${content}\n\n[重定向 ${res.status} → ${location}]` : content,
     }
   } catch (e) {
+    if (operationSignal?.aborted) throw e
     const msg = safeErrorMessage(e)
-    return { success: false, error: msg.includes('abort') ? `请求超时（${timeoutMs}ms）` : msg }
+    return { success: false, error: controller.signal.aborted ? `请求超时（${timeoutMs}ms）` : msg }
   } finally {
     clearTimeout(timer)
   }
@@ -168,6 +174,7 @@ export function registerDevController() {
     try {
       return await invokeDevApi(req)
     } catch (e) {
+      if (currentOperationSignal()?.aborted) throw e
       logger.error('Dev', t('log.dev.invokeError').replace('{err}', safeErrorMessage(e)))
       return { success: false, error: safeErrorMessage(e) }
     }

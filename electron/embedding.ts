@@ -11,7 +11,14 @@
 import { t } from '../src/shared/locale'
 import type { LLMProtocol } from '../src/shared/llm-protocols'
 import { buildOpenAIUrl } from './llm/url-utils'
-import { fetchWithTimeout } from './net/fetch-with-timeout'
+import { abortableDelay, fetchWithTimeout, throwIfAborted, withAbortSignal, withDeadline } from './net/fetch-with-timeout'
+import { currentOperationSignal } from './services/agent-operation-journal'
+
+class EmbeddingHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+  }
+}
 
 /** ⚠️ P2 修复：查询向量 LRU 缓存——RAG 是每次章节写作/对话的必经路径，同一查询重复向量化
  *  （此前每次检索都发一次 Embedding API 请求，无缓存） */
@@ -27,11 +34,18 @@ const QUERY_CACHE_TTL = 30 * 60 * 1000 // 30 分钟
 export async function embedOpenAI(
   texts: string[],
   model: { baseUrl: string; apiKey: string; modelName?: string },
+  signal: AbortSignal | undefined = currentOperationSignal(),
 ): Promise<number[][]> {
+  return withDeadline(deadlineSignal => embedOpenAIRequest(texts, model, deadlineSignal), undefined, signal)
+}
+
+async function embedOpenAIRequest(texts: string[], model: { baseUrl: string; apiKey: string; modelName?: string }, signal: AbortSignal): Promise<number[][]> {
+  throwIfAborted(signal)
   const embeddingModel = model.modelName || 'text-embedding-3-small'
   const url = buildOpenAIUrl(model.baseUrl, 'embedding')
   const res = await fetchWithTimeout(url, {
     method: 'POST',
+    signal,
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${model.apiKey}`,
@@ -43,11 +57,11 @@ export async function embedOpenAI(
   })
 
   if (!res.ok) {
-    const text = await res.text()
-    throw new Error(t('error.embeddingApiFailed').replace('{provider}', 'OpenAI').replace('{status}', String(res.status)).replace('{err}', text))
+    const text = await withAbortSignal(() => res.text(), signal, () => { void res.body?.cancel().catch(() => {}) })
+    throw new EmbeddingHttpError(t('error.embeddingApiFailed').replace('{provider}', 'OpenAI').replace('{status}', String(res.status)).replace('{err}', text), res.status)
   }
 
-  const data = await res.json() as {
+  const data = await withAbortSignal(() => res.json(), signal, () => { void res.body?.cancel().catch(() => {}) }) as {
     data: Array<{ embedding: number[]; index: number }>
   }
 
@@ -61,7 +75,13 @@ export async function embedOpenAI(
 export async function embedGemini(
   texts: string[],
   model: { baseUrl: string; apiKey: string; modelName?: string },
+  signal: AbortSignal | undefined = currentOperationSignal(),
 ): Promise<number[][]> {
+  return withDeadline(deadlineSignal => embedGeminiRequest(texts, model, deadlineSignal), undefined, signal)
+}
+
+async function embedGeminiRequest(texts: string[], model: { baseUrl: string; apiKey: string; modelName?: string }, signal: AbortSignal): Promise<number[][]> {
+  throwIfAborted(signal)
   const embeddingModel = model.modelName || 'text-embedding-004'
   const baseUrl = model.baseUrl.replace(/\/$/, '')
 
@@ -75,6 +95,7 @@ export async function embedGemini(
 
   const res = await fetchWithTimeout(url, {
     method: 'POST',
+    signal,
     headers: {
       'Content-Type': 'application/json',
       'x-goog-api-key': model.apiKey,
@@ -83,11 +104,11 @@ export async function embedGemini(
   })
 
   if (!res.ok) {
-    const text = await res.text()
-    throw new Error(t('error.embeddingApiFailed').replace('{provider}', 'Gemini').replace('{status}', String(res.status)).replace('{err}', text))
+    const text = await withAbortSignal(() => res.text(), signal, () => { void res.body?.cancel().catch(() => {}) })
+    throw new EmbeddingHttpError(t('error.embeddingApiFailed').replace('{provider}', 'Gemini').replace('{status}', String(res.status)).replace('{err}', text), res.status)
   }
 
-  const data = await res.json() as {
+  const data = await withAbortSignal(() => res.json(), signal, () => { void res.body?.cancel().catch(() => {}) }) as {
     embeddings: Array<{ values: number[] }>
   }
 
@@ -99,7 +120,9 @@ export async function generateEmbeddings(
   texts: string[],
   protocol: LLMProtocol,
   model: { baseUrl: string; apiKey: string; modelName?: string },
+  signal: AbortSignal | undefined = currentOperationSignal(),
 ): Promise<number[][]> {
+  throwIfAborted(signal)
   // Anthropic 不提供嵌入 API（协议注册表里它只服务生成）——显式报错，
   // 否则会落入 OpenAI 兼容分支静默打错端点（2026-09-28 加原生协议时收窄）
   if (protocol === 'anthropic') {
@@ -115,7 +138,8 @@ export async function generateEmbeddings(
     if (hit && Date.now() - hit.ts < QUERY_CACHE_TTL) {
       return [hit.vector]
     }
-    const result = await doGenerate(texts, protocol, model)
+    const result = await doGenerate(texts, protocol, model, signal)
+    throwIfAborted(signal)
     if (result[0] && result[0].length > 0) {
       queryCache.set(key, { vector: result[0], ts: Date.now() })
       if (queryCache.size > QUERY_CACHE_MAX) {
@@ -126,7 +150,7 @@ export async function generateEmbeddings(
     return result
   }
 
-  return doGenerate(texts, protocol, model)
+  return doGenerate(texts, protocol, model, signal)
 }
 
 /** 实际批量生成（批量限制 + 分批循环 + 指数退避重试） */
@@ -134,7 +158,9 @@ async function doGenerate(
   texts: string[],
   protocol: 'openai' | 'gemini',
   model: { baseUrl: string; apiKey: string; modelName?: string },
+  signal: AbortSignal | undefined = currentOperationSignal(),
 ): Promise<number[][]> {
+  throwIfAborted(signal)
   // 批量限制：每次最多 50 条
   const batchSize = protocol === 'gemini' ? 100 : 50
   const results: number[][] = []
@@ -147,11 +173,15 @@ async function doGenerate(
     for (let attempt = 0; attempt < 3 && !embeddings; attempt++) {
       try {
         embeddings = protocol === 'gemini'
-          ? await embedGemini(batch, model)
-          : await embedOpenAI(batch, model)
+          ? await embedGemini(batch, model, signal)
+          : await embedOpenAI(batch, model, signal)
+        throwIfAborted(signal)
       } catch (e) {
+        throwIfAborted(signal)
+        if (e instanceof Error && e.name === 'AbortError') throw e
+        if (e instanceof EmbeddingHttpError && !(e.status === 408 || e.status === 429 || e.status >= 500)) throw e
         if (attempt >= 2) throw e
-        await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)))
+        await abortableDelay(500 * Math.pow(2, attempt), signal)
       }
     }
     results.push(...(embeddings ?? []))

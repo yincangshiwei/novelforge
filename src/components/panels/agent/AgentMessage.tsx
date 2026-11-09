@@ -276,6 +276,13 @@ export default memo(function AgentMessage({ message, onFork, onRewind, rewindDis
       >
         {/* Turn 级错误行（线②）：失败回执走专用错误行，不写正文 markdown */}
         {error && <TurnErrorRow message={error.message} code={error.code} />}
+        {!streaming && message.executionOutcome && message.executionOutcome.status !== 'completed' && (
+          <div role="status" className="mb-2 opacity-70">
+            {message.executionOutcome.status === 'unverified' ? '修改完成声明未通过执行核验'
+              : message.executionOutcome.status === 'cancelled' ? '任务已停止，不能视为完成'
+              : message.executionOutcome.status === 'exhausted' ? '已达到步骤上限，任务未确认完成' : '部分操作失败，请查看工具结果'}
+          </div>
+        )}
 
         {/* 正文与工具调用（交错时间线，2026-10-17）：
             - 有 contentOffset（引擎按轮写入）→ 按 offset 把工具批插回对应正文段之后（dsh 的 step 节奏）；
@@ -287,7 +294,13 @@ export default memo(function AgentMessage({ message, onFork, onRewind, rewindDis
           const { steps: planSteps, rest: planRest } = extractPlanSteps(rest, {
             finalize: !streaming && processCalls.some(tc => tc.status === 'completed'),
           })
-          const timeline = processCalls.length > 0 ? buildTimeline(planRest, processCalls) : null
+          const eventTimeline: TimelineSegment[] | undefined = (!streaming ? message.timeline : undefined)?.map(block => block.kind === 'text'
+            ? { kind: 'text', text: block.text }
+            : { kind: 'tools', calls: block.callIds.flatMap(id => processCalls.filter(call => call.id === id)) })
+          const rawTimeline = eventTimeline ?? (processCalls.length > 0 ? buildTimeline(content, processCalls) : null)
+          const timeline = rawTimeline?.map(seg => seg.kind === 'text'
+            ? { ...seg, text: extractPlanSteps(splitThinking(seg.text).rest).rest }
+            : seg) ?? null
 
           // 交错时间线：正文段与工具批统一 8px（gap-2）节奏，空正文段不占间距
           if (timeline) {

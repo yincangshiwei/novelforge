@@ -8,7 +8,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 import { computeTextStats, formatTextStats } from '../../text-stats'
 
@@ -30,7 +30,9 @@ export const countCharactersTool = buildAgentTool({
     },
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const textArg = args.text as string | undefined
     // 数值归一化（LLM 可能传字符串 "10"——此前透传 IPC/SQLite，亲和性偶发可用）
     const chapterNumRaw = args.chapter_number
@@ -54,11 +56,11 @@ export const countCharactersTool = buildAgentTool({
         return { success: false, content: '', error: t('error.noProject') }
       }
       try {
-        const latest = await ipc.invoke('db:draft-get-latest', chapterNum) as { id?: number; version?: number } | null
+        const latest = await toolIpc.invoke('db:draft-get-latest', chapterNum) as { id?: number; version?: number } | null
         if (!latest || latest.id === undefined) {
           return { success: true, content: t('tool.countNoDraft').replace('{chapter}', String(chapterNum)) }
         }
-        const full = await ipc.invoke('db:draft-get-full', latest.id) as { content?: string } | null
+        const full = await toolIpc.invoke('db:draft-get-full', latest.id) as { content?: string } | null
         if (!full) {
           return { success: false, content: '', error: t('tool.countDraftReadFailed').replace('{chapter}', String(chapterNum)) }
         }

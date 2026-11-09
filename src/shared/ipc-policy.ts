@@ -67,6 +67,9 @@ export const IPC_EVENT_CHANNELS = [
  * 通道 → 策略。S2 阶段只填 authority；pathArgs 由 S8 补齐。
  */
 export const IPC_CHANNEL_POLICY: Record<InvokeChannel, ChannelPolicy> = {
+  'agent:operation-invoke': { authority: 'write-project' },
+  'agent:operation-cancel': { authority: 'write-project' },
+  'agent:operation-list': { authority: 'read-project' },
   'browser:list-tabs': { authority: 'dev-bridge' },
   'browser:test': { authority: 'dev-bridge' },
   'config:get': { authority: 'read-global' },

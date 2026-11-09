@@ -13,7 +13,15 @@ import { logger } from '../utils/logger'
 import { t } from '../../src/shared/locale'
 import type { ModelProfile } from '../../src/shared/ipc-channels'
 import type { ResolvedModelProfile } from '../llm/provider.interface'
-import { guardedHandle } from '../security/ipc-guard'
+import { guardedHandle as registerGuardedHandle } from '../security/ipc-guard'
+import { checkOperationCancellation } from '../services/agent-operation-journal'
+
+const guardedHandle: typeof registerGuardedHandle = (channel, handler) => {
+  registerGuardedHandle(channel, async (event, ...args) => {
+    checkOperationCancellation()
+    return handler(event, ...args)
+  })
+}
 
 /**
  * 从全局配置加载嵌入模型配置 —— **此处才解析密钥**（返回 `ResolvedModelProfile`）。
@@ -89,6 +97,7 @@ export function registerEmbeddingController() {
     async (_event, query: string, candidates: string[]) => {
       try {
         const queryResult = await embeddingService.embed(query)
+        checkOperationCancellation()
         const candidateResults = await embeddingService.embedBatch(candidates)
 
         const similarities = candidateResults
@@ -101,6 +110,7 @@ export function registerEmbeddingController() {
 
         return { success: true, similarities }
       } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') throw error
         return { success: false, error: safeErrorMessage(error) }
       }
     },
@@ -120,6 +130,7 @@ export function registerEmbeddingController() {
         const results = findMostSimilar(queryVector, candidates, topK, threshold)
         return { success: true, results }
       } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') throw error
         return { success: false, error: safeErrorMessage(error) }
       }
     },

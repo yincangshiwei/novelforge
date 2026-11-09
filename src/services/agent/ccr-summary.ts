@@ -4,6 +4,7 @@ import { t } from '../../shared/locale'
 import { ipc } from '../ipc-client'
 import { calculateCost } from '../llm/prompt-cache'
 import { parseSharedFacts, upsertSharedFacts } from '../memory/shared-memory'
+import { waitWithAbort } from './abort-wait'
 
 /** 组装 CCR 摘要 prompt：第 N 次压缩输入 = 旧 rollingSummary + 新压缩批原文（迭代规则见设计 §4.2）
  *  @param maxTokens 摘要**生成长度指令**（W1 批 2：与注入上限同源，由 `context-policy.m1BudgetTokens` 给；
@@ -51,7 +52,9 @@ export async function generateConversationSummary(opts: {
   hints?: string[]
   /** W1 批 2：摘要生成长度指令上限（缺省 250；与注入上限同源，由档位策略给出） */
   maxTokens?: number
+  signal?: AbortSignal
 }): Promise<string> {
+  opts.signal?.throwIfAborted()
   const batchText = opts.batch
     .map(m => `${m.role === 'user' ? t('ccr.roleUser') : t('ccr.roleAssistant')}: ${m.content}`)
     .join('\n\n')
@@ -64,11 +67,12 @@ export async function generateConversationSummary(opts: {
   const mid = useLLMStore.getState().getModelForPurpose('summarize') ?? opts.modelId
 
   const startTime = Date.now()
-  const response = await useLLMStore.getState().generate(
+  const response = await waitWithAbort(useLLMStore.getState().generate(
     [{ role: 'user', content: prompt }],
     mid,
-    { temperature: 0.2, priority: 12 },
-  )
+    { temperature: 0.2, priority: 12, signal: opts.signal },
+  ), opts.signal)
+  opts.signal?.throwIfAborted()
   const duration = Date.now() - startTime
   const model = useLLMStore.getState().models.find(m => m.id === mid)
   const usage = response.usage
@@ -112,7 +116,9 @@ export async function generateConversationSummary(opts: {
 
   // P3 SharedContext：摘要成功 → 提取「[可复用事实]」段 → 合并写项目级 shared.md（跨会话复用）。
   // 无锚点/无事实/读写失败均不阻断压缩主流程（upsertSharedFacts 内部 catch 返回 false）。
-  await upsertSharedFacts(parseSharedFacts(response.content))
+  opts.signal?.throwIfAborted()
+  await upsertSharedFacts(parseSharedFacts(response.content), opts.signal)
+  opts.signal?.throwIfAborted()
 
   return response.content
 }

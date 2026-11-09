@@ -26,6 +26,27 @@ import { isIpcMetricsEnabled, recordIpcCall } from '../dev/ipc-metrics'
 /** 与 `ipcMain.handle` 一致的回调签名（刻意不改，见文件头） */
 export type GuardedHandler = (event: IpcMainInvokeEvent, ...args: never[]) => unknown
 
+const registeredHandlers = new Map<InvokeChannel, GuardedHandler>()
+
+const AGENT_TOOL_CHANNELS: ReadonlySet<string> = new Set([
+  'fs:read-file', 'fs:read-external-file', 'fs:write-file',
+  'db:draft-get-full', 'db:draft-get-latest', 'db:draft-get-finalized',
+  'db:draft-list', 'db:draft-get-all-chapter-numbers', 'db:draft-apply-content',
+  'db:character-get-all', 'db:character-upsert', 'db:character-create-missing',
+  'db:revision-get-full', 'db:review-get-full',
+  'db:blueprint-get', 'db:blueprint-get-all', 'db:project-core-get',
+  'project:update-config',
+  'kb:search', 'kb:search-with-scope', 'kb:list-documents', 'kb:stats', 'kb:import-text',
+  'embedding:generate', 'embedding:compare',
+  'dev:invoke', 'browser:list-tabs', 'memory:list', 'memory:read', 'mcp:call-tool',
+])
+
+export function isAgentOperationChannelAllowed(channel: string): channel is InvokeChannel {
+  if (!AGENT_TOOL_CHANNELS.has(channel)) return false
+  const policy = IPC_CHANNEL_POLICY[channel as InvokeChannel]
+  return Boolean(policy && policy.authority !== 'destructive')
+}
+
 // ===== 来源校验（S6）=====
 
 /**
@@ -113,6 +134,28 @@ function probeFrom(event: IpcMainInvokeEvent): SenderProbe {
   }
 }
 
+export function assertTrustedIpcSender(event: IpcMainInvokeEvent, channel: string): void {
+  const probe = probeFrom(event)
+  if (!isSenderTrusted(probe, {
+    trustedIds: trustedWebContentsIds,
+    devServerUrl: process.env.VITE_DEV_SERVER_URL,
+  })) {
+    logger.error('IPCGuard', `[ipc-guard] 拒绝来源不可信的调用: channel=${channel} senderId=${probe.senderId} top=${probe.isTopFrame} alive=${probe.alive} url=${probe.frameUrl ?? 'null'}`)
+    throw new Error(`[ipc-guard] sender not trusted: ${channel}`)
+  }
+}
+
+/** 保留原 event 和原返回值（同步 handler 可用于主进程事务）。 */
+export function dispatchAgentOperationIpc(event: IpcMainInvokeEvent, channel: string, args: readonly unknown[]): unknown {
+  assertTrustedIpcSender(event, channel)
+  if (!isAgentOperationChannelAllowed(channel)) {
+    throw new Error(`[ipc-guard] agent operation channel not allowed: ${channel}`)
+  }
+  const handler = registeredHandlers.get(channel)
+  if (!handler) throw new Error(`[ipc-guard] handler not registered: ${channel}`)
+  return handler(event, ...(args as never[]))
+}
+
 /**
  * 注册一个受策略约束的 IPC handler。
  *
@@ -128,15 +171,7 @@ export function guardedHandle(channel: InvokeChannel, handler: GuardedHandler): 
   ipcMain.handle(channel, async (event, ...args) => {
     // S6：来源校验。失败即拒绝（默认拒绝），并留下可诊断的日志——
     //   ⚠️ 这条日志是「真机启动后 IPC 全被拒」时唯一的排查线索，字段必须齐全。
-    const probe = probeFrom(event)
-    const trusted = isSenderTrusted(probe, {
-      trustedIds: trustedWebContentsIds,
-      devServerUrl: process.env.VITE_DEV_SERVER_URL,
-    })
-    if (!trusted) {
-      logger.error('IPCGuard', `[ipc-guard] 拒绝来源不可信的调用: channel=${channel} senderId=${probe.senderId} top=${probe.isTopFrame} alive=${probe.alive} url=${probe.frameUrl ?? 'null'}`)
-      throw new Error(`[ipc-guard] sender not trusted: ${channel}`)
-    }
+    assertTrustedIpcSender(event, channel)
     // S8 将在此前插入 assertPathArgs(channel, policy, args)
     if (!isIpcMetricsEnabled()) return handler(event, ...(args as never[]))
 
@@ -150,4 +185,5 @@ export function guardedHandle(channel: InvokeChannel, handler: GuardedHandler): 
       throw error
     }
   })
+  registeredHandlers.set(channel, handler)
 }

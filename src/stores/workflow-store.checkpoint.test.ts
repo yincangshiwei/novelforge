@@ -9,7 +9,8 @@
  * - 跨任务约束 I-1：恢复态对齐 running，断点重放能打到 completed
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { useWorkflowStore } from './workflow-store'
+import { executeRunFromIndex, useWorkflowStore, type StepExecutor } from './workflow-store'
+import { toast } from '../components/ui/Toast'
 import { registerWorkflow } from '../services/workflows/workflow-registry'
 
 const CHECKPOINT_KEY = 'vela-workflow-checkpoint'
@@ -105,6 +106,155 @@ beforeEach(() => {
 })
 
 describe('工作流历史结果持久化', () => {
+  it('普通 run 取消刷缓冲，晚到正文与 undefined 结果仍留在历史', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const next = vi.fn(async () => '不得执行')
+    const starting = useWorkflowStore.getState().startWorkflow({
+      type: 'post_process', title: '取消正文', steps: [
+        { name: '正文', description: '', executor: async (_step, _context, callbacks) => {
+          callbacks.appendText('取消前')
+          await gate
+          callbacks.appendText('晚到尾文')
+        } },
+        { name: '后续', description: '', executor: next },
+      ],
+    })
+    await vi.waitFor(() => expect(useWorkflowStore.getState().activeRuns[0]?.steps[0].status).toBe('running'))
+    const id = useWorkflowStore.getState().activeRuns[0].id
+    useWorkflowStore.getState().cancelWorkflow(id)
+    expect(useWorkflowStore.getState().history[0].steps[0].result).toBe('取消前')
+    release()
+    await starting
+    expect(useWorkflowStore.getState().history[0].steps[0].result).toBe('取消前晚到尾文')
+    expect(useWorkflowStore.getState().history[0].status).toBe('failed')
+    expect(next).not.toHaveBeenCalled()
+  })
+  it('执行器拒绝时仍保留尚未刷出的尾文', async () => {
+    await useWorkflowStore.getState().startWorkflow({
+      type: 'post_process', title: '失败正文', steps: [{ name: '正文', description: '', executor: async (_step, _context, callbacks) => {
+        callbacks.appendText('失败前尾文')
+        throw new Error('失败')
+      } }],
+    })
+    expect(useWorkflowStore.getState().history[0].steps[0].result).toBe('失败前尾文')
+  })
+  it('已取消历史 run 的晚到执行入口不启动也不改回运行', async () => {
+    const run = makeRun('late-entry', { status: 'failed', cancellationRequestedAt: '2026-11-09T00:00:00Z' })
+    useWorkflowStore.setState({ history: [run] })
+    const execute = vi.fn(async () => '不得执行')
+    await executeRunFromIndex(run, { type: 'post_process', title: '晚到', steps: [{ name: 's', description: '', executor: execute }] }, 0, {})
+    expect(execute).not.toHaveBeenCalled()
+    expect(useWorkflowStore.getState().history[0].status).toBe('failed')
+  })
+  it('Agent 未完成工作流恢复为暂停，不能自动重放', async () => {
+    h.dbMap.set('cp', JSON.stringify({ activeRuns: [makeRun('agent-interrupted', { operationId: 'agent-op', startupState: 'started' })],
+      waitingRuns: {}, savedAt: '2026-11-09T00:00:00Z', runDefs: { 'agent-interrupted': { type: 'post_process', params: {} } },
+    }))
+    await useWorkflowStore.getState().restoreCheckpoint()
+    expect(useWorkflowStore.getState().activeRuns[0].status).toBe('paused')
+    expect(h.seen).toEqual([])
+  })
+  it('退出超时保持工作流禁入，重复关闭单飞并保存晚到尾文', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const execute = vi.fn<StepExecutor>(async (_step, _context, callbacks) => {
+      callbacks.appendText('退出前')
+      await gate
+      callbacks.appendText('晚到尾文')
+    })
+    const definition = { type: 'post_process' as const, title: '合成关闭超时', steps: [{ name: 's', description: '', executor: execute }] }
+    const starting = useWorkflowStore.getState().startWorkflow(definition)
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce())
+    const cancel = vi.spyOn(useWorkflowStore.getState(), 'cancelWorkflow')
+    vi.useFakeTimers()
+    try {
+      const first = useWorkflowStore.getState().prepareForClose()
+      const second = useWorkflowStore.getState().prepareForClose()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(await first).toBe(false)
+      expect(await second).toBe(false)
+      expect(cancel).toHaveBeenCalledOnce()
+      await expect(useWorkflowStore.getState().startWorkflow(definition)).rejects.toThrow('保存退出')
+      const retry = useWorkflowStore.getState().prepareForClose()
+      release()
+      await starting
+      expect(await retry).toBe(true)
+      expect(cancel).toHaveBeenCalledOnce()
+      expect(execute).toHaveBeenCalledOnce()
+      const checkpoint = JSON.parse(h.dbMap.get('cp')!)
+      expect(checkpoint.history[0].steps[0].result).toBe('退出前晚到尾文')
+      expect(checkpoint.history[0].status).toBe('failed')
+      await vi.advanceTimersByTimeAsync(100)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      release()
+      await starting
+      await useWorkflowStore.getState().prepareForClose()
+      cancel.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('checkpoint 读取晚于关闭完成时不恢复旧工作流', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const original = h.invoke.getMockImplementation()!
+    const cp = { activeRuns: [makeRun('close-restore')], waitingRuns: {}, savedAt: '2026-11-09T00:00:00Z',
+      runDefs: { 'close-restore': { type: 'post_process', params: {} } },
+    }
+    h.invoke.mockImplementation(async (...args: unknown[]) => {
+      if (args[0] === 'db:checkpoint-load') { await gate; return { success: true, data: cp } }
+      return original(...args)
+    })
+    try {
+      const restoring = useWorkflowStore.getState().restoreCheckpoint()
+      await useWorkflowStore.getState().prepareForClose()
+      release()
+      expect(await restoring).toBeNull()
+      expect(useWorkflowStore.getState().activeRuns).toHaveLength(0)
+      expect(h.seen).toEqual([])
+    } finally { release(); h.invoke.mockImplementation(original) }
+  })
+  it('保存明确失败时flush返回false而非假成功', async () => {
+    const notify = vi.spyOn(toast, 'error').mockImplementation(() => {})
+    useWorkflowStore.setState({ history: [makeRun('failed-save', { status: 'completed' })] })
+    h.invoke.mockResolvedValueOnce({ success: false })
+    expect(await useWorkflowStore.getState().flushCheckpoint()).toBe(false)
+    expect(notify).toHaveBeenCalled()
+    expect(await useWorkflowStore.getState().flushCheckpoint()).toBe(true)
+    notify.mockRestore()
+  })
+  it('保存失败通知自身抛错也返回 false，重试仍可成功', async () => {
+    const notify = vi.spyOn(toast, 'error').mockImplementation(() => { throw new Error('通知渲染失败') })
+    useWorkflowStore.setState({ history: [makeRun('failed-notify', { status: 'completed' })] })
+    h.invoke.mockResolvedValueOnce({ success: false })
+    try {
+      expect(await useWorkflowStore.getState().flushCheckpoint()).toBe(false)
+      expect(await useWorkflowStore.getState().flushCheckpoint()).toBe(true)
+    } finally { notify.mockRestore() }
+  })
+  it('第二启动checkpoint期间取消，不可复用未执行的started回执', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const original = h.invoke.getMockImplementation()!
+    let saves = 0
+    h.invoke.mockImplementation(async (...args: unknown[]) => {
+      if (args[0] === 'db:checkpoint-save' && ++saves === 2) await gate
+      return original(...args)
+    })
+    const execute = vi.fn(async () => '不应执行')
+    const definition = { type: 'post_process' as const, title: '取消启动', steps: [{ name: 's', description: '', executor: execute }] }
+    const starting = useWorkflowStore.getState().startWorkflow(definition, false, { operationId: 'cancel-start' })
+    const rejection = expect(starting).rejects.toBeDefined()
+    await vi.waitFor(() => expect(saves).toBe(2))
+    useWorkflowStore.getState().cancelWorkflow()
+    release(); await rejection
+    expect(useWorkflowStore.getState().history[0].startupState).not.toBe('started')
+    await expect(useWorkflowStore.getState().startWorkflow(definition, false, { operationId: 'cancel-start' })).rejects.toBeDefined()
+    expect(execute).not.toHaveBeenCalled()
+    h.invoke.mockImplementation(original)
+  })
   it('完成后仅剩历史也保存，重开后正文可读且不重跑', async () => {
     await useWorkflowStore.getState().startWorkflow({
       type: 'post_process', title: '结果持久化',
@@ -123,6 +273,7 @@ describe('工作流历史结果持久化', () => {
   it('取消全部保留历史；项目重置只清内存、不清数据库', async () => {
     useWorkflowStore.setState({ activeRuns: [makeRun('cancelled')] })
     useWorkflowStore.getState().cancelWorkflow()
+    expect(await useWorkflowStore.getState().flushCheckpoint()).toBe(true)
     expect(JSON.parse(h.dbMap.get('cp')!).history[0].status).toBe('failed')
     useWorkflowStore.getState().resetProject()
     expect(useWorkflowStore.getState().history).toHaveLength(0)

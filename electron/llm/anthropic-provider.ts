@@ -6,6 +6,8 @@ import { safeErrorMessage } from '../utils/error-utils'
 import { t } from '../../src/shared/locale'
 import { proxyFetch } from '../net/proxy-fetch'
 import { fetchWithTimeout } from '../net/fetch-with-timeout'
+import { generateNative, streamNative } from './native-tools'
+import type { LLMChatMessage } from '../../src/shared/llm-tool-protocol'
 
 /**
  * Anthropic 原生 Messages API 协议（2026-09-28，照 deepseek-harness 的"小 translator + 显式责任"模式）。
@@ -189,17 +191,26 @@ function toUsage(usage: AnthropicMessagesResponse['usage']): LLMUsage | undefine
 }
 
 export class AnthropicProvider implements ILLMProvider {
-  async generate(model: ResolvedModelProfile, messages: Array<{ role: string; content: string }>, opts: LLMGenerateOptions): Promise<LLMResponse> {
+  async generate(model: ResolvedModelProfile, messages: LLMChatMessage[], opts: LLMGenerateOptions): Promise<LLMResponse> {
+    if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+    if (opts.tools?.length) return generateNative('anthropic', model, messages, opts)
     return withRetry(async () => {
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       const req = toAnthropicRequest(model, messages, opts)
       const res = await proxyFetch(req.url, {
         method: 'POST',
         headers: req.headers,
         body: JSON.stringify(req.body),
+        signal: opts.signal,
+      }).catch(error => {
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+        throw error
       })
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
 
       if (!res.ok) {
         const text = await res.text().catch(() => '')
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         const errorMsg = t('error.apiCallFailed').replace('{status}', String(res.status)).replace('{err}', () => text)
         // 可重试的状态抛 HttpError 交给 withRetry（与 openai-provider 同口径）
         if (res.status === 429 || res.status === 503 || res.status >= 500) {
@@ -209,11 +220,13 @@ export class AnthropicProvider implements ILLMProvider {
       }
 
       const data = (await res.json()) as AnthropicMessagesResponse
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       // Anthropic 的 thinking 是独立块（type:'thinking'）——只取 text 块；<think> 清理保留作保险
       const textBlock = data.content?.find((b) => b.type === 'text')
       const finalContent = (textBlock?.text ?? '').replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim()
       return { success: true, content: finalContent, usage: toUsage(data.usage) }
-    }).catch((error) => {
+    }, { signal: opts.signal }).catch((error) => {
+      if (opts.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw new DOMException('Operation cancelled', 'AbortError')
       if (error instanceof HttpError) {
         let errorMsg = error.message
         if (error.status === 429) {
@@ -229,7 +242,8 @@ export class AnthropicProvider implements ILLMProvider {
     })
   }
 
-  async generateStream(model: ResolvedModelProfile, messages: Array<{ role: string; content: string }>, opts: LLMStreamOptions): Promise<void> {
+  async generateStream(model: ResolvedModelProfile, messages: LLMChatMessage[], opts: LLMStreamOptions): Promise<void> {
+    if (opts.tools?.length) return streamNative('anthropic', model, messages, opts)
     // 已输出内容标记：中途断流不得重试（重试会重复推送已输出前缀）
     let emittedAny = false
     await withStreamRetry(async () => {
@@ -239,10 +253,15 @@ export class AnthropicProvider implements ILLMProvider {
         headers: req.headers,
         body: JSON.stringify(req.body),
         signal: opts.signal,
+      }).catch(error => {
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+        throw error
       })
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
 
       if (!res.ok) {
         const text = await res.text().catch(() => '')
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         const errorMsg = t('error.apiCallFailed').replace('{status}', String(res.status)).replace('{err}', () => text)
         if (res.status === 429 || res.status === 503 || res.status >= 500) {
           throw new HttpError(res.status, errorMsg)
@@ -282,13 +301,15 @@ export class AnthropicProvider implements ILLMProvider {
 
       for (;;) {
         const { done, value } = await reader.read()
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         if (done) break
         parser(decoder.decode(value, { stream: true }))
       }
 
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       if (streamErrored) return
       opts.onDone(fullText.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim(), lastUsage)
-    }, { canRetry: () => !emittedAny }).catch((error) => {
+    }, { signal: opts.signal, canRetry: () => !emittedAny }).catch((error) => {
       if ((error as Error).name === 'AbortError') {
         opts.onError(t('error.generationCancelled'))
       } else if (error instanceof HttpError) {

@@ -24,17 +24,74 @@ export function fetchWithTimeout(
   timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
 ): Promise<Response> {
   const controller = new AbortController()
+  const signal = init.signal
+    ? AbortSignal.any([init.signal, controller.signal])
+    : controller.signal
   let timer: ReturnType<typeof setTimeout> | undefined
+  const request = withAbortSignal(() => proxyFetch(url, { ...init, signal }), signal)
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      controller.abort()
-      reject(new DOMException('This operation was aborted', 'AbortError'))
+      const error = new DOMException(`Request timed out after ${timeoutMs}ms`, 'TimeoutError')
+      reject(error)
+      controller.abort(error)
     }, timeoutMs)
   })
-  return Promise.race([
-    proxyFetch(url, { ...init, signal: controller.signal }),
-    timeoutPromise,
-  ]).finally(() => {
-    if (timer) clearTimeout(timer)
+  return Promise.race([request, timeoutPromise]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
+}
+
+export function throwIfAborted(signal?: AbortSignal | null): void {
+  if (signal?.aborted) throw signal.reason ?? new DOMException('This operation was aborted', 'AbortError')
+}
+
+/** 即使底层请求/读体未响应 abort，也立即结束等待，并清理订阅。 */
+export function withAbortSignal<T>(
+  work: () => Promise<T>,
+  signal?: AbortSignal | null,
+  onAbort?: () => void,
+): Promise<T> {
+  try {
+    throwIfAborted(signal)
+  } catch (error) {
+    onAbort?.()
+    return Promise.reject(error)
+  }
+  if (!signal) return work()
+  let abort: () => void
+  return new Promise<T>((resolve, reject) => {
+    abort = (): void => {
+      onAbort?.()
+      reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    try {
+      throwIfAborted(signal)
+      work().then(resolve, reject)
+    } catch (error) {
+      reject(error)
+    }
+  }).finally(() => signal.removeEventListener('abort', abort))
+}
+
+export function withDeadline<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController()
+  const signal = externalSignal ? AbortSignal.any([externalSignal, controller.signal]) : controller.signal
+  const timer = setTimeout(() => controller.abort(new DOMException(`Request lifecycle timed out after ${timeoutMs}ms`, 'TimeoutError')), timeoutMs)
+  return withAbortSignal(() => work(signal), signal).finally(() => clearTimeout(timer))
+}
+
+export function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return withAbortSignal(() => new Promise<void>(resolve => {
+    timer = setTimeout(resolve, ms)
+  }), signal, () => {
+    if (timer !== undefined) clearTimeout(timer)
+  }).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
   })
 }

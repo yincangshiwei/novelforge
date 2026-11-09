@@ -1,4 +1,5 @@
 import { ModelProfile, LLMModelCandidate } from '../../src/shared/ipc-channels'
+import type { LLMChatMessage, LLMStepResult, LLMToolDefinition, LLMToolChoice } from '../../src/shared/llm-tool-protocol'
 
 /**
  * **已解析密钥**的模型条目（v3 §3.2）—— provider 侧的入参类型。
@@ -13,12 +14,15 @@ import { ModelProfile, LLMModelCandidate } from '../../src/shared/ipc-channels'
 export type ResolvedModelProfile = ModelProfile & { apiKey: string }
 
 export interface LLMGenerateOptions {
+  signal?: AbortSignal
   temperature: number
   maxTokens: number
   responseFormat?: { type: string }
   thinking?: boolean
   /** Prompt 缓存键（相同键的请求共享静态前缀缓存，节省 50% 输入费用） */
   cacheKey?: string
+  tools?: LLMToolDefinition[]
+  toolChoice?: LLMToolChoice
 }
 
 /** LLM 用量（含真实缓存命中 token：OpenAI prompt_tokens_details.cached_tokens / DeepSeek prompt_cache_hit_tokens） */
@@ -33,7 +37,7 @@ export interface LLMUsage {
 export interface LLMStreamOptions extends LLMGenerateOptions {
   signal: AbortSignal
   onChunk: (chunk: string) => void
-  onDone: (fullText: string, usage?: LLMUsage) => void
+  onDone: (fullText: string, usage?: LLMUsage, step?: LLMStepResult) => void
   onError: (error: string) => void
   /** 实时 Token 用量回调（流式传输中可用时触发） */
   onTokenUsage?: (usage: LLMUsage) => void
@@ -43,6 +47,7 @@ export interface LLMResponse {
   success: boolean
   content: string
   usage?: LLMUsage
+  step?: LLMStepResult
   error?: string
 }
 
@@ -50,14 +55,14 @@ export interface ILLMProvider {
   /** 非流式生成 */
   generate(
     model: ResolvedModelProfile,
-    messages: Array<{ role: string; content: string }>,
+    messages: LLMChatMessage[],
     opts: LLMGenerateOptions
   ): Promise<LLMResponse>
 
   /** 流式生成 */
   generateStream(
     model: ResolvedModelProfile,
-    messages: Array<{ role: string; content: string }>,
+    messages: LLMChatMessage[],
     opts: LLMStreamOptions
   ): Promise<void>
 

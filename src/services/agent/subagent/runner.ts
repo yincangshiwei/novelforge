@@ -7,6 +7,7 @@
  * 「审批路由」两处被 agent-store 显式接线。
  */
 import { t } from '../../../shared/locale'
+import { sanitizeToolCalls } from '../conversation-recovery'
 import { runAgentLoop, type AgentEngineCallbacks, type LLMGenerateFn } from '../agent-engine'
 import { estimateTokens, truncateToTokenBudget } from '../token-budget'
 import { stripDsmlMarkup } from '../dsml-tool-calls'
@@ -23,9 +24,12 @@ export interface SubAgentDeps {
   /** 系统提示词装配（注入以便单测；真实实现 = buildSubAgentPrompt） */
   buildPrompt: (task: SubAgentTask) => Promise<string>
   /** 写操作审批（注入以便单测；真实实现 = agent-store 的父方审批卡） */
-  confirm: (toolCall: ToolCallInfo) => Promise<boolean>
+  confirm: (toolCall: ToolCallInfo, signal?: AbortSignal) => Promise<boolean>
   /** 父的取消信号（与父的 AbortController 绑定） */
   signal?: AbortSignal
+  executionScope?: string
+  conversationId?: string
+  beforeExecute?: (session: SubAgentSession) => Promise<boolean>
   /** 转录/状态回写（父端 50ms 缓冲 flush） */
   onUpdate?: (session: SubAgentSession) => void
   /**
@@ -100,21 +104,58 @@ export async function runSubAgent(task: SubAgentTask, deps: SubAgentDeps): Promi
 
   const controller = new AbortController()
   let timedOut = false
+  let finalized = false
+  const active = (): boolean => !finalized && !controller.signal.aborted
   // 真实定时器是**兜底**：LLM 调用真的挂住时用它中断；正常路径由「跑完后的墙钟比对」判定
   const timer = setTimeout(() => { timedOut = true; controller.abort() }, SUBAGENT_MAX_MS)
   const onParentAbort = (): void => controller.abort()
   deps.signal?.addEventListener('abort', onParentAbort, { once: true })
+  if (deps.signal?.aborted) controller.abort()
+
+  const abortable = async <T>(operation: () => Promise<T>): Promise<T> => {
+    if (controller.signal.aborted) throw new Error('Subagent aborted')
+    let onAbort!: () => void
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new Error('Subagent aborted'))
+      controller.signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => {
+          if (controller.signal.aborted) throw new Error('Subagent aborted')
+          return operation()
+        }),
+        aborted,
+      ])
+    } finally {
+      controller.signal.removeEventListener('abort', onAbort)
+    }
+  }
+  const generate: LLMGenerateFn = (messages, modelId, onChunk, onRequestId) => abortable(() =>
+    deps.generate(messages, modelId,
+      chunk => { if (active()) onChunk?.(chunk) },
+      requestId => { if (active()) onRequestId?.(requestId) }, controller.signal),
+  )
   emit()
 
   const callbacks: AgentEngineCallbacks = {
     onTextChunk: (chunk) => {
+      if (!active()) return
       const cleaned = stripToolTags(chunk).trim()
       if (cleaned) { appendText(session, cleaned); emit() }
     },
-    onToolCallStart: (tc) => { upsertToolCall(session, tc); emit() },
-    onToolCallComplete: (tc) => { upsertToolCall(session, tc); emit() },
-    onToolCallConfirmRequired: (tc) => deps.confirm(tc),
-    onDone: (fullText, toolCalls, artifacts) => {
+    onToolCallStart: (tc) => { if (active()) { upsertToolCall(session, { ...tc }); emit() } },
+    onBeforeToolExecution: deps.beforeExecute ? () => deps.beforeExecute!(session) : undefined,
+    onToolCallComplete: (tc, artifacts) => {
+      if (finalized) return
+      upsertToolCall(session, { ...tc })
+      if (artifacts?.length) session.artifacts.push(...artifacts)
+      emit()
+    },
+    onToolCallConfirmRequired: (tc) => abortable(() => deps.confirm(tc, controller.signal)),
+    onDone: (fullText, toolCalls, artifacts, outcome) => {
+      if (!active()) return
+      if (outcome && outcome.status !== 'completed') session.error = `任务未完成：${outcome.status}`
       // 用清洗后的全文**重写**最后一条 assistant 消息（跨 chunk 切开的标签只有这里能清干净）；
       // result 同样取清洗后文本 —— 父端 formatSubAgentResult 会把 result 灌回父上下文，DSML 原文不得外溢
       const cleanedFull = stripToolTags(fullText)
@@ -125,8 +166,8 @@ export async function runSubAgent(task: SubAgentTask, deps: SubAgentDeps): Promi
       if (last?.role === 'assistant') last.content = cleanedFull
       else if (cleanedFull) session.messages.push({ id: `sa-${session.messages.length}`, role: 'assistant', content: cleanedFull, createdAt: Date.now() })
     },
-    onError: (error) => { session.error = error },
-    onProgress: (p) => deps.onProgress?.(p),
+    onError: (error) => { if (active()) session.error = error },
+    onProgress: (p) => { if (active()) deps.onProgress?.(p) },
   }
 
   /** 终态判定：超时 → failed（spec §3.9）；父取消 → cancelled；引擎报错 → failed；否则 completed */
@@ -146,22 +187,24 @@ export async function runSubAgent(task: SubAgentTask, deps: SubAgentDeps): Promi
   }
 
   try {
-    const systemPrompt = await deps.buildPrompt(task)
+    const systemPrompt = await abortable(() => deps.buildPrompt(task))
     await runAgentLoop(
-      systemPrompt, [], task.prompt, task.modelId, deps.generate, callbacks, controller.signal,
+      systemPrompt, [], task.prompt, task.modelId, generate, callbacks, controller.signal,
       { allowedTools: task.allowedTools },
-      { allowedTools: task.allowedTools },
+      { allowedTools: task.allowedTools, executionScope: deps.executionScope, conversationId: deps.conversationId },
     )
     settle()
   } catch (e) {
     session.error = String(e)
     settle()
   } finally {
+    finalized = true
     clearTimeout(timer)
     deps.signal?.removeEventListener('abort', onParentAbort)
     session.endedAt = now()
+    session.toolCalls = sanitizeToolCalls(session.toolCalls)
     session.messages = session.messages
-      .map((m): AgentMessage => ({ ...m, streaming: false }))
+      .map((m): AgentMessage => ({ ...m, streaming: false, toolCalls: sanitizeToolCalls(m.toolCalls) }))
       .slice(-MAX_SUBAGENT_MESSAGES)
     emit()
   }

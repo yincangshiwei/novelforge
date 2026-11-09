@@ -33,7 +33,7 @@ export class OpenAICompatibleStreamAdapter implements InternalStreamAdapter {
   private parser: ReturnType<typeof createParser>
   private started = false
   private finished = false
-  private finishReason: InternalStreamFinishReason = 'stop'
+  private finishReason: InternalStreamFinishReason = 'unknown'
   private usage: LLMUsage | undefined
   private readonly tools = new Map<number, ToolBuffer>()
   private warnedUnknownShape = false
@@ -94,6 +94,7 @@ export class OpenAICompatibleStreamAdapter implements InternalStreamAdapter {
           const fn = tc.function as { name?: string; arguments?: string } | undefined
           const id = String(tc.id ?? this.tools.get(index)?.id ?? `call_${index}`)
           const prev = this.tools.get(index) ?? { id, name: '', args: '' }
+          if (tc.id) prev.id = String(tc.id)
           if (fn?.name) prev.name = fn.name
           const argsDelta = fn?.arguments ?? ''
           prev.args += argsDelta
@@ -105,8 +106,8 @@ export class OpenAICompatibleStreamAdapter implements InternalStreamAdapter {
 
     const finish = choice.finish_reason
     if (typeof finish === 'string') {
-      this.finishReason = this.tools.size > 0 ? 'tool_use' : finish === 'length' ? 'length' : 'stop'
-      this.completeToolsAndFinish()
+      this.finishReason = finish === 'length' ? 'length'
+        : ['tool_calls', 'tool_use'].includes(finish) ? 'tool_use' : finish === 'stop' ? 'stop' : 'error'
     }
   }
 
@@ -115,10 +116,20 @@ export class OpenAICompatibleStreamAdapter implements InternalStreamAdapter {
   private completeToolsAndFinish(): void {
     if (this.finished) return
     this.finished = true
-    for (const tool of this.tools.values()) {
-      let args: unknown = {}
-      try { args = tool.args ? JSON.parse(tool.args) : {} } catch { args = {} }
-      this.events.push({ type: 'tool_call_complete', id: tool.id, name: tool.name, args })
+    if (this.finishReason === 'stop' || this.finishReason === 'tool_use') {
+      const completed: InternalStreamEvent[] = []
+      try {
+        if (this.tools.size > 32) throw new Error('单步工具调用超过上限')
+        for (const tool of this.tools.values()) {
+          const args: unknown = tool.args ? JSON.parse(tool.args) : {}
+          if (!tool.name || !args || typeof args !== 'object' || Array.isArray(args)) throw new Error('工具参数不是有效对象')
+          completed.push({ type: 'tool_call_complete', id: tool.id, name: tool.name, args })
+        }
+        this.events.push(...completed)
+      } catch {
+        this.finishReason = 'error'
+        this.events.push({ type: 'error', message: '工具调用参数损坏，未执行任何调用', retryable: false })
+      }
     }
     this.events.push({ type: 'finish', reason: this.finishReason, usage: this.usage })
   }

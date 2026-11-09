@@ -58,6 +58,25 @@ beforeEach(() => {
   })
 })
 
+describe('write_file 取消与核验', () => {
+  it('预取消不调用任何 IPC', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const context = { signal: controller.signal, turnId: 't', callId: 'write-cancel', step: 1, operationId: 'write-cancel', scope: projectPath }
+    expect(await writeFileTool.execute({ file_path: 'note.md', content: '新内容' }, context)).toMatchObject({ executionState: 'not_committed' })
+    expect(mockInvoke).not.toHaveBeenCalled()
+  })
+  it('reconcile 只读读取全文，一致才确认，不一致仍未知', async () => {
+    const context = { signal: new AbortController().signal, turnId: 't', callId: 'write-check', step: 1, operationId: 'write-check', scope: projectPath }
+    mockInvoke.mockResolvedValue({ state: 'committed', value: { success: true, content: '新内容' } } as never)
+    expect(await writeFileTool.reconcile!({ file_path: 'note.md', content: '新内容' }, context)).toMatchObject({ executionState: 'committed' })
+    expect(mockInvoke).toHaveBeenCalledWith('agent:operation-invoke', expect.objectContaining({ channel: 'fs:read-file' }))
+    mockInvoke.mockResolvedValue({ state: 'committed', value: { success: true, content: '前缀新内容后缀' } } as never)
+    expect(await writeFileTool.reconcile!({ file_path: 'note.md', content: '新内容' }, context)).toBeUndefined()
+    expect(writeCalls).toHaveLength(0)
+  })
+})
+
 describe('write_file 工具契约', () => {
   it('注册形态：行动工具（需确认、非只读、参数必填）', () => {
     expect(writeFileTool.name).toBe('write_file')

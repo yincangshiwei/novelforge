@@ -3,7 +3,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 import { isProtectedRelativePath, validatePath } from './safe-path'
 import { clearReadState } from './read-file.tool'
@@ -32,7 +32,32 @@ export const writeFileTool = buildAgentTool({
   },
   requiresConfirmation: true,
   isReadOnly: false,
-  execute: async (args) => {
+  reconcile: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    const project = useProjectStore.getState().currentProject
+    if (!project || context.signal.aborted || (context.scope && context.scope !== project.path) || typeof args.content !== 'string' || typeof args.file_path !== 'string') return undefined
+    const path = resolveAgentFilePath(args.file_path)
+    let actual: string | undefined
+    let target = path
+    if (path.startsWith(VELA.DRAFT)) {
+      const rawId = path.slice(VELA.DRAFT.length)
+      if (!/^\d+$/.test(rawId)) return undefined
+      actual = (await toolIpc.invoke('db:draft-get-full', Number(rawId)))?.content
+    } else {
+      if (isVelaProtocol(path)) return undefined
+      const check = validatePath(project.path, path)
+      if (!check.valid || isProtectedRelativePath(check.relativePath)) return undefined
+      target = check.fullPath
+      const result = await toolIpc.invoke('fs:read-file', target)
+      if (!result.success) return undefined
+      actual = result.content
+    }
+    if (context.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path || actual !== args.content) return undefined
+    return { success: true, executionState: 'committed', content: '已只读核验实际内容与原写入一致；不重复写入。', persistence: { target, verified: true, projectPath: project.path } }
+  },
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const filePath = args.file_path as string
     const content = args.content as string
 
@@ -60,10 +85,11 @@ export const writeFileTool = buildAgentTool({
       const draftId = Number(rawId)
       const openTab = useEditorStore.getState().tabs.find(x => x.filePath === resolvedPath || x.id === resolvedPath)
       if (openTab?.dirty) return { success: false, content: '', error: t('tool.draftDirty') }
-      const full = await ipc.invoke('db:draft-get-full', draftId)
+      const full = await toolIpc.invoke('db:draft-get-full', draftId)
+      if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path || (context?.scope && context.scope !== project.path)) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消或项目已切换，未提交' }
       if (!full) return { success: false, content: '', error: t('tool.draftNotFound') }
       if (full.status === 'finalized') return { success: false, content: '', error: t('tool.draftReadonly') }
-      const res = await ipc.invoke('db:draft-apply-content', {
+      const res = await toolIpc.invoke('db:draft-apply-content', {
         draftId,
         expectedHash: full.contentHash,
         expectedUpdatedAt: full.updatedAt,
@@ -76,13 +102,16 @@ export const writeFileTool = buildAgentTool({
       }
       clearReadState(filePath)
       const tab = useEditorStore.getState().tabs.find(x => x.filePath === filePath || x.id === filePath)
-      if (tab) {
-        if (tab.inlineSession) useEditorStore.getState().endInlineSession(tab.id)
-        useEditorStore.getState().markTabSaved(tab.id)
-        useEditorStore.getState().syncTabContent(tab.id, content)
+      if (!context?.signal.aborted && useProjectStore.getState().currentProject?.path === project.path && tab) {
+        try {
+          if (tab.inlineSession) useEditorStore.getState().endInlineSession(tab.id)
+          useEditorStore.getState().markTabSaved(tab.id)
+          useEditorStore.getState().syncTabContent(tab.id, content)
+        } catch (error) { console.warn('[write_file] 已提交，编辑器刷新失败', error) }
       }
       return {
         success: true,
+        executionState: 'committed',
         content: t('tool.fileWritten').replace('{path}', filePath).replace('{length}', String(content.length)),
         artifacts: [{ type: 'file_modified', path: resolvedPath, name: filePath }],
       }
@@ -102,7 +131,8 @@ export const writeFileTool = buildAgentTool({
       return { success: false, content: '', error: t('tool.writeProtectedPath') }
     }
 
-    const result = await ipc.invoke('fs:write-file', pathCheck.fullPath, content)
+    if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path || (context?.scope && context.scope !== project.path)) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消或项目已切换，未提交' }
+    const result = await toolIpc.invoke('fs:write-file', pathCheck.fullPath, content)
     if (!result.success) {
       return { success: false, content: '', error: result.error ?? t('tool.writeFileFailed') }
     }
@@ -113,6 +143,7 @@ export const writeFileTool = buildAgentTool({
 
     return {
       success: true,
+      executionState: 'committed',
       content: t('tool.fileWritten').replace('{path}', filePath).replace('{length}', String(content.length)),
       artifacts: [{ type: 'file_modified', path: pathCheck.fullPath, name: filePath }],
     }

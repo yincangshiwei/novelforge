@@ -11,6 +11,7 @@ import { installGlobalErrorHandlers, logger, detectLogEnvironment, LogEnvironmen
 import { migrateLegacyDirs } from './utils/config-utils'
 import { runCredentialMigration } from './credentials/migrate'
 import { safeErrorMessage } from './utils/error-utils'
+import { CLOSE_HANDSHAKE_TIMEOUT_MS, waitForCloseResult } from '../src/shared/close-deadline'
 
 import path from 'node:path'
 import { exec } from 'node:child_process'
@@ -238,31 +239,35 @@ function createWindow() {
     }
   })
 
-  // 关闭窗口前检查未保存内容
+  let checkingClose = false
+  let allowClose = false
   win.on('close', async (e) => {
+    if (allowClose) return
+    e.preventDefault()
+    if (checkingClose) return
+    checkingClose = true
     try {
-      // 查询渲染进程是否有脏 tab
       const hasDirty = await win?.webContents.executeJavaScript(
         'window.__vela_hasDirtyTabs ? window.__vela_hasDirtyTabs() : false',
-      ).catch(() => false)
-
+      )
       if (hasDirty) {
-        e.preventDefault()
         const { response } = await dialog.showMessageBox(win!, {
-          type: 'warning',
-          title: t('dialog.unsavedTitle'),
-          message: t('dialog.unsavedMsg'),
+          type: 'warning', title: t('dialog.unsavedTitle'), message: t('dialog.unsavedMsg'),
           buttons: [t('dialog.buttons.cancel'), t('dialog.buttons.discardExit')],
-          defaultId: 0,
-          cancelId: 0,
+          defaultId: 0, cancelId: 0,
         })
-        if (response === 1) {
-          // 用户确认退出 — 强制关闭
-          win?.destroy()
-        }
+        if (response !== 1) return
       }
-    } catch {
-      // IPC 不可用时正常关闭
+      const saved = await waitForCloseResult(win!.webContents.executeJavaScript(
+        'window.__vela_flushAgentArchives ? window.__vela_flushAgentArchives() : false',
+      ), CLOSE_HANDSHAKE_TIMEOUT_MS)
+      if (!saved) throw new Error('任务收尾或执行记录保存尚未确认完成（可能超时）。窗口已保留，请等待后重试关闭，勿强制退出。')
+      allowClose = true
+      win?.close()
+    } catch (error) {
+      dialog.showErrorBox('执行记录保存未完成', String(error))
+    } finally {
+      checkingClose = false
     }
   })
 
@@ -311,7 +316,12 @@ app.on('activate', () => {
 })
 
 // 应用即将退出时清理
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
+  if (win && !win.isDestroyed()) {
+    e.preventDefault()
+    win.close()
+    return
+  }
   closeProjectDatabase()
   logger.info('Main', t('log.main.appQuitting'))
   logger.close()

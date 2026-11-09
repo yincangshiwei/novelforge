@@ -24,6 +24,25 @@ beforeEach(() => {
   })
 })
 
+describe('角色卡取消与核验', () => {
+  it('预取消不得查询或提交角色卡', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const context = { signal: controller.signal, turnId: 't', callId: 'char-cancel', step: 1, operationId: 'char-cancel' }
+    expect(await manageCharacterTool.execute({ action: 'update', name: '城主', fields_json: '{"tier":2}' }, context)).toMatchObject({ executionState: 'not_committed' })
+    expect(invoke).not.toHaveBeenCalled()
+  })
+  it('角色实际字段全部一致才确认，不一致不重写', async () => {
+    const context = { signal: new AbortController().signal, turnId: 't', callId: 'char-check', step: 1, operationId: 'char-check' }
+    const args = { action: 'update', name: '城主', fields_json: '{"tier":2,"notes":"实际记录"}' }
+    invoke.mockResolvedValue({ state: 'committed', value: [{ ...oldCard, tier: 2, notes: '其他记录' }] } as never)
+    expect(await manageCharacterTool.reconcile!(args, context)).toBeUndefined()
+    invoke.mockResolvedValue({ state: 'committed', value: [{ ...oldCard, tier: 2, notes: '实际记录' }] } as never)
+    expect(await manageCharacterTool.reconcile!(args, context)).toMatchObject({ executionState: 'committed' })
+    expect(invoke).toHaveBeenCalledWith('agent:operation-invoke', expect.objectContaining({ channel: 'db:character-get-all' }))
+  })
+})
+
 describe('Agent 人物与创作要求接口', () => {
   it('修改别名匹配人物的等级，不清空其他档案', async () => {
     const result = await manageCharacterTool.execute({ action: 'update', name: '城主', fields_json: '{"tier":2}' })

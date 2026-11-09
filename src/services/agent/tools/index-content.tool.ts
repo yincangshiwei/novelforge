@@ -6,7 +6,8 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
+import { ToolExecutionInterrupted } from '../tool-execution'
 import { useProjectStore } from '../../../stores/project-store'
 
 export const indexContentTool = buildAgentTool({
@@ -32,7 +33,9 @@ export const indexContentTool = buildAgentTool({
     required: ['content', 'file_name'],
   },
   requiresConfirmation: true,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const content = args.content as string
     const fileName = args.file_name as string
 
@@ -50,13 +53,16 @@ export const indexContentTool = buildAgentTool({
       return { success: false, content: '', error: t('tool.embedTextTooLong').replace('{limit}', String(MAX_INDEX_LENGTH)) }
     }
 
+    let executionState: 'not_committed' | 'unknown' | 'committed' = 'not_committed'
     try {
       const project = useProjectStore.getState().currentProject
       if (!project) {
         return { success: false, content: '', error: t('error.noProject') }
       }
 
-      const result = await ipc.invoke(
+      if (context?.scope && context.scope !== project.path) return { success: false, executionState: 'not_committed', content: '', error: '项目已切换，未提交' }
+      executionState = 'unknown'
+      const result = await toolIpc.invoke(
         'kb:import-text',
         content,
         fileName,
@@ -71,6 +77,7 @@ export const indexContentTool = buildAgentTool({
         }
       }
 
+      executionState = 'committed'
       const chunkCount = result.chunkCount || 0
       const chapterInfo = args.chapter_number
         ? t('tool.indexChapterInfo').replace('{chapter}', String(args.chapter_number))
@@ -78,6 +85,7 @@ export const indexContentTool = buildAgentTool({
 
       return {
         success: true,
+        executionState: 'committed',
         content:
           t('tool.indexSuccessHeader') +
           t('tool.indexDocName').replace('{name}', fileName) +
@@ -88,9 +96,11 @@ export const indexContentTool = buildAgentTool({
           t('tool.indexRetrievable'),
       }
     } catch (error) {
+      if (error instanceof ToolExecutionInterrupted) throw error
       return {
         success: false,
         content: '',
+        executionState,
         error: t('tool.indexException').replace('{error}', String(error)),
       }
     }

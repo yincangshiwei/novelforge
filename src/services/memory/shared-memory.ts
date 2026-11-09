@@ -68,12 +68,14 @@ export function parseSharedFile(raw: string): string[] {
  * 写回重建 frontmatter（丢弃 status——同 upsert 语义：合并后不再视为 stale）。
  * 失败降级返回 false——不阻断压缩主流程（调用方 ccr-summary）。
  */
-export async function upsertSharedFacts(facts: string[]): Promise<boolean> {
+export async function upsertSharedFacts(facts: string[], signal?: AbortSignal): Promise<boolean> {
   try {
+    signal?.throwIfAborted()
     // 无新事实 → 直接短路：不触发 memory:read/write（避免无关写回使 shared.md mtime 更新、
     // 重建 frontmatter 丢弃 status、规范化重写丢弃非 `- ` 行内容）
     if (facts.length === 0) return true
     const raw = await ipc.invoke('memory:read', SHARED_MEMORY_FILE) as string | null
+    signal?.throwIfAborted()
     const merged = mergeSharedFacts(parseSharedFile(raw ?? ''), facts)
     if (merged.length === 0) return true // 无可写事实：不写入（幂等）
     const res = await ipc.invoke('memory:write', SHARED_MEMORY_FILE, buildSharedFile(merged)) as { success: boolean } | null

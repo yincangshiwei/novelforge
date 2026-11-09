@@ -2,7 +2,7 @@ import { BrowserWindow } from 'electron'
 import { t } from '../../src/shared/locale'
 import { readJsonFile, writeJsonFile, MODELS_CONFIG_PATH, GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG, readProvidersFile, writeProvidersFile } from '../utils/config-utils'
 import type { ProvidersFileState } from '../utils/config-utils'
-import { ModelProfile, GlobalConfig, ProviderAccount, ProviderModelQuery } from '../../src/shared/ipc-channels'
+import { ModelProfile, GlobalConfig, ProviderAccount, ProviderModelQuery, type LLMRequest } from '../../src/shared/ipc-channels'
 import { MAX_TOKENS_CAP, clampMaxTokens } from '../../src/shared/llm-constants'
 import { syncAccountModels, isModelOfAccount, type ModelOverrides } from '../../src/shared/provider-accounts'
 import { apiKeyFailure, deriveCredentialRef } from '../../src/shared/credential-rules'
@@ -23,6 +23,27 @@ import { guardedHandle } from '../security/ipc-guard'
 import { refreshOutboundProxy } from '../net/proxy-fetch'
 
 const activeStreams = new Map<string, AbortController>()
+const cancelledRequests = new Map<string, number>()
+const CANCEL_TOMBSTONE_TTL_MS = 60_000
+const MAX_CANCEL_TOMBSTONES = 1000
+
+function consumeCancellation(requestId: string): boolean {
+  const cancelledAt = cancelledRequests.get(requestId)
+  cancelledRequests.delete(requestId)
+  return cancelledAt !== undefined && Date.now() - cancelledAt < CANCEL_TOMBSTONE_TTL_MS
+}
+
+function rememberCancellation(requestId: string): void {
+  const now = Date.now()
+  for (const [id, cancelledAt] of cancelledRequests) {
+    if (now - cancelledAt >= CANCEL_TOMBSTONE_TTL_MS) cancelledRequests.delete(id)
+  }
+  cancelledRequests.delete(requestId)
+  cancelledRequests.set(requestId, now)
+  if (cancelledRequests.size > MAX_CANCEL_TOMBSTONES) {
+    cancelledRequests.delete(cancelledRequests.keys().next().value!)
+  }
+}
 
 /** 请求未显式给温度时的兜底（模型条目上已无 temperature，正常路径由渲染层注入全局思考等级） */
 const DEFAULT_REQUEST_TEMPERATURE = 0.7
@@ -256,33 +277,49 @@ export function registerLLMController() {
   // 不能只依赖 applyProxyConfig 那几处「LLM 操作前」的调用点
   applyProxyConfig()
 
-  guardedHandle('llm:generate', async (_event, request: { modelId: string; messages: Array<{ role: string; content: string }>; temperature?: number; maxTokens?: number; responseFormat?: { type: string }; thinking?: boolean; priority?: number }) => {
+  guardedHandle('llm:generate', async (_event, request: LLMRequest) => {
+    const abortController = new AbortController()
+    const requestId = request.requestId
+    const cancelled = () => ({ success: false, content: '', error: t('error.requestCancelled') })
+    if (requestId) {
+      if (consumeCancellation(requestId)) return cancelled()
+      if (activeStreams.has(requestId)) return { success: false, content: '', error: 'Duplicate requestId' }
+      activeStreams.set(requestId, abortController)
+    }
     return llmConcurrencyController.execute(
       async () => {
+        if (abortController.signal.aborted) return cancelled()
         applyProxyConfig()
         const model = getModelConfig(request.modelId)
         if (!model) return { success: false, content: '', error: t('error.modelConfigNotFound') }
 
         const provider = LLMFactory.getProvider(model)
-        return await provider.generate(model, request.messages, {
+        const result = await provider.generate(model, request.messages, {
           temperature: request.temperature ?? DEFAULT_REQUEST_TEMPERATURE,
           maxTokens: resolveMaxTokens(request.maxTokens, model),
           responseFormat: request.responseFormat,
           thinking: request.thinking,
+          tools: request.tools,
+          toolChoice: request.toolChoice,
+          signal: abortController.signal,
         })
+        return abortController.signal.aborted ? cancelled() : result
       },
       // timeoutMs: 0 —— 与流式一致：长输出（预设 maxTokens 高达 131072）可超 120s；
       // Promise.race 超时不取消底层 fn，超时后请求仍会真实调用 API 继续扣费（历史事故：
       // 超时报错 + 底层继续执行 + 槽位提前释放 → 并发上限失效 + 双倍计费）
-      { priority: request.priority ?? 10, timeoutMs: 0 },
-    ).catch((error) => ({
+      { priority: request.priority ?? 10, timeoutMs: 0, signal: abortController.signal },
+    ).catch((error) => abortController.signal.aborted ? cancelled() : ({
       success: false,
       content: '',
       error: error instanceof Error ? error.message : safeErrorMessage(error),
-    }))
+    })).finally(() => {
+      if (requestId && activeStreams.get(requestId) === abortController) activeStreams.delete(requestId)
+    })
   })
 
-  guardedHandle('llm:generate-stream', async (event, requestId: string, request: { modelId: string; messages: Array<{ role: string; content: string }>; temperature?: number; maxTokens?: number; responseFormat?: { type: string }; thinking?: boolean; priority?: number }) => {
+  guardedHandle('llm:generate-stream', async (event, requestId: string, request: LLMRequest) => {
+    if (consumeCancellation(requestId) || activeStreams.has(requestId)) return { requestId, started: false }
     applyProxyConfig()
     const model = getModelConfig(request.modelId)
     if (!model) return { requestId, started: false }
@@ -313,15 +350,23 @@ export function registerLLMController() {
             maxTokens: resolveMaxTokens(request.maxTokens, model),
             responseFormat: request.responseFormat,
             thinking: request.thinking,
+            tools: request.tools,
+            toolChoice: request.toolChoice,
             signal: abortController.signal,
             onChunk: (chunk: string) => {
               if (!abortController.signal.aborted) {
                 win?.webContents.send('llm:stream-chunk', { requestId, chunk })
               }
             },
-            onDone: (fullText: string, usage?: { promptTokens: number; completionTokens: number; totalTokens: number; cachedTokens?: number }) => {
+            onDone: (fullText: string, usage?: { promptTokens: number; completionTokens: number; totalTokens: number; cachedTokens?: number }, step?: import('../../src/shared/llm-tool-protocol').LLMStepResult) => {
+              if (abortController.signal.aborted) {
+                win?.webContents.send('llm:stream-error', { requestId, error: t('error.requestCancelled') })
+                activeStreams.delete(requestId)
+                resolve()
+                return
+              }
               // usage 含真实缓存命中 token（provider 已解析），透传给渲染进程供费用统计
-              win?.webContents.send('llm:stream-done', { requestId, fullText, usage })
+              win?.webContents.send('llm:stream-done', { requestId, fullText, usage, step })
               activeStreams.delete(requestId)
               resolve()
             },
@@ -330,8 +375,14 @@ export function registerLLMController() {
               activeStreams.delete(requestId)
               reject(new Error(error))
             },
-          }).catch(reject)
-        }).catch(() => { /* 流式错误已通过 onError 回调处理 */ })
+          }).catch(error => {
+            if (activeStreams.has(requestId)) {
+              win?.webContents.send('llm:stream-error', { requestId, error: String(error) })
+              activeStreams.delete(requestId)
+            }
+            reject(error)
+          })
+        }).catch(() => { /* 错误已发送给请求所属窗口 */ })
       },
       { priority: request.priority ?? 10, timeoutMs: 0 },
     ).catch((error) => {
@@ -350,9 +401,9 @@ export function registerLLMController() {
     const controller = activeStreams.get(requestId)
     if (controller) {
       controller.abort()
-      activeStreams.delete(requestId)
       return { success: true }
     }
+    rememberCancellation(requestId)
     return { success: false }
   })
 

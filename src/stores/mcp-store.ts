@@ -7,6 +7,7 @@
 
 import { create } from 'zustand'
 import { ipc } from '../services/ipc-client'
+import { createToolIpc } from '../services/agent/tool-ipc'
 import { t } from '../shared/locale'
 import { toolRegistry } from '../services/agent/tool-registry'
 import type {
@@ -173,10 +174,13 @@ export const useMCPStore = create<MCPState>()((set, get) => ({
         requiresConfirmation: true, // MCP Tool 默认需要确认（保守策略）
         isReadOnly: false,
         userFacingName: `${mcpTool.name} (${mcpTool.serverId})`,
-        execute: async (args) => {
-          const result = await ipc.invoke('mcp:call-tool', mcpTool.serverId, mcpTool.name, args)
+        execute: async (args, context) => {
+          const toolIpc = createToolIpc(context)
+          if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
+          const result = await toolIpc.invoke('mcp:call-tool', mcpTool.serverId, mcpTool.name, args)
           return {
             success: result.success,
+            executionState: result.success ? 'committed' : 'unknown',
             content: result.content,
             error: result.error,
           }

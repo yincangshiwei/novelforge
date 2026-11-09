@@ -4,7 +4,7 @@
  */
 import type { LLMUsage } from '../../electron/llm/provider.interface'
 
-export type InternalStreamFinishReason = 'stop' | 'length' | 'tool_use' | 'error'
+export type InternalStreamFinishReason = 'stop' | 'length' | 'tool_use' | 'error' | 'unknown'
 
 export type InternalStreamEvent =
   | { type: 'start'; model: string }

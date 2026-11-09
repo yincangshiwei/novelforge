@@ -1,5 +1,12 @@
-import { describe, it, expect } from 'vitest'
-import { parseArgs, buildInstanceId, sanitizeName, isPidAlive, readManifests, buildChildEnv, isOwnedProcessCommand } from './dev-instance-lib.mjs'
+import { afterEach, describe, it, expect } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
+import { parseArgs, buildInstanceId, sanitizeName, isPidAlive, readManifests, buildChildEnv, isOwnedProcessCommand, seedInstanceHome } from './dev-instance-lib.mjs'
+
+const temporaryDirs: string[] = []
+afterEach(() => {
+  for (const dir of temporaryDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true })
+})
 
 describe('dev-instance-lib', () => {
   it('解析 start 参数', () => {
@@ -47,6 +54,33 @@ describe('dev-instance-lib', () => {
     expect(env.APPDATA).toContain('AppData')
     expect(env.LOCALAPPDATA).toContain('AppData')
     expect(env.ELECTRON_RUN_AS_NODE).toBeUndefined()
+  })
+
+  it('fresh 清除各种大小写的 API key 与凭据环境，默认模式仍继承', () => {
+    const base = { PATH: 'safe', OPENAI_API_KEY: 'synthetic', apiKey: 'synthetic', ANTHROPIC_AUTH_TOKEN: 'synthetic', AWS_SECRET_ACCESS_KEY: 'synthetic', NORMAL_SETTING: 'keep' }
+    const env = buildChildEnv(base, '/isolated/home', 'linux', true)
+    expect(env).toMatchObject({ PATH: 'safe', NORMAL_SETTING: 'keep' })
+    for (const key of ['OPENAI_API_KEY', 'apiKey', 'ANTHROPIC_AUTH_TOKEN', 'AWS_SECRET_ACCESS_KEY']) expect(env[key]).toBeUndefined()
+    expect(buildChildEnv(base, '/isolated/home', 'linux').OPENAI_API_KEY).toBe('synthetic')
+    expect(base.OPENAI_API_KEY).toBe('synthetic')
+    expect(parseArgs(['start', '--fresh', '--json']).options.fresh).toBe(true)
+  })
+
+  it('fresh 不复制合成配置、模型、凭据和 prompts，默认复制行为保留', () => {
+    const dir = fs.mkdtempSync(path.join(process.cwd(), '.dev-instance-test-'))
+    temporaryDirs.push(dir)
+    const source = path.join(dir, 'synthetic-source')
+    fs.mkdirSync(path.join(source, 'prompts'), { recursive: true })
+    for (const name of ['config.json', 'models.json', 'credentials.json']) fs.writeFileSync(path.join(source, name), JSON.stringify({ synthetic: name }))
+    fs.writeFileSync(path.join(source, 'prompts', 'synthetic.txt'), 'synthetic')
+    const freshHome = path.join(dir, 'fresh-home')
+    seedInstanceHome(source, freshHome, true)
+    expect(fs.existsSync(freshHome)).toBe(false)
+    const defaultHome = path.join(dir, 'default-home')
+    seedInstanceHome(source, defaultHome)
+    for (const name of ['config.json', 'models.json', 'credentials.json', 'prompts/synthetic.txt']) {
+      expect(fs.readFileSync(path.join(defaultHome, '.novelforge', name), 'utf8')).toBe(fs.readFileSync(path.join(source, name), 'utf8'))
+    }
   })
 
   it('进程归属校验只认 --dev-instance=<id>', () => {

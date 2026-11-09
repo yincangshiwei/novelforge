@@ -63,12 +63,25 @@ export interface ToolArtifact {
 export interface ToolResult {
   /** 是否执行成功 */
   success: boolean
+  executionState?: 'committed' | 'not_committed' | 'unknown'
   /** 文本结果（注入回 Agent 的对话上下文） */
   content: string
   /** 执行产物列表（可选） */
   artifacts?: ToolArtifact[]
   /** 错误信息（失败时） */
   error?: string
+  persistence?: { target: string; verified: boolean; projectPath?: string; revision?: number }
+}
+
+export interface ToolExecutionContext {
+  signal: AbortSignal
+  turnId: string
+  callId: string
+  step: number
+  operationId: string
+  scope?: string
+  toolName?: string
+  conversationId?: string
 }
 
 // ===== Tool 定义 =====
@@ -97,7 +110,8 @@ export interface AgentTool {
    */
   timeoutMs?: number
   /** 执行函数 */
-  execute: (args: Record<string, unknown>) => Promise<ToolResult>
+  execute: (args: Record<string, unknown>, context?: ToolExecutionContext) => Promise<ToolResult>
+  reconcile?: (args: Record<string, unknown>, context: ToolExecutionContext) => Promise<ToolResult | undefined>
   /** 可选的用户友好名称（UI 显示用，比 name 更可读） */
   userFacingName?: string
 }

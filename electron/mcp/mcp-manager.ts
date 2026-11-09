@@ -17,6 +17,7 @@ import { logger } from '../utils/logger'
 import { safeErrorMessage } from '../utils/error-utils'
 import { t } from '../../src/shared/locale'
 import { VELA_HOME } from '../utils/config-utils'
+import { currentOperationSignal, checkOperationCancellation } from '../services/agent-operation-journal'
 
 // ===== 类型定义 =====
 
@@ -90,6 +91,10 @@ interface MCPServerRuntime {
     reject: (error: Error) => void
     timerId: ReturnType<typeof setTimeout>
   }>
+}
+
+function unknownRemoteOutcome(message: string, name = 'Error'): Error {
+  return Object.assign(new Error(`${message}; remote outcome unknown`), { name, remoteOutcome: 'unknown' as const })
 }
 
 // ===== MCP Manager 实现 =====
@@ -272,13 +277,17 @@ class MCPManagerImpl {
     proc.on('exit', (code) => {
       logger.info('MCP', t('log.mcp.processExited').replace('{id}', runtime.config.id).replace('{code}', String(code)))
       runtime.status = 'disconnected'
+      this.rejectPendingRequests(runtime, unknownRemoteOutcome('MCP process exited'))
       this.notifyStatusChange(runtime.config.id, 'disconnected')
+      this.notifyToolsChange()
     })
 
     proc.on('error', (error) => {
       runtime.status = 'error'
       runtime.error = `进程启动失败：${error.message}`
+      this.rejectPendingRequests(runtime, unknownRemoteOutcome(runtime.error))
       this.notifyStatusChange(runtime.config.id, 'error', runtime.error)
+      this.notifyToolsChange()
     })
   }
 
@@ -321,28 +330,58 @@ class MCPManagerImpl {
   }
 
   /** 发送 JSON-RPC 请求 */
-  private sendRequest(runtime: MCPServerRuntime, method: string, params?: unknown): Promise<unknown> {
+  private sendRequest(runtime: MCPServerRuntime, method: string, params?: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) return Promise.reject(new DOMException('Operation cancelled', 'AbortError'))
     return new Promise((resolve, reject) => {
       const id = runtime.nextRequestId++
-
-      // 超时定时器（响应到达或请求取消时清除，防止泄漏）
+      let sent = false
+      const cleanup = () => {
+        clearTimeout(timerId)
+        signal?.removeEventListener('abort', onAbort)
+        runtime.pendingRequests.delete(id)
+      }
+      const notifyCancellation = (reason: string) => {
+        if (!sent) return
+        try {
+          runtime.process?.stdin?.write(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'notifications/cancelled',
+            params: { requestId: id, reason },
+          }) + '\n')
+        } catch { /* 通知不能证明远端撤销 */ }
+      }
+      const onAbort = () => {
+        cleanup()
+        notifyCancellation('Operation cancelled')
+        reject(sent ? unknownRemoteOutcome('Operation cancelled', 'AbortError') : new DOMException('Operation cancelled', 'AbortError'))
+      }
       const timerId = setTimeout(() => {
-        if (runtime.pendingRequests.has(id)) {
-          runtime.pendingRequests.delete(id)
-          reject(new Error(t('error.mcpRequestTimeout').replace('{method}', method)))
-        }
+        cleanup()
+        notifyCancellation('Request timed out')
+        reject(unknownRemoteOutcome(t('error.mcpRequestTimeout').replace('{method}', method)))
       }, 10000)
-
-      runtime.pendingRequests.set(id, { resolve, reject, timerId })
-
-      const msg = JSON.stringify({
-        jsonrpc: '2.0',
-        id,
-        method,
-        params: params ?? {},
+      runtime.pendingRequests.set(id, {
+        resolve: result => { cleanup(); resolve(result) },
+        reject: error => { cleanup(); reject(error) },
+        timerId,
       })
-
-      runtime.process?.stdin?.write(msg + '\n')
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) { onAbort(); return }
+      const msg = JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? {} })
+      try {
+        const stdin = runtime.process?.stdin
+        if (!stdin || stdin.destroyed || !stdin.writable) throw new Error(t('error.connectionClosed'))
+        sent = true
+        stdin.write(msg + '\n', error => {
+          if (error && runtime.pendingRequests.has(id)) {
+            cleanup()
+            reject(unknownRemoteOutcome(safeErrorMessage(error)))
+          }
+        })
+      } catch (error) {
+        cleanup()
+        reject(sent ? unknownRemoteOutcome(safeErrorMessage(error)) : error)
+      }
     })
   }
 
@@ -405,10 +444,11 @@ class MCPManagerImpl {
     }
 
     try {
+      checkOperationCancellation()
       const result = await this.sendRequest(runtime, 'tools/call', {
         name: toolName,
         arguments: args,
-      }) as { content?: Array<{ type: string; text?: string }> }
+      }, currentOperationSignal()) as { content?: Array<{ type: string; text?: string }> }
 
       const textParts = (result?.content ?? [])
         .filter(c => c.type === 'text')
@@ -417,8 +457,18 @@ class MCPManagerImpl {
 
       return { success: true, content: textParts }
     } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || (error as Error & { remoteOutcome?: string }).remoteOutcome === 'unknown')) throw error
+      checkOperationCancellation()
       return { success: false, content: '', error: safeErrorMessage(error) }
     }
+  }
+
+  private rejectPendingRequests(runtime: MCPServerRuntime, error: Error): void {
+    for (const pending of [...runtime.pendingRequests.values()]) {
+      clearTimeout(pending.timerId)
+      pending.reject(error)
+    }
+    runtime.pendingRequests.clear()
   }
 
   /** 断开服务器连接 */
@@ -426,9 +476,8 @@ class MCPManagerImpl {
     const runtime = this.servers.get(serverId)
     if (!runtime) return
 
+    this.rejectPendingRequests(runtime, unknownRemoteOutcome(t('error.connectionClosed')))
     runtime.process?.kill()
-    runtime.pendingRequests.forEach(p => p.reject(new Error(t('error.connectionClosed'))))
-    runtime.pendingRequests.clear()
     this.servers.delete(serverId)
     this.notifyStatusChange(serverId, 'disconnected')
     this.notifyToolsChange()

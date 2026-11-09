@@ -71,6 +71,37 @@ beforeEach(() => {
 const fileEditedMsg = (path: string, line: string, removed: string, added: string): string =>
   t('tool.fileEdited').replace('{path}', path).replace('{line}', line).replace('{removed}', removed).replace('{added}', added)
 
+describe('edit_file 取消与核验', () => {
+  it('读取期间切换项目不得继续写盘', async () => {
+    const context = { signal: new AbortController().signal, turnId: 't', callId: 'edit-switch', step: 1, operationId: 'edit-switch', scope: projectPath }
+    mockInvoke.mockImplementation(async () => {
+      useProjectStore.setState({ currentProject: { ...useProjectStore.getState().currentProject!, path: '/tmp/other' } })
+      return { state: 'committed', value: { success: true, content: '原内容' } } as never
+    })
+    expect(await editFileTool.execute({ file_path: 'note.md', old_string: '原内容', new_string: '新内容' }, context)).toMatchObject({ executionState: 'not_committed' })
+    expect(mockInvoke.mock.calls).toHaveLength(1)
+  })
+  it('原编辑全文核验，不以新子串存在冒充提交', async () => {
+    const context = { signal: new AbortController().signal, turnId: 't', callId: 'edit-check', step: 1, operationId: 'edit-check', scope: projectPath }
+    mockInvoke.mockImplementation(async (channel, ...args) => {
+      if (channel === 'agent:operation-invoke') {
+        const payload = args[0] as { channel: string; args: unknown[] }
+        if (payload.channel === 'fs:read-file') return { state: 'committed', value: { success: true, content: disk } } as never
+        if (payload.channel === 'fs:write-file') { disk = String(payload.args[1]); return { state: 'committed', value: { success: true } } as never }
+      }
+      return { state: 'not_committed' } as never
+    })
+    disk = '前原内容后'
+    const args = { file_path: 'note.md', old_string: '原内容', new_string: '新内容' }
+    expect(await editFileTool.execute(args, context)).toMatchObject({ executionState: 'committed' })
+    const expected = disk
+    disk = '其他新内容'
+    expect(await editFileTool.reconcile!(args, context)).toBeUndefined()
+    disk = expected
+    expect(await editFileTool.reconcile!(args, context)).toMatchObject({ executionState: 'committed' })
+  })
+})
+
 describe('edit_file 工具契约', () => {
   it('注册形态：name/描述/参数 schema/确认与只读标志（与 write_file 同为行动工具）', () => {
     expect(editFileTool.name).toBe('edit_file')

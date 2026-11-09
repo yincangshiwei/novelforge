@@ -1,6 +1,9 @@
 // @vitest-environment node
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { executeRunFromIndex, useWorkflowStore, type WorkflowDefinition, type WorkflowRun } from './workflow-store'
+
+vi.mock('../services/ipc-client', () => ({ ipc: { invoke: vi.fn(async () => ({ success: true })) } }))
+vi.mock('../components/ui/Toast', () => ({ toast: { error: vi.fn() } }))
 
 describe('executeRunFromIndex（断点重放，L2 任务2）', () => {
   beforeEach(() => { useWorkflowStore.setState({ activeRuns: [], waitingRuns: {}, history: [] }) })

@@ -224,6 +224,22 @@ describe('AgentMessage 分支操作', () => {
 describe('正文与工具调用交错渲染（contentOffset，2026-10-17）', () => {
   afterEach(() => { document.body.innerHTML = '' })
 
+  it('有序事件块优先于旧偏移和正文重写', () => {
+    const { container, root } = render(<AgentMessage message={{ id: 'events', role: 'assistant', content: '旧正文', createdAt: 0,
+      toolCalls: [toolCall('t', 'read_file', 999)],
+      timeline: [{ seq: 0, kind: 'text', text: '执行前' }, { seq: 1, kind: 'tools', callIds: ['t'] }, { seq: 2, kind: 'text', text: '执行后' }],
+    }} />)
+    expect(domOrder(container)).toEqual(['text:执行前', 'tool:read_file', 'text:执行后'])
+    act(() => { root.unmount() })
+  })
+
+  it('思考前缀清洗不改变工具相对正文位置', () => {
+    const prefix = '_思考过程_\n> 分析\n\n先读取。'
+    const { container, root } = render(<AgentMessage message={{ id: 'ordered', role: 'assistant', content: prefix + '读取后的结论。', createdAt: 0, toolCalls: [toolCall('t', 'read_file', prefix.length)] }} />)
+    expect(domOrder(container)).toEqual(['think', 'text:先读取。', 'tool:read_file', 'text:读取后的结论。'])
+    act(() => { root.unmount() })
+  })
+
   it('正文段 → 工具行 → 正文段：按 offset 插回对应位置，不再所有工具卡堆在底部', () => {
     const content = '先读文件。然后写入。最后完成。'
     const first = '先读文件。'.length

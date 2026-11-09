@@ -7,6 +7,8 @@ import { safeErrorMessage } from '../utils/error-utils'
 import { t } from '../../src/shared/locale'
 import { proxyFetch } from '../net/proxy-fetch'
 import { fetchWithTimeout } from '../net/fetch-with-timeout'
+import { generateNative, streamNative } from './native-tools'
+import type { LLMChatMessage } from '../../src/shared/llm-tool-protocol'
 
 /** 带 HTTP 状态码的错误对象，用于重试判断 */
 class HttpError extends Error {
@@ -50,8 +52,11 @@ export function toGeminiContents(messages: Array<{ role: string; content: string
 
 export class GeminiProvider implements ILLMProvider {
 
-  async generate(model: ResolvedModelProfile, messages: Array<{ role: string; content: string }>, opts: LLMGenerateOptions): Promise<LLMResponse> {
+  async generate(model: ResolvedModelProfile, messages: LLMChatMessage[], opts: LLMGenerateOptions): Promise<LLMResponse> {
+    if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+    if (opts.tools?.length) return generateNative('gemini', model, messages, opts)
     return withRetry(async () => {
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       const baseUrl = model.baseUrl.replace(/\/$/, '')
       const url = `${baseUrl}/v1beta/models/${model.modelName}:generateContent`
 
@@ -83,10 +88,16 @@ export class GeminiProvider implements ILLMProvider {
           'x-goog-api-key': model.apiKey,
         },
         body: JSON.stringify(body),
+        signal: opts.signal,
+      }).catch(error => {
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+        throw error
       })
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
 
       if (!res.ok) {
         const text = await res.text().catch(() => '')
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         // text 为服务端原始响应（可能含 $）→ 箭头函数 replacer 防 $& 语义
         const errorMsg = t('error.geminiApiCallFailed').replace('{status}', String(res.status)).replace('{err}', () => text)
         if (res.status === 429 || res.status === 503 || res.status >= 500) {
@@ -100,6 +111,7 @@ export class GeminiProvider implements ILLMProvider {
         usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }
       }
 
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
       const usage = data.usageMetadata ? {
         promptTokens: data.usageMetadata.promptTokenCount ?? 0,
@@ -109,7 +121,8 @@ export class GeminiProvider implements ILLMProvider {
       } : undefined
 
       return { success: true, content: text, usage }
-    }).catch((error) => {
+    }, { signal: opts.signal }).catch((error) => {
+      if (opts.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw new DOMException('Operation cancelled', 'AbortError')
       if (error instanceof HttpError) {
         let errorMsg = error.message
         if (error.status === 429) {
@@ -125,7 +138,9 @@ export class GeminiProvider implements ILLMProvider {
     })
   }
 
-  async generateStream(model: ResolvedModelProfile, messages: Array<{ role: string; content: string }>, opts: LLMStreamOptions): Promise<void> {
+  async generateStream(model: ResolvedModelProfile, messages: LLMChatMessage[], opts: LLMStreamOptions): Promise<void> {
+    if (opts.tools?.length) return streamNative('gemini', model, messages, opts)
+    let emittedAny = false
     await withStreamRetry(async () => {
       const baseUrl = model.baseUrl.replace(/\/$/, '')
       const url = `${baseUrl}/v1beta/models/${model.modelName}:streamGenerateContent?alt=sse`
@@ -158,10 +173,15 @@ export class GeminiProvider implements ILLMProvider {
         },
         body: JSON.stringify(body),
         signal: opts.signal,
+      }).catch(error => {
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+        throw error
       })
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
 
       if (!res.ok) {
         const text = await res.text()
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         // text 为服务端原始响应（可能含 $）→ 箭头函数 replacer 防 $& 语义
         const errorMsg = t('error.geminiApiCallFailed').replace('{status}', String(res.status)).replace('{err}', () => text)
         // 可重试的 HTTP 状态码 → 抛出以便 withStreamRetry 处理
@@ -188,6 +208,7 @@ export class GeminiProvider implements ILLMProvider {
       const hasMore = true
       while (hasMore) {
         const { done, value } = await reader.read()
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         if (done) break
 
         buffer += decoder.decode(value, { stream: true })
@@ -206,6 +227,7 @@ export class GeminiProvider implements ILLMProvider {
             const chunk = parsed.candidates?.[0]?.content?.parts?.[0]?.text
             if (chunk) {
               fullText += chunk
+              emittedAny = true
               opts.onChunk(chunk)
             }
             if (parsed.usageMetadata) {
@@ -233,8 +255,9 @@ export class GeminiProvider implements ILLMProvider {
       if (failedChunkCount > 0) {
         logger.warn('LLM:Stream', t('log.llmStream.chunkParseFailures').replace('{n}', String(failedChunkCount)))
       }
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       opts.onDone(fullText, usage)
-    }).catch((error) => {
+    }, { signal: opts.signal, canRetry: () => !emittedAny }).catch((error) => {
       // withStreamRetry 重试耗尽后的最终错误处理
       if ((error as Error).name === 'AbortError') {
         opts.onError(t('error.generationCancelled'))

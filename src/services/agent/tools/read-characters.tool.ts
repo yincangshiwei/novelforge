@@ -3,7 +3,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { normalizeCharacterTier, matchCharacterName } from '../../character-normalize'
 import { useProjectStore } from '../../../stores/project-store'
 
@@ -22,7 +22,9 @@ export const readCharactersTool = buildAgentTool({
     },
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
@@ -31,7 +33,7 @@ export const readCharactersTool = buildAgentTool({
     const charName = args.character_name as string | undefined
 
     try {
-      const charsResult = await ipc.invoke('db:character-get-all')
+      const charsResult = await toolIpc.invoke('db:character-get-all')
       const chars = (Array.isArray(charsResult) ? charsResult : []) as unknown as Array<Record<string, unknown>>
       if (!chars || chars.length === 0) {
         return { success: true, content: t('tool.readCharsEmpty') }

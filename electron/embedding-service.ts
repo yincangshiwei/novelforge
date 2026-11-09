@@ -8,6 +8,7 @@
  */
 
 import { generateEmbeddings } from './embedding'
+import { currentOperationSignal, checkOperationCancellation } from './services/agent-operation-journal'
 import type { ModelProfile } from '../src/shared/ipc-channels'
 import type { ResolvedModelProfile } from './llm/provider.interface'
 import { resolveModelKey } from './credentials/resolve'
@@ -190,6 +191,7 @@ export class EmbeddingService {
     text: string,
     onProgress?: ProgressCallback,
   ): Promise<EmbeddingResult> {
+    checkOperationCancellation()
     if (!this.canUseLLMEmbedding()) {
       throw new Error(t('error.llmVectorizeNotConfigured'))
     }
@@ -239,6 +241,7 @@ export class EmbeddingService {
 
       // 双重试机制：先尝试 JSON 模式 → 失败则纯文本模式（兼容非 OpenAI API）
       const response = await this.tryGenerateEmbedding(provider, model, prompt, dims)
+      checkOperationCancellation()
 
       if (!response.success) throw new Error(t('error.llmCallFailed').replace('{err}', response.error || t('error.unknownError')))
       if (!response.content?.trim()) throw new Error(t('error.llmEmptyResponse'))
@@ -256,6 +259,8 @@ export class EmbeddingService {
       const tokens = response.usage?.totalTokens || Math.ceil(promptText.length * 0.75)
       return { vector, text, tokens, source: 'llm' }
     } catch (error) {
+      checkOperationCancellation()
+      if (error instanceof Error && error.name === 'AbortError') throw error
       throw new Error(t('error.llmVectorizeFailed').replace('{err}', error instanceof Error ? error.message : safeErrorMessage(error)))
     }
   }
@@ -265,6 +270,7 @@ export class EmbeddingService {
     texts: string[],
     onProgress?: (done: number, total: number) => void,
   ): Promise<EmbeddingResult[]> {
+    checkOperationCancellation()
     const uniqueMap = new Map<string, { text: string; indices: number[] }>()
     for (let i = 0; i < texts.length; i++) {
       const hash = contentHash(texts[i])
@@ -280,7 +286,9 @@ export class EmbeddingService {
       try {
         const r = await this.embedWithLLM(item.text)
         for (const idx of item.indices) results[idx] = { ...r, text: texts[idx] }
-      } catch {
+      } catch (error) {
+        checkOperationCancellation()
+        if (error instanceof Error && error.name === 'AbortError') throw error
         for (const idx of item.indices) results[idx] = { vector: [], text: texts[idx], tokens: 0, source: 'llm' }
       }
       done++
@@ -326,7 +334,9 @@ export class EmbeddingService {
         temperature: 0,
         maxTokens: Math.max(4096, dims * 6),
         responseFormat: { type: 'json_object' },
+        signal: currentOperationSignal(),
       })
+      checkOperationCancellation()
 
       if (res1.success && res1.content?.trim()) {
         return { success: true, content: res1.content, usage: res1.usage }
@@ -335,7 +345,9 @@ export class EmbeddingService {
       // JSON 模式失败，记录原因
       // res1.error 动态内容可能含 $ → 箭头函数 replacer 防 $& 语义
       logger.debug('Embedding', t('log.embedding.jsonModeFailedTryPlain').replace('{err}', () => res1.error || t('log.embedding.emptyResponse')))
-    } catch {
+    } catch (error) {
+      checkOperationCancellation()
+      if (error instanceof Error && error.name === 'AbortError') throw error
       // provider.generate 抛出异常（如 API 不可达），继续尝试 2
     }
 
@@ -358,8 +370,10 @@ export class EmbeddingService {
     ], {
       temperature: 0,
       maxTokens: Math.max(4096, dims * 6),
+      signal: currentOperationSignal(),
       // 不传 responseFormat — 纯文本兼容模式
     })
+    checkOperationCancellation()
 
     if (!res2.success || !res2.content?.trim()) {
       return { success: false, content: '', error: t('embedding.doubleAttemptFailed')
@@ -469,6 +483,7 @@ export class EmbeddingService {
    * 优先级：Embedding API > LLM 向量化 > 报错
    */
   async embed(text: string, options?: { skipCache?: boolean }): Promise<EmbeddingResult> {
+    checkOperationCancellation()
     const hash = this.hashText(text)
 
     // 检查缓存
@@ -497,12 +512,15 @@ export class EmbeddingService {
       } as ResolvedModelProfile
 
       try {
-        const vectors = await generateEmbeddings([text], this.config!.protocol, model)
+        const vectors = await generateEmbeddings([text], this.config!.protocol, model, currentOperationSignal())
+        checkOperationCancellation()
         const vector = vectors[0] || []
         this.cache.set(hash, vector)
         const tokens = Math.ceil(text.length * 0.75)
         return { vector, text, tokens, source: 'embedding_api' }
       } catch (error) {
+        checkOperationCancellation()
+        if (error instanceof Error && error.name === 'AbortError') throw error
         logger.warn('Embedding', t('log.embedding.apiFailedTryLlm').replace('{err}', safeErrorMessage(error)))
         // 降级到 LLM 向量化
       }
@@ -528,6 +546,7 @@ export class EmbeddingService {
       onProgress?: (done: number, total: number) => void
     },
   ): Promise<EmbeddingResult[]> {
+    checkOperationCancellation()
     if (texts.length === 0) return []
     if (!this.config) throw new Error(t('error.embeddingNoModel'))
 
@@ -568,10 +587,12 @@ export class EmbeddingService {
       const totalBatches = Math.ceil(uncached.length / batchSize)
 
       for (let b = 0; b < uncached.length; b += batchSize) {
+        checkOperationCancellation()
         const batch = uncached.slice(b, b + batchSize)
         const batchTexts = batch.map((item) => item.text)
 
-        const vectors = await generateEmbeddings(batchTexts, this.config.protocol, model)
+        const vectors = await generateEmbeddings(batchTexts, this.config.protocol, model, currentOperationSignal())
+        checkOperationCancellation()
 
         for (let j = 0; j < batch.length; j++) {
           const { text, index } = batch[j]

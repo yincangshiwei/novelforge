@@ -158,6 +158,7 @@ describe('agent-store 持久化', () => {
 
   it('restoreArchives 从 archive 恢复会话列表', async () => {
     const conv = useAgentStore.getState().createConversation({ title: '旧会话' })
+    expect(await useAgentStore.getState().flushArchives()).toBe(true)
     // 仅清内存（不经 clearAll——clearAll 会同步删归档，测试意图是验证 restoreArchives 从 archive 重建列表）
     useAgentStore.setState({ conversations: [], activeConversationId: null })
     await useAgentStore.getState().restoreArchives()
@@ -209,15 +210,20 @@ describe('CCR 压缩集成', () => {
       conversations: state.conversations.map(c => c.id === conv.id ? { ...c, messages: longMsgs } : c),
     }))
     useLLMStore.setState({ defaultModelId: 'test-model' })
-    // 摘要比原文还长 → 降幅为负 → degraded → 必须保持原样
-    const generateMock = vi.fn(async () => ({ success: true, content: '超长摘要'.repeat(5000), usage: undefined }))
+    const { estimateTokens, initTokenEngine } = await import('../services/agent/token-budget')
+    await initTokenEngine()
+    const oversizedSummary = [longMsgs.map(m => m.content).join('\n\n'), longMsgs.map(m => m.content).join('\n\n')].join('\n\n')
+    expect(estimateTokens(oversizedSummary)).toBeGreaterThan(longMsgs.reduce((sum, m) => sum + estimateTokens(m.content), 0))
+    const generateMock = vi.fn(async () => ({ success: true, content: oversizedSummary, usage: undefined }))
     useLLMStore.setState({ generate: generateMock as never })
 
     await useAgentStore.getState().sendMessage('新消息')
 
     const after = useAgentStore.getState().conversations.find(c => c.id === conv.id)!
-    expect(after.compressed ?? []).toHaveLength(0)          // 未产生压缩批次
-    expect(after.messages.length).toBeGreaterThanOrEqual(longMsgs.length)   // 历史未被替换
+    expect(generateMock).toHaveBeenCalled()
+    expect(after.compressed ?? []).toHaveLength(0)
+    expect(after.rollingSummary).toBeUndefined()
+    expect(after.messages.filter(m => longMsgs.some(original => original.id === m.id))).toEqual(longMsgs)
   })
 
   it('正常压缩 → 原文写分卷、会话不内联原文档（B 档第二轮）', async () => {
@@ -242,6 +248,52 @@ describe('CCR 压缩集成', () => {
     expect(batch!.recoverable).toBe(true)
     expect(batch!.changeTokens).toBeGreaterThan(0)   // 记了真实降幅
     expect(mockInvoke).toHaveBeenCalledWith('fs:agent-archive-original-write', conv.id, expect.any(String))
+  })
+
+  it.each(['success:true', 'success:false', 'IPC reject'] as const)('分卷写入期间取消，晚到 %s 不替换或裁剪历史', async outcome => {
+    const conv = useAgentStore.getState().createConversation({ title: '取消分卷' })
+    const messages = Array.from({ length: 12 }, (_, i) => ({
+      id: `cancel-original-${i}`, role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      content: '这里是历史消息内容占位。'.repeat(100), createdAt: i,
+    }))
+    const compressed = [{ batch: 1, original: [], summary: '旧摘要', compressedAt: 1, originalTokens: 1 }]
+    const oldOriginals = JSON.stringify({ version: 1, batches: { '1': [messages[0]] } })
+    originals.set(conv.id, oldOriginals)
+    useAgentStore.setState(state => ({ conversations: state.conversations.map(c => c.id === conv.id
+      ? { ...c, messages, compressed, rollingSummary: '旧摘要' } : c) }))
+    configResponse = { compaction: { historyMaxTokens: 1000, keepBatches: 1 }, compactionLearning: { enabled: true } }
+    useLLMStore.setState({ defaultModelId: 'test-model', generate: vi.fn(async () => ({ success: true, content: '新短摘要' })) as never })
+    const original = mockInvoke.getMockImplementation()!
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    mockInvoke.mockImplementation(async (ch, ...args) => {
+      if (ch === 'fs:agent-archive-original-write') {
+        await gate
+        if (outcome === 'IPC reject') throw new Error('晚到写盘失败')
+        if (outcome === 'success:false') return { success: false }
+      }
+      return original(ch, ...args)
+    })
+    vi.mocked(runAgentLoop).mockClear()
+    const sending = useAgentStore.getState().sendMessage('新消息')
+    try {
+      await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('fs:agent-archive-original-write', conv.id, expect.any(String)))
+      await useAgentStore.getState().cancelGeneration()
+      release()
+      await sending
+      expect(await useAgentStore.getState().flushArchives()).toBe(true)
+      const restored = parseArchive(archiveFiles.get(conv.id)!)!
+      expect(restored.messages.filter(m => messages.some(old => old.id === m.id))).toEqual(messages)
+      expect(restored.rollingSummary).toBe('旧摘要')
+      expect(restored.compressed).toEqual(compressed)
+      expect(JSON.parse(originals.get(conv.id)!).batches['1']).toEqual([messages[0]])
+      expect(vi.mocked(runAgentLoop)).not.toHaveBeenCalled()
+      expect(mockInvoke.mock.calls.some(c => c[0] === 'config:set' && (c[1] as Record<string, unknown>)?.compactionLearning)).toBe(false)
+    } finally {
+      release()
+      await sending
+      mockInvoke.mockImplementation(original)
+    }
   })
 
   it('摘要生成失败时降级硬截断（不阻断对话，rollingSummary 不变）', async () => {
@@ -1109,7 +1161,7 @@ describe('子 agent 写操作审批（C 档第二轮 T6）', () => {
     vi.useFakeTimers()
     const p = ask(call('write_file', { file_path: 'drafts/c30.md' }))
     await Promise.resolve()   // 让决策层的 await 走完（fake timers 不影响 microtask）
-    vi.advanceTimersByTime(SUBAGENT_CONFIRM_TIMEOUT_MS + 1)
+    await vi.advanceTimersByTimeAsync(SUBAGENT_CONFIRM_TIMEOUT_MS + 1)
     await expect(p).resolves.toBe(false)
     expect(useAgentStore.getState().pendingSubAgentConfirmation).toBeNull()
     vi.useRealTimers()
@@ -1164,7 +1216,10 @@ describe('派发顺序化与取消传到底（C 档第二轮评审修复）', ()
     // 模拟真实链路：store 的 generateForSubAgent → llm.generateStream 返回 requestId → 登记
     const streamSpy = vi.spyOn(useLLMStore.getState(), 'generateStream').mockImplementation(async () => 'req-42')
     runMock.mockImplementation(async (task, deps) => {
-      void deps.generate([], 'm')   // 不 await：mock 的 generateStream 不会回调 onDone（真实生成才回）
+      const generation = deps.generate([], 'm').catch(error => {
+        expect(String(error)).toContain('取消')
+      })
+      void generation
       deps.onUpdate?.(fakeSession({ id: task.taskId, taskId: task.taskId, status: 'running' }))
       // 300ms 才完成：确保取消发生在 finally（它会清掉 requestIds）之前
       return new Promise<SubAgentSession>(resolve => setTimeout(() => resolve(fakeSession({ id: task.taskId, taskId: task.taskId })), 300))
@@ -1870,6 +1925,33 @@ describe('自学习压缩 v1：接线', () => {
       expect(written.stats.compressions).toBe(1)
       expect(written.rules.find(r => r.id === 'keep-characters')!.active).toBe(true)
     })
+  })
+
+  it.each(['resolve', 'reject'] as const)('摘要取消后晚到 %s 不学习、不替换历史、不启动执行', async outcome => {
+    const conv = await seedLongHistory()
+    const before = useAgentStore.getState().getActiveConversation()!.messages.slice()
+    configResponse = { compaction: { historyMaxTokens: 1000 }, compactionLearning: { enabled: true } }
+    let resolve!: (value: { success: boolean; content: string }) => void
+    let reject!: (reason: Error) => void
+    const generate = vi.fn(() => new Promise<{ success: boolean; content: string }>((res, rej) => { resolve = res; reject = rej }))
+    useLLMStore.setState({ generate: generate as never })
+    vi.mocked(runAgentLoop).mockClear()
+    const sending = useAgentStore.getState().sendMessage('新消息')
+    await vi.waitFor(() => expect(generate).toHaveBeenCalled())
+    await useAgentStore.getState().cancelGeneration()
+    await sending
+    if (outcome === 'resolve') resolve({ success: true, content: '摘要\n[可复用事实]\n- 合成事实' })
+    else reject(new Error('晚到摘要失败'))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(await useAgentStore.getState().flushArchives()).toBe(true)
+    const after = parseArchive(archiveFiles.get(conv.id)!)!
+    expect(after.messages.filter(m => before.some(old => old.id === m.id))).toEqual(before)
+    expect(after.compressed ?? []).toEqual([])
+    expect(after.rollingSummary).toBeUndefined()
+    expect(vi.mocked(runAgentLoop)).not.toHaveBeenCalled()
+    expect(mockInvoke.mock.calls.some(c => c[0] === 'fs:agent-archive-original-write' || c[0] === 'memory:write'
+      || (c[0] === 'config:set' && (c[1] as Record<string, unknown>)?.compactionLearning))).toBe(false)
   })
 
   it('保真缺失累计到门槛 → 规则激活并落盘 + LogsView 留痕', async () => {

@@ -1,5 +1,6 @@
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
+import { ToolExecutionInterrupted } from '../tool-execution'
 import { useProjectStore } from '../../../stores/project-store'
 import { useCharacterStore } from '../../../stores/character-store'
 import { matchCharacterName, normalizeCharacterTier, normalizeCharacterRole } from '../../character-normalize'
@@ -22,7 +23,30 @@ export const manageCharacterTool = buildAgentTool({
   },
   requiresConfirmation: true,
   isReadOnly: false,
-  execute: async args => {
+  reconcile: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    const project = useProjectStore.getState().currentProject
+    if (!project || context.signal.aborted || (context.scope && context.scope !== project.path)) return undefined
+    try {
+      if (args.action !== 'create' && args.action !== 'update') return undefined
+      const fields = JSON.parse(String(args.fields_json)) as Record<string, unknown>
+      if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return undefined
+      const existing = await toolIpc.invoke('db:character-get-all')
+      const target = matchCharacterName(existing, String(args.name ?? '').trim())
+      if (!target || context.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path) return undefined
+      const expected = { ...fields }
+      if (args.action === 'create') {
+        expected.role = normalizeCharacterRole(String(fields.role ?? 'supporting'))
+        expected.tier = normalizeCharacterTier(fields.tier, expected.role)
+      } else if (fields.tier !== undefined) expected.tier = Number(fields.tier)
+      if (Object.entries(expected).some(([key, value]) => (target as unknown as Record<string, unknown>)[key] !== value)) return undefined
+      return { success: true, executionState: 'committed', content: '已只读核验角色卡实际字段与原操作一致；不重复保存。', persistence: { target: `character:${target.name}`, verified: true, projectPath: project.path } }
+    } catch { return undefined }
+  },
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
+    let executionState: 'not_committed' | 'unknown' | 'committed' = 'not_committed'
     const project = useProjectStore.getState().currentProject
     if (!project) return { success: false, content: '', error: '请先打开小说项目' }
     if (useCharacterStore.getState().dirty) return { success: false, content: '', error: '角色卡有未保存编辑，请先保存，避免覆盖' }
@@ -41,23 +65,31 @@ export const manageCharacterTool = buildAgentTool({
         } else if (typeof value !== 'string') throw new Error(`${key} 必须是字符串`)
       }
       if (fields.role !== undefined && !['protagonist', 'antagonist', 'supporting', 'minor'].includes(String(fields.role))) throw new Error('Invalid role')
-      const existing = await ipc.invoke('db:character-get-all')
+      const existing = await toolIpc.invoke('db:character-get-all')
       const target = matchCharacterName(existing, name)
-      if (useProjectStore.getState().currentProject?.id !== project.id) throw new Error('Project changed')
+      if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path || (context?.scope && context.scope !== project.path)) throw new Error('Operation cancelled or project changed')
       if (args.action === 'create') {
         if (target) throw new Error(`角色 ${target.name} 已存在，请使用 update`)
         const role = normalizeCharacterRole(String(fields.role ?? 'supporting'))
-        const created = await createMissingCharacters([{ ...fields, name, role, tier: normalizeCharacterTier(fields.tier, role) }], project.id)
-        if (!created) throw new Error('角色已存在，未覆盖')
+        executionState = 'unknown'
+        const created = await createMissingCharacters([{ ...fields, name, role, tier: normalizeCharacterTier(fields.tier, role) }], project.id, context)
+        if (!created) { executionState = 'not_committed'; throw new Error('角色已存在，未覆盖') }
+        executionState = 'committed'
       } else {
         if (!target) throw new Error('角色不存在，请使用 create')
-        const result = await ipc.invoke('db:character-upsert', { ...target, ...fields })
-        if (!result.success) throw new Error(result.error || '角色保存失败')
-        globalEventBus.emit('REFRESH_RESOURCE', { resources: ['characterCards'] })
+        executionState = 'unknown'
+        const result = await toolIpc.invoke('db:character-upsert', { ...target, ...fields })
+        if (!result.success) { executionState = 'not_committed'; throw new Error(result.error || '角色保存失败') }
+        executionState = 'committed'
+        if (!context?.signal.aborted && useProjectStore.getState().currentProject?.path === project.path) {
+          try { globalEventBus.emit('REFRESH_RESOURCE', { resources: ['characterCards'] }) }
+          catch (error) { console.warn('[manage_character] 已提交，角色界面刷新失败', error) }
+        }
       }
-      return { success: true, content: `已保存角色卡：${target?.name ?? name}；未提交字段保持不变。` }
+      return { success: true, executionState: 'committed', content: `已保存角色卡：${target?.name ?? name}；未提交字段保持不变。` }
     } catch (error) {
-      return { success: false, content: '', error: String(error) }
+      if (error instanceof ToolExecutionInterrupted) throw error
+      return { success: false, executionState, content: '', error: String(error) }
     }
   },
 })

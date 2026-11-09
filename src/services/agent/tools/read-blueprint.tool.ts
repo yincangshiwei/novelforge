@@ -3,7 +3,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 
 
@@ -21,7 +21,9 @@ export const readBlueprintTool = buildAgentTool({
     },
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
@@ -31,7 +33,7 @@ export const readBlueprintTool = buildAgentTool({
 
     if (chapterNum !== undefined) {
       // 读取指定章节蓝图
-      const bp = await ipc.invoke('db:blueprint-get', chapterNum)
+      const bp = await toolIpc.invoke('db:blueprint-get', chapterNum)
       if (!bp) {
         return { success: false, content: '', error: t('tool.readBlueprintNotFound').replace('{chapter}', String(chapterNum)) }
       }
@@ -50,7 +52,7 @@ export const readBlueprintTool = buildAgentTool({
 
     // 列出所有蓝图文件
     try {
-      const bps = await ipc.invoke('db:blueprint-get-all')
+      const bps = await toolIpc.invoke('db:blueprint-get-all')
       if (!bps || bps.length === 0) {
         return { success: true, content: t('tool.readBlueprintEmpty') }
       }

@@ -20,6 +20,8 @@ import {
   getConnection,
   closeConnection,
   addChunks,
+  replaceDocumentChunks,
+  listDocuments,
   getChunksWithoutTokens,
   backfillTokens,
   searchWithScope,
@@ -35,6 +37,89 @@ import {
 vi.mock('./utils/logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), getLogDir: () => '' },
 }))
+
+const cancellation = vi.hoisted(() => ({ signal: undefined as AbortSignal | undefined }))
+vi.mock('./services/agent-operation-journal', () => ({
+  checkOperationCancellation: () => {
+    if (cancellation.signal?.aborted) throw Object.assign(new Error('操作已取消'), { name: 'AbortError' })
+  },
+}))
+
+describe('replaceDocumentChunks 取消与恢复', () => {
+  function makeTempProject(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'nf-replace-'))
+  }
+  async function cleanupProject(project: string): Promise<void> {
+    await closeConnection(project)
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+  async function readChunks(project: string): Promise<Array<{ text: string }>> {
+    return await (await (await getConnection(project)).openTable('chunks')).query().select(['text']).toArray() as Array<{ text: string }>
+  }
+
+  it('提交前取消保留旧文档', async () => {
+    const project = makeTempProject()
+    try {
+      const oldId = randomUUID()
+      await addChunks(project, oldId, 'fixture.md', ['old fixture'])
+      const controller = new AbortController()
+      controller.abort()
+      cancellation.signal = controller.signal
+      await expect(replaceDocumentChunks(project, randomUUID(), 'fixture.md', ['new fixture'])).rejects.toMatchObject({ name: 'AbortError' })
+      expect((await readChunks(project)).map(r => r.text)).toEqual(['old fixture'])
+      expect((await listDocuments(project)).map(d => d.id)).toEqual([oldId])
+    } finally {
+      cancellation.signal = undefined
+      await cleanupProject(project)
+    }
+  })
+
+  it('写入期间取消仍完成替换，不留下旧块', async () => {
+    const project = makeTempProject()
+    try {
+      await addChunks(project, randomUUID(), 'fixture.md', ['old fixture'])
+      const controller = new AbortController()
+      cancellation.signal = controller.signal
+      const db = await getConnection(project)
+      const create = db.createTable.bind(db)
+      const spy = vi.spyOn(db, 'createTable').mockImplementation(async (...args) => {
+        controller.abort()
+        return create(...args)
+      })
+      const newId = randomUUID()
+      const result = await replaceDocumentChunks(project, newId, 'fixture.md', ['new fixture'])
+      spy.mockRestore()
+      expect(result.success).toBe(true)
+      expect(controller.signal.aborted).toBe(true)
+      expect((await readChunks(project)).map(r => r.text)).toEqual(['new fixture'])
+      expect((await listDocuments(project)).map(d => d.id)).toEqual([newId])
+    } finally {
+      vi.restoreAllMocks()
+      cancellation.signal = undefined
+      await cleanupProject(project)
+    }
+  })
+
+  it('新表重建失败恢复旧块和元数据', async () => {
+    const project = makeTempProject()
+    try {
+      const oldId = randomUUID()
+      await addChunks(project, oldId, 'fixture.md', ['old fixture'])
+      const db = await getConnection(project)
+      const create = db.createTable.bind(db)
+      const spy = vi.spyOn(db, 'createTable').mockImplementationOnce(async () => { throw new Error('injected write failure') }).mockImplementation(create)
+      const result = await replaceDocumentChunks(project, randomUUID(), 'fixture.md', ['new fixture'])
+      spy.mockRestore()
+      expect(result).toMatchObject({ success: false })
+      expect(result.error).toContain('injected write failure')
+      expect((await readChunks(project)).map(r => r.text)).toEqual(['old fixture'])
+      expect((await listDocuments(project)).map(d => d.id)).toEqual([oldId])
+    } finally {
+      vi.restoreAllMocks()
+      await cleanupProject(project)
+    }
+  })
+})
 
 describe('computeFTSRelevance（P1-1 FTS 相关性打分）', () => {
   it('空输入返回基础分 0.5', () => {

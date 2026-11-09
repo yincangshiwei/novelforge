@@ -3,7 +3,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 
 
@@ -16,14 +16,16 @@ export const listChaptersTool = buildAgentTool({
     properties: {},
   },
   requiresConfirmation: false,
-  execute: async () => {
+  execute: async (_args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
     }
 
     try {
-      const blueprints = await ipc.invoke('db:blueprint-get-all')
+      const blueprints = await toolIpc.invoke('db:blueprint-get-all')
       const bpNums = new Set<number>((Array.isArray(blueprints) ? blueprints : []).map((b: unknown) => (b as { chapterNumber?: number }).chapterNumber).filter((n): n is number => n !== undefined))
       const { useDraftStore } = await import('../../../stores/draft-store')
       const draftsByChapter = useDraftStore.getState().draftsByChapter
@@ -32,7 +34,7 @@ export const listChaptersTool = buildAgentTool({
       // 定稿状态从 DB 查询而非 FS 扫描
       const msNums = new Set<number>()
       for (const bp of (Array.isArray(blueprints) ? blueprints : [])) {
-        const finalized = await ipc.invoke('db:draft-get-finalized', bp.chapterNumber)
+        const finalized = await toolIpc.invoke('db:draft-get-finalized', bp.chapterNumber)
         if (finalized) msNums.add(bp.chapterNumber)
       }
 

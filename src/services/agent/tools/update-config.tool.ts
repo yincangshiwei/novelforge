@@ -3,7 +3,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 
 export const updateConfigTool = buildAgentTool({
@@ -32,7 +32,23 @@ export const updateConfigTool = buildAgentTool({
   },
   requiresConfirmation: true,
   isReadOnly: false,
-  execute: async (args) => {
+  reconcile: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    const project = useProjectStore.getState().currentProject
+    if (!project || (context.scope && context.scope !== project.path) || context.signal.aborted) return undefined
+    const core = await toolIpc.invoke('db:project-core-get')
+    if (!core || context.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path) return undefined
+    const field = String(args.field)
+    const key = field === 'narrativePOV' ? 'narrativePov' : field
+    const expected = ['totalChapters', 'wordsPerChapter'].includes(field) ? Number(args.value) : args.value
+    if ((core as unknown as Record<string, unknown>)[key] !== expected) return undefined
+    useProjectStore.getState().updateNovelConfig({ [field]: expected })
+    return { success: true, executionState: 'committed', content: `已读取实际配置，${field} 与原操作值一致；不重复写入。`,
+      persistence: { target: `config:${field}`, verified: true, projectPath: project.path } }
+  },
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消，未提交' }
     const field = args.field as string
     const value = args.value as string
 
@@ -76,20 +92,29 @@ export const updateConfigTool = buildAgentTool({
     // 而 genre/subGenre 退回旧值，Agent 只得反复重提，最终撞上工具调用次数上限。
     // 只发单字段后，主进程的逐字段合并语义才真正成立（也是该 handler 的原始设计意图）。
     const updateData = {
+      path: project.path,
       novelConfig: { [field]: finalValue },
     }
 
-    const result = await ipc.invoke('project:update-config', project.id, updateData)
+    if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path || (context?.scope && context.scope !== project.path)) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消或项目已切换，未提交' }
+    const result = await toolIpc.invoke('project:update-config', project.id, updateData)
     if (!result.success) {
       return { success: false, content: '', error: result.error ?? t('tool.updateConfigFailed') }
     }
 
-    if (useProjectStore.getState().currentProject?.id === project.id) {
-      useProjectStore.getState().updateNovelConfig({ [field]: finalValue })
+    const persistedValue = result.persistedConfig?.[field as keyof NonNullable<typeof result.persistedConfig>]
+    if (result.projectPath !== project.path || persistedValue !== finalValue) {
+      return { success: false, executionState: 'unknown', content: '', error: '配置写入未通过回读核验，不能确认保存成功，请重新读取实际状态。' }
+    }
+    if (!context?.signal.aborted && useProjectStore.getState().currentProject?.path === project.path) {
+      try { useProjectStore.getState().updateNovelConfig({ [field]: persistedValue }) }
+      catch (error) { console.warn('[update_config] 已提交，配置界面刷新失败', error) }
     }
 
     return {
       success: true,
+      executionState: 'committed',
+      persistence: { target: `config:${field}`, verified: true, projectPath: result.projectPath, revision: result.revision },
       content: t('tool.configUpdated')
         .replace('{field}', field)
         .replace('{value}', typeof value === 'string' && value.length > 50 ? value.slice(0, 50) + '…' : String(value)),

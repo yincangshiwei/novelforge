@@ -1,5 +1,29 @@
-import { describe, it, expect } from 'vitest'
-import { toGeminiContents } from './gemini-provider'
+import { describe, it, expect, vi } from 'vitest'
+import { GeminiProvider, toGeminiContents } from './gemini-provider'
+import { proxyFetch } from '../net/proxy-fetch'
+import type { ResolvedModelProfile } from './provider.interface'
+
+vi.mock('../net/proxy-fetch', () => ({ proxyFetch: vi.fn() }))
+const model = { modelName: 'test', baseUrl: 'https://example.com', apiKey: 'test', maxTokens: 100 } as ResolvedModelProfile
+
+describe('Gemini流式取消与重复保护', () => {
+  it('输出后网络错误不重试', async () => {
+    vi.mocked(proxyFetch).mockReset()
+    let reads = 0
+    vi.mocked(proxyFetch).mockResolvedValueOnce(new Response(new ReadableStream({
+      pull(controller) {
+        if (reads++ === 0) controller.enqueue(new TextEncoder().encode('data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}\n\n'))
+        else controller.error(new TypeError('fetch network failed'))
+      },
+    })))
+    const onChunk = vi.fn(), onDone = vi.fn(), onError = vi.fn()
+    await new GeminiProvider().generateStream(model, [], { temperature: 0.3, maxTokens: 100, signal: new AbortController().signal, onChunk, onDone, onError })
+    expect(onChunk).toHaveBeenCalledExactlyOnceWith('partial')
+    expect(onDone).not.toHaveBeenCalled()
+    expect(onError).toHaveBeenCalledOnce()
+    expect(proxyFetch).toHaveBeenCalledOnce()
+  })
+})
 
 describe('toGeminiContents', () => {
   it('单条 system 作为 systemInstruction，user/assistant 正确映射', () => {

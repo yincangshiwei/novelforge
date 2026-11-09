@@ -11,6 +11,7 @@
  */
 import { ipc } from '../ipc-client'
 import type { AgentMessage } from '../../stores/agent-store'
+import { waitWithAbort } from './abort-wait'
 
 interface OriginalsFile {
   version: 1
@@ -42,12 +43,15 @@ export async function writeBatchOriginal(
   convId: string,
   batch: number,
   messages: AgentMessage[],
+  signal?: AbortSignal,
 ): Promise<boolean> {
-  const file = await readAll(convId)
+  signal?.throwIfAborted()
+  const file = await waitWithAbort(readAll(convId), signal)
+  signal?.throwIfAborted()
   file.batches[String(batch)] = messages
   const res = await ipc.invoke('fs:agent-archive-original-write', convId, JSON.stringify(file)) as
     { success?: boolean } | null
-  return res?.success !== false
+  return res?.success === true
 }
 
 /**
@@ -88,7 +92,8 @@ export async function deleteBatchOriginals(convId: string, batches: number[]): P
     }
   }
   if (!changed) return
-  await ipc.invoke('fs:agent-archive-original-write', convId, JSON.stringify(file))
+  const result = await ipc.invoke('fs:agent-archive-original-write', convId, JSON.stringify(file))
+  if (result?.success !== true) throw new Error('压缩原文分卷释放失败')
 }
 
 /**

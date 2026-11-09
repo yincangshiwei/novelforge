@@ -112,6 +112,42 @@ describe('sanitizeMessageList', () => {
     expect(out.map(m => m.id)).toEqual(['a1'])
   })
 
+  it.each(['pending', 'running', 'waiting_confirm'] as const)('封存 %s 工具且不改变原归档，重复恢复幂等', status => {
+    const msg = makeMsg('interrupted', 'assistant', '', {
+      toolCalls: [{ id: 'call', turnId: 'turn', step: 2, toolName: 'update_config', arguments: { field: 'globalGuidance' }, status }],
+    })
+    const recovered = sanitizeAgentMessage(msg)!
+    expect(recovered.toolCalls?.[0]).toMatchObject({ status: 'failed', error: expect.stringContaining('应用中断') })
+    expect(msg.toolCalls?.[0].status).toBe(status)
+    if (status === 'running') {
+      expect(recovered.toolCalls?.[0].receipt).toMatchObject({ outcome: 'unknown', verified: false, callId: 'call', turnId: 'turn', step: 2, target: 'config:globalGuidance' })
+    } else {
+      expect(recovered.toolCalls?.[0].receipt).toBeUndefined()
+    }
+    expect(sanitizeAgentMessage(recovered)).toBe(recovered)
+  })
+
+  it('中断不能覆盖已提交回执；正常已完成调用保持原引用', () => {
+    const receipt = { turnId: 'turn', step: 1, callId: 'call', toolName: 'update_config', target: 'config:globalGuidance', outcome: 'committed' as const, verified: true, revision: 123 }
+    const msg = makeMsg('committed', 'assistant', '', { toolCalls: [{ id: 'call', toolName: 'update_config', arguments: {}, status: 'running', receipt }] })
+    const recovered = sanitizeAgentMessage(msg)!
+    expect(recovered.toolCalls?.[0].status).toBe('failed')
+    expect(recovered.toolCalls?.[0].receipt).toBe(receipt)
+    const completed = makeMsg('completed', 'assistant', '', { toolCalls: [{ ...msg.toolCalls![0], status: 'completed' }] })
+    expect(sanitizeAgentMessage(completed)).toBe(completed)
+  })
+
+  it('非法工具形状丢弃，不让损坏归档污染 tool-only 消息', () => {
+    expect(sanitizeAgentMessage(makeMsg('bad', 'assistant', '', { toolCalls: [null, {}, 1] as never }))).toBeNull()
+  })
+
+  it('保留正文为空但有工具回执的崩溃消息', () => {
+    const msg = makeMsg('a1', 'assistant', '', { streaming: true, toolCalls: [{ id: 'call', toolName: 'update_config', arguments: { field: 'globalGuidance' }, status: 'completed' }] })
+    const recovered = sanitizeAgentMessage(msg)
+    expect(recovered?.toolCalls).toEqual(msg.toolCalls)
+    expect(recovered?.streaming).toBe(false)
+  })
+
   it('仅含 tool_call 无正文的 assistant 整条过滤（CC「无配对 tool_use」对齐）', () => {
     const list = [
       makeMsg('u1', 'user', '帮我查第 3 章'),

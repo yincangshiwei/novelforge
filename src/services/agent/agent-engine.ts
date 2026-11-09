@@ -12,10 +12,14 @@
  */
 
 import { t } from '../../shared/locale'
-import { toolRegistry, type AgentTool, type ToolResult, type ToolArtifact } from './tool-registry'
+import { waitWithAbort } from './abort-wait'
+import { executeTool, ToolExecutionInterrupted } from './tool-execution'
+import { validateToolCalls, type LLMChatMessage, type LLMStepResult } from '../../shared/llm-tool-protocol'
+import { toolRegistry, type AgentTool, type ToolArtifact } from './tool-registry'
 import type { ApprovalDecision } from './approval'
 import { outputPostProcessor } from './output-post-processor'
 import { looksMultiStep } from './task-anchor'
+import { executionTarget, unsupportedMutationClaims, removeMutationClaims, EXECUTION_DIAGNOSIS, UNVERIFIED_EXECUTION_NOTICE, type ExecutionReceipt, type ExecutionOutcome } from './execution-evidence'
 import { unsupportedWorkflowClaims, removeUnsupportedWorkflowClaims } from './workflow-claims'
 import { ProgressTracker, type AgentProgress } from './progress-tracker'
 import { estimateTokens, truncateToTokenBudget } from './token-budget'
@@ -96,6 +100,10 @@ export interface ToolCallInfo {
    * 可选字段：旧归档没有它 → 保持「正文在前、工具块在底部」的旧布局；archive 必填形状不变。
    */
   contentOffset?: number
+  turnId?: string
+  step?: number
+  receipt?: ExecutionReceipt
+  providerMetadata?: Record<string, unknown>
 }
 
 /** Agent Engine 回调 */
@@ -107,18 +115,22 @@ export interface AgentEngineCallbacks {
   onToolCallStart: (toolCall: ToolCallInfo) => void
   /** Tool 调用完成 */
   onToolCallComplete: (toolCall: ToolCallInfo, artifacts?: ToolArtifact[]) => void
+  onBeforeToolExecution?: (toolCall: ToolCallInfo) => Promise<boolean>
   /** Tool 需要用户确认 */
   onToolCallConfirmRequired: (toolCall: ToolCallInfo) => Promise<boolean>
   /** 进度更新 */
   onProgress?: (progress: AgentProgress) => void
+  onTimeline?: (blocks: import('./agent-timeline').AgentTimelineBlock[]) => void
   /** 全部完成 */
-  onDone: (fullText: string, toolCalls: ToolCallInfo[], artifacts: ToolArtifact[]) => void
+  onDone: (fullText: string, toolCalls: ToolCallInfo[], artifacts: ToolArtifact[], outcome?: ExecutionOutcome) => void
   /** 错误 */
   onError: (error: string) => void
 }
 
 /** 引擎依赖注入（保持 agent-engine 无 electron 依赖可单测；agent-store 注入真实 IPC 实现） */
 export interface AgentEngineDeps {
+  executionScope?: string
+  conversationId?: string
   getWorkflowStatus?: (runId: string) => string | undefined
   /** 长工具结果写盘（>800 tokens 落盘引用；失败返回 success:false 时引擎回退截断注入） */
   writeResult?: (content: string) => Promise<{ success: boolean; path?: string; error?: string }>
@@ -150,9 +162,8 @@ export interface AgentEngineOptions {
 }
 
 /** LLM 消息格式 */
-export interface LLMMessage {
-  role: 'system' | 'user' | 'assistant'
-  content: string
+export interface LLMMessage extends LLMChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool'
 }
 
 /** LLM 生成函数签名（由 agent-store 提供实际实现）
@@ -165,7 +176,8 @@ export type LLMGenerateFn = (
   onChunk?: (chunk: string) => void,
   /** 底层流式请求 id 回填（C 档第二轮：子 agent 的飞行中请求要能被取消） */
   onRequestId?: (requestId: string) => void,
-) => Promise<string>
+  signal?: AbortSignal,
+) => Promise<string | LLMStepResult>
 
 // ===== 核心引擎 =====
 
@@ -207,6 +219,10 @@ export async function runAgentLoop(
   let steps = 0
   let fullAssistantText = ''
   let workflowClaimCorrectionUsed = false
+  let mutationClaimCorrectionUsed = false
+  const turnId = crypto.randomUUID()
+  const timeline: import('./agent-timeline').AgentTimelineBlock[] = []
+  const publishTimeline = () => callbacks.onTimeline?.(timeline.map(block => ({ ...block })))
   const claimEvidence = { toolCalls: allToolCalls, artifacts: allArtifacts, getWorkflowStatus: deps?.getWorkflowStatus }
   const finish = (text: string, calls: ToolCallInfo[], artifacts: ToolArtifact[]) => {
     const claims = unsupportedWorkflowClaims(text, claimEvidence)
@@ -215,7 +231,25 @@ export async function runAgentLoop(
       : text
     const trustedArtifacts = artifacts.filter(a => !a.type.startsWith('workflow_') || allArtifacts.includes(a)
       || allArtifacts.some(real => real.type === a.type && real.name === a.name && real.metadata?.runId === a.metadata?.runId))
-    callbacks.onDone(verified, calls, trustedArtifacts)
+    const mutationClaims = unsupportedMutationClaims(verified, calls)
+    const finalText = mutationClaims.length
+      ? `${removeMutationClaims(verified, mutationClaims)}\n\n${UNVERIFIED_EXECUTION_NOTICE}`.trim()
+      : verified
+    const receipts = calls.flatMap(call => call.receipt ? [call.receipt] : [])
+    const outcome: ExecutionOutcome = {
+      turnId,
+      status: abortSignal?.aborted ? 'cancelled' : steps >= MAX_STEPS ? 'exhausted' : mutationClaims.length || claims.length ? 'unverified'
+        : calls.some(call => call.status === 'failed') ? 'partial' : 'completed',
+      receipts,
+    }
+    if (timeline.filter(block => block.kind === 'text').map(block => block.text).join('') !== finalText) {
+      const toolBlocks = timeline.filter(block => block.kind === 'tools')
+      timeline.splice(0, timeline.length, ...toolBlocks, { seq: timeline.length, kind: 'text', text: finalText })
+    }
+    timeline.forEach((block, seq) => { block.seq = seq })
+    publishTimeline()
+    callbacks.onTextReplace?.(finalText)
+    callbacks.onDone(finalText, calls, trustedArtifacts, outcome)
   }
 
   // 恢复阶梯状态（withhold-then-recover，P0-2）：可恢复错误先恢复后放行；
@@ -247,6 +281,7 @@ export async function runAgentLoop(
     // 发送前按当前预算压缩消息副本（完整 messages 仍保留给后处理使用）
     let budgetedMessages = compressMessagesToBudget(messages, currentBudget)
     let llmResponse: string
+    let nativeStep: LLMStepResult | undefined
     let streamed = false
     // DSML 流式守卫（2026-10-17）：DeepSeek V4.1 会把原生工具调用标记（<｜｜DSML｜｜ ...>）
     // 当正文流回来。先在本层截住，避免 Markdown 面板闪现原始标记；全文解析在生成返回后做。
@@ -254,11 +289,18 @@ export async function runAgentLoop(
     const dsmlStreamFilter = createDsmlStreamFilter()
     const xmlStreamFilter = createToolProtocolStreamFilter()
     try {
-      llmResponse = await generateFn(budgetedMessages, modelId, (chunk) => {
+      const generated = await waitWithAbort(generateFn(budgetedMessages, modelId, (chunk) => {
+        if (abortSignal?.aborted) return
         streamed = true
         const safe = dsmlStreamFilter.push(xmlStreamFilter.push(chunk))
         if (safe) callbacks.onTextChunk(safe)
-      })
+      }, undefined, abortSignal), abortSignal)
+      nativeStep = typeof generated === 'string' ? undefined : generated
+      if (nativeStep && (!nativeStep.terminalSeen || !['stop', 'tool_use'].includes(nativeStep.finishReason))) {
+        throw new Error(`模型步骤未正常结束：${nativeStep.finishReason}，未执行本步工具`)
+      }
+      if (nativeStep) validateToolCalls(nativeStep.toolCalls)
+      llmResponse = typeof generated === 'string' ? generated : generated.text
       const xmlTail = xmlStreamFilter.flush()
       const streamTail = dsmlStreamFilter.push(xmlTail) + dsmlStreamFilter.flush()
       if (streamTail) callbacks.onTextChunk(streamTail)
@@ -313,7 +355,11 @@ export async function runAgentLoop(
     // 解析 LLM 回复：分离文本和 tool_call（含 DeepSeek DSML 原生标记 repair，见 dsml-tool-calls.ts）
     const parsed = parseToolCalls(llmResponse)
     let { textParts, toolCalls } = parsed
-    const { parseErrors } = parsed
+    const parseErrors = nativeStep?.toolCalls.length ? [] : parsed.parseErrors
+    if (nativeStep?.toolCalls.length) {
+      toolCalls = nativeStep.toolCalls
+      textParts = parsed.textParts
+    }
     // 裸 JSON 工具调用兜底（Qwen 等 OpenAI-compatible 模型）
     if (toolCalls.length === 0) {
       const bare = parseBareJsonToolCalls(llmResponse, (name) => !!toolRegistry.get(name))
@@ -345,6 +391,8 @@ export async function runAgentLoop(
       // 流式模式下文本已通过 onChunk 实时推送，避免重复输出
       if (!streamed) callbacks.onTextChunk(textContent)
       fullAssistantText += textContent
+      timeline.push({ seq: timeline.length, kind: 'text', text: textContent })
+      publishTimeline()
     }
 
     // ★ 工具调用解析失败诊断（逐条反馈，不静默）：
@@ -409,6 +457,15 @@ export async function runAgentLoop(
     }
 
     if (toolCalls.length === 0) {
+      const mutationClaims = unsupportedMutationClaims(fullAssistantText, allToolCalls)
+      if (mutationClaims.length && !mutationClaimCorrectionUsed && steps < MAX_STEPS) {
+        mutationClaimCorrectionUsed = true
+        fullAssistantText = removeMutationClaims(fullAssistantText, mutationClaims)
+        callbacks.onTextReplace?.(fullAssistantText)
+        messages.push({ role: 'assistant', content: llmResponse })
+        messages.push({ role: 'user', content: EXECUTION_DIAGNOSIS.replace('{claims}', () => mutationClaims.join('\n')) })
+        continue
+      }
       const claims = unsupportedWorkflowClaims(fullAssistantText, claimEvidence)
       if (claims.length > 0 && !workflowClaimCorrectionUsed && steps < MAX_STEPS) {
         workflowClaimCorrectionUsed = true
@@ -453,7 +510,9 @@ export async function runAgentLoop(
     }
 
     // 将 LLM 的完整回复加入历史（包含 tool_call 标签）
-    messages.push({ role: 'assistant', content: llmResponse })
+    messages.push(nativeStep?.toolCalls.length
+      ? { role: 'assistant', content: textContent, toolCalls: nativeStep.toolCalls }
+      : { role: 'assistant', content: llmResponse })
 
     const observationParts: string[] = []
 
@@ -466,13 +525,16 @@ export async function runAgentLoop(
     const allowed = options?.allowedTools
     const jobs: ToolCallJob[] = toolCalls.map(tc => {
       const info: ToolCallInfo = {
-        id: crypto.randomUUID(),
+        id: tc.id ?? crypto.randomUUID(),
         toolName: tc.name,
         arguments: tc.arguments,
         status: 'pending',
         // 交错排版（2026-10-17）：记录解析时刻的正文累计长度——同一轮多个调用 offset 相同；
         // 渲染层据此把这一轮工具批插到「本轮正文」之后（旧归档无此字段 → 保持底部布局）
         contentOffset: fullAssistantText.length,
+        turnId,
+        step: steps,
+        providerMetadata: tc.providerMetadata,
       }
       allToolCalls.push(info)
       const registered = toolRegistry.get(tc.name)
@@ -483,6 +545,8 @@ export async function runAgentLoop(
       if (tool) info.source = tool.source
       return { tc, tool, deniedByAllowlist: Boolean(registered) && !permitted, info }
     })
+    timeline.push({ seq: timeline.length, kind: 'tools', callIds: jobs.map(job => job.info.id) })
+    publishTimeline()
     // 白名单与 options 同源透传给执行层（供「不在白名单」观察文案列可用集合）——
     // 两条执行路径（单元素批 / 只读并行批）共用同一个 execDeps，避免只补一处
     const execDeps: AgentEngineDeps | undefined = options?.allowedTools
@@ -524,7 +588,7 @@ export async function runAgentLoop(
     for (const batch of batches) {
       if (batch.length === 1) {
         // 单工具批（写/需确认/未知工具 + 单个只读——现状串行路径逐字节等价）
-        const outcome = await executeToolJob(batch[0], callbacks, execDeps)
+        const outcome = await executeToolJob(batch[0], callbacks, execDeps, abortSignal)
         observationParts.push(outcome.observation)
         if (outcome.artifacts.length > 0) allArtifacts.push(...outcome.artifacts)
         continue
@@ -532,7 +596,7 @@ export async function runAgentLoop(
       // 只读并行批：Promise.all 并发执行（引擎无 electron 依赖，无新并行基础设施）；
       // 单工具失败由 executeToolJob 内部 try/catch 隔离——失败项照旧注入 error observation，
       // 不影响同批其他工具；每个工具仍走 executeToolWithTimeout 超时包装
-      const outcomes = await Promise.all(batch.map(job => executeToolJob(job, callbacks, execDeps)))
+      const outcomes = await Promise.all(batch.map(job => executeToolJob(job, callbacks, execDeps, abortSignal)))
       for (const outcome of outcomes) {
         observationParts.push(outcome.observation)
         if (outcome.artifacts.length > 0) allArtifacts.push(...outcome.artifacts)
@@ -545,7 +609,10 @@ export async function runAgentLoop(
       ? [`${t('engine.parsePartialDiagnosis')}\n${parseFeedbackForObservation}`, ...observationParts]
       : observationParts
     const observation = `${t('engine.observationHeader')}\n\n${observationPartsWithDiagnosis.join('\n\n')}\n\n${t('engine.observationFooter')}`
-    messages.push({ role: 'user', content: observation })
+    if (nativeStep?.toolCalls.length) {
+      for (let i = 0; i < jobs.length; i++) messages.push({ role: 'tool', toolCallId: jobs[i].info.id, name: jobs[i].info.toolName, content: observationParts[i] })
+      if (parseFeedbackForObservation) messages.push({ role: 'user', content: parseFeedbackForObservation })
+    } else messages.push({ role: 'user', content: observation })
   }
 
   // 达到单次轮次的步骤上限
@@ -577,8 +644,10 @@ export async function runAgentLoop(
 
 /** 解析的 Tool 调用 */
 interface ParsedToolCall {
+  id?: string
   name: string
   arguments: Record<string, unknown>
+  providerMetadata?: Record<string, unknown>
 }
 
 /** 单条 tool_call 的执行 job（M1 预扫描阶段创建，保持原始顺序） */
@@ -611,9 +680,17 @@ async function executeToolJob(
   job: ToolCallJob,
   callbacks: AgentEngineCallbacks,
   deps: AgentEngineDeps | undefined,
+  signal?: AbortSignal,
 ): Promise<ToolJobOutcome> {
   const { tc, tool, info } = job
   const artifacts: ToolArtifact[] = []
+  const failBeforeExecution = (error: unknown): ToolJobOutcome => {
+    info.status = 'failed'
+    info.error = sanitizeErrorText(error)
+    callbacks.onToolCallComplete(info)
+    return { observation: `<tool_result name="${tc.name}" error="true">\n${info.error}\n</tool_result>`, artifacts }
+  }
+  if (signal?.aborted) return failBeforeExecution('操作已取消，未启动')
 
   // 查找 Tool（预扫描已定位；此处 tool 不存在走「不在白名单」/「未知工具」两条错误注入）
   if (!tool) {
@@ -639,7 +716,11 @@ async function executeToolJob(
     info.status = 'waiting_confirm'
     callbacks.onToolCallStart(info)
 
-    const confirmed = await callbacks.onToolCallConfirmRequired(info)
+    let confirmed: boolean
+    try {
+      confirmed = await waitWithAbort(callbacks.onToolCallConfirmRequired(info), signal)
+    } catch (error) { return failBeforeExecution(error) }
+    if (signal?.aborted) return failBeforeExecution('操作已取消，未启动')
     if (!confirmed) {
       info.status = 'failed'
       info.error = t('agent.userRejected')
@@ -653,13 +734,28 @@ async function executeToolJob(
 
   // 执行 Tool
   info.status = 'running'
+  if (!tool.isReadOnly) info.receipt = {
+    turnId: info.turnId!, step: info.step!, callId: info.id, toolName: tool.name,
+    target: executionTarget(tool.name, tc.arguments), outcome: 'unknown', verified: false,
+  }
   callbacks.onToolCallStart(info)
   const executeStartedAt = Date.now()
 
   try {
+    if (!tool.isReadOnly && callbacks.onBeforeToolExecution) {
+      try {
+        const saved = await waitWithAbort(callbacks.onBeforeToolExecution(info), signal)
+        if (!saved) throw new Error('执行记录保存失败')
+      } catch (error) {
+        throw new ToolExecutionInterrupted(`执行记录未保存，未启动写操作：${sanitizeErrorText(error)}`, false)
+      }
+    }
     // 工具级超时覆盖（C 档第二轮 C1）：`task` 派子 agent 的设计上限 300s + 审批卡 120s，
     // 用全局 30s 会把所有 >30s 的子任务腰斩（结论永远回不到父端，子 agent 还在空烧 token）
-    const result = await executeToolWithTimeout(tool.execute, tc.arguments, tool.timeoutMs ?? TOOL_TIMEOUT_MS)
+    const result = await executeTool(tool, tc.arguments, {
+      signal: signal ?? new AbortController().signal,
+      turnId: info.turnId!, step: info.step!, callId: info.id, operationId: info.id, scope: deps?.executionScope, toolName: tool.name, conversationId: deps?.conversationId,
+    }, tool.timeoutMs ?? TOOL_TIMEOUT_MS)
 
     // 截断过长的结果
     const truncatedContent = truncateResult(result.content, TOOL_RESULT_MAX_TOKENS)
@@ -669,6 +765,17 @@ async function executeToolJob(
     info.duration_ms = Date.now() - executeStartedAt
     if (result.error) info.error = result.error
     if (result.artifacts) artifacts.push(...result.artifacts)
+    if (!tool.isReadOnly && tool.name !== 'start_workflow' && tool.name !== 'task') {
+      const committed = result.success && (tool.name !== 'update_config' || result.persistence?.verified === true)
+      info.receipt = {
+        turnId: info.turnId!, step: info.step!, callId: info.id, toolName: tool.name,
+        target: result.persistence?.target ?? executionTarget(tool.name, tc.arguments),
+        outcome: result.executionState === 'unknown' ? 'unknown' : committed ? 'committed' : 'failed',
+        verified: result.persistence?.verified === true,
+        projectPath: result.persistence?.projectPath,
+        revision: result.persistence?.revision,
+      }
+    }
 
     if (artifacts.length > 0) callbacks.onToolCallComplete(info, artifacts)
     else callbacks.onToolCallComplete(info)
@@ -713,6 +820,13 @@ async function executeToolJob(
     info.status = 'failed'
     info.duration_ms = Date.now() - executeStartedAt
     info.error = t('agent.executionError').replace('{error}', sanitizeErrorText(error))
+    if (!tool.isReadOnly) {
+      info.receipt = {
+        turnId: info.turnId!, step: info.step!, callId: info.id, toolName: tool.name,
+        target: executionTarget(tool.name, tc.arguments), verified: false,
+        outcome: error instanceof ToolExecutionInterrupted && !error.unknown ? 'failed' : 'unknown',
+      }
+    }
     callbacks.onToolCallComplete(info)
     return {
       observation: `<tool_result name="${tc.name}" error="true">\n${t('agent.executionError').replace('{error}', sanitizeErrorText(error))}\n</tool_result>`,
@@ -889,30 +1003,6 @@ ${t('engine.parseBulletNoExtraText')}`
 }
 
 /**
- * 带超时的 Tool 执行
- *
- * 注意：Promise.race 超时后工具本身无法中止（副作用可能已发生），
- * 这里仅确保等待不无限期挂起，并在 settle 后清理计时器。
- */
-async function executeToolWithTimeout(
-  executeFn: (args: Record<string, unknown>) => Promise<ToolResult>,
-  args: Record<string, unknown>,
-  timeoutMs: number,
-): Promise<ToolResult> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([
-      executeFn(args),
-      new Promise<ToolResult>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(t('agent.toolTimeout').replace('{n}', String(timeoutMs / 1000)))), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
-
-/**
  * 错误文本脱敏（P3 修复）：截断 + 去除绝对路径——原始异常常含绝对路径/DB 栈，
  * 直接注入 LLM 上下文会泄漏本机路径信息。
  */
@@ -990,8 +1080,26 @@ export function isRecoverableError(message: string): boolean {
  * 注意：仅作用于发送给 LLM 的副本，不修改引擎的完整消息记录。
  */
 function compressMessagesToBudget(messages: LLMMessage[], budget: number): LLMMessage[] {
-  const total = messages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+  const total = messages.reduce((sum, m) => sum + estimateTokens(m.content + JSON.stringify(m.toolCalls ?? [])), 0)
   if (total <= budget) return messages
+  if (messages.some(m => m.toolCalls?.length || m.role === 'tool')) {
+    const groups: LLMMessage[][] = []
+    for (const message of messages) {
+      if (message.role === 'system') continue
+      if (message.role === 'tool' && groups.at(-1)?.[0].toolCalls?.length) groups.at(-1)!.push(message)
+      else groups.push([message])
+    }
+    const system = messages.filter(m => m.role === 'system')
+    let tokens = system.reduce((sum, m) => sum + estimateTokens(m.content), 0)
+    const tail: LLMMessage[][] = []
+    for (let i = groups.length - 1; i >= 0; i--) {
+      const size = groups[i].reduce((sum, m) => sum + estimateTokens(m.content + JSON.stringify(m.toolCalls ?? [])), 0)
+      if (tail.length && tokens + size > budget) break
+      tail.unshift(groups[i])
+      tokens += size
+    }
+    return [...system, ...tail.flat()]
+  }
 
   const out: LLMMessage[] = []
   let used = 0

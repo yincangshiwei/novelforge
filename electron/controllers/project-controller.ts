@@ -14,7 +14,15 @@ import type { ProjectSummary } from '../../src/shared/ipc-channels'
 import { DIR_VELA_INTERNAL, DIR_PROMPTS } from '../../src/shared/project-paths'
 import { initProjectDatabase } from '../database'
 import { ProjectCoreRepository } from '../repositories/project-core-repository'
-import { guardedHandle } from '../security/ipc-guard'
+import { guardedHandle as registerGuardedHandle } from '../security/ipc-guard'
+import { checkOperationCancellation, withOperationCommit, isOperationRollback } from '../services/agent-operation-journal'
+
+const guardedHandle: typeof registerGuardedHandle = (channel, handler) => {
+  registerGuardedHandle(channel, async (event, ...args) => {
+    checkOperationCancellation()
+    return handler(event, ...args)
+  })
+}
 
 interface RecentProject {
   name: string
@@ -98,6 +106,7 @@ export function registerProjectController() {
 
       return { success: true, projectId, projectPath: projectDir }
     } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || isOperationRollback(error) || ('notCommitted' in error && error.notCommitted === true))) throw error
       return { success: false, projectId: '', error: safeErrorMessage(error) }
     }
   })
@@ -156,6 +165,7 @@ export function registerProjectController() {
 
       return { success: true, project: projectData }
     } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || isOperationRollback(error) || ('notCommitted' in error && error.notCommitted === true))) throw error
       return { success: false, project: null, error: safeErrorMessage(error) }
     }
   })
@@ -204,6 +214,7 @@ export function registerProjectController() {
       }
 
       // 单次批量更新
+      checkOperationCancellation()
       ProjectCoreRepository.update(updateData)
       logger.info('Project', t('log.project.configPersisted').replace('{count}', String(Object.keys(updateData).length)))
 
@@ -215,6 +226,7 @@ export function registerProjectController() {
 
       return { success: true }
     } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || isOperationRollback(error) || ('notCommitted' in error && error.notCommitted === true))) throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -222,6 +234,13 @@ export function registerProjectController() {
   // project:update-config 同理
   guardedHandle('project:update-config', async (_event, _projectId: string, data: Partial<ProjectData>) => {
     try {
+      const currentPath = getCurrentProjectPath()
+      if (!data.path || !currentPath || path.resolve(data.path) !== path.resolve(currentPath)) {
+        return { success: false, error: '配置保存失败：目标项目与当前数据库不匹配' }
+      }
+      if (!data.novelConfig || !ProjectCoreRepository.get()) {
+        return { success: false, error: '配置保存失败：配置或项目记录不存在' }
+      }
       if (data.novelConfig) {
         const nc = data.novelConfig
         const updateData: Partial<import('../repositories/project-core-repository').ProjectCoreData> = {}
@@ -240,10 +259,23 @@ export function registerProjectController() {
         if (nc.coreOutline !== undefined) updateData.coreOutline = nc.coreOutline
         if (nc.worldSetting !== undefined) updateData.worldSetting = nc.worldSetting
         if (nc.protagonistProfile !== undefined) updateData.protagonistProfile = nc.protagonistProfile
-        ProjectCoreRepository.update(updateData)
+        if (!Object.keys(updateData).length) return { success: false, error: '没有可更新的配置字段' }
+        return withOperationCommit(() => {
+          ProjectCoreRepository.update(updateData)
+          const saved = ProjectCoreRepository.get()
+          if (!saved) throw new Error('配置回读失败')
+          const persistedConfig: Record<string, unknown> = {}
+          for (const [key, expected] of Object.entries(updateData)) {
+            const actual = saved[key as keyof typeof saved]
+            if (actual !== expected) throw new Error(`配置回读不一致：${key}`)
+            persistedConfig[key === 'narrativePov' ? 'narrativePOV' : key] = actual
+          }
+          return { success: true, persistedConfig, projectPath: currentPath, revision: saved.updatedAt }
+        })
       }
-      return { success: true }
+      return { success: false, error: '缺少配置更新数据' }
     } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || isOperationRollback(error) || ('notCommitted' in error && error.notCommitted === true))) throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -297,6 +329,7 @@ export function registerProjectController() {
       title: t('dialog.selectFolder'),
     })
     if (result.canceled || result.filePaths.length === 0) return null
+    checkOperationCancellation()
     // 登记授权目录：导出/分享卡随后写入该目录不被沙箱拦截
     grantDirectory(result.filePaths[0])
     return result.filePaths[0]
@@ -312,6 +345,7 @@ export function registerProjectController() {
     }
     const result = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options)
     if (result.canceled || !result.filePath) return null
+    checkOperationCancellation()
     grantDirectory(path.dirname(result.filePath))
     return result.filePath
   })

@@ -13,6 +13,8 @@ import { t } from '../../src/shared/locale'
 import { safeErrorMessage } from '../utils/error-utils'
 import { VELA_HOME } from '../utils/config-utils'
 import { guardedHandle } from '../security/ipc-guard'
+import { checkOperationCancellation } from '../services/agent-operation-journal'
+import { randomUUID } from 'node:crypto'
 
 /** MCP 配置文件路径（与 mcpManager.getDefaultConfigPath 一致） */
 function mcpConfigPath(): string {
@@ -33,8 +35,18 @@ async function readMcpConfig(): Promise<Record<string, { command: string; args?:
 async function writeMcpConfig(
   servers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>,
 ): Promise<void> {
+  checkOperationCancellation()
   await fs.mkdir(path.dirname(mcpConfigPath()), { recursive: true })
-  await fs.writeFile(mcpConfigPath(), JSON.stringify({ mcpServers: servers }, null, 2), 'utf-8')
+  checkOperationCancellation()
+  const temp = `${mcpConfigPath()}.${randomUUID()}.tmp`
+  try {
+    await fs.writeFile(temp, JSON.stringify({ mcpServers: servers }, null, 2), { encoding: 'utf-8', flag: 'wx' })
+    checkOperationCancellation()
+    await fs.rename(temp, mcpConfigPath())
+  } catch (error) {
+    await fs.unlink(temp).catch(() => {})
+    throw error
+  }
 }
 
 /**
@@ -48,6 +60,7 @@ export function registerMCPHandlers(): void {
       const configs = await mcpManager.loadConfig(configPath)
       return { success: true, configs }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, configs: [], error: safeErrorMessage(error) }
     }
   })
@@ -60,6 +73,7 @@ export function registerMCPHandlers(): void {
       await mcpManager.connectById(serverId)
       return { success: true }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -70,6 +84,7 @@ export function registerMCPHandlers(): void {
       await mcpManager.disconnect(serverId)
       return { success: true }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -80,6 +95,7 @@ export function registerMCPHandlers(): void {
       await mcpManager.disconnectAll()
       return { success: true }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -96,6 +112,7 @@ export function registerMCPHandlers(): void {
 
   // 调用 MCP Tool
   guardedHandle('mcp:call-tool', async (_event, serverId: string, toolName: string, args: Record<string, unknown>) => {
+    checkOperationCancellation()
     return await mcpManager.callTool(serverId, toolName, args)
   })
 
@@ -117,6 +134,7 @@ export function registerMCPHandlers(): void {
       await writeMcpConfig(servers)
       return { success: true }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -131,6 +149,7 @@ export function registerMCPHandlers(): void {
       await mcpManager.disconnect(serverId).catch(() => { /* 未连接则忽略 */ })
       return { success: true }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })

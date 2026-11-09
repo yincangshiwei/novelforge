@@ -4,7 +4,7 @@
  * NovelForge 隔离实例 CLI
  *
  * 用法：
- *   node scripts/dev-instance.mjs start [--project <path>] [--port <n>] [--name <label>] [--json]
+ *   node scripts/dev-instance.mjs start [--project <path>] [--port <n>] [--name <label>] [--fresh] [--json]
  *   node scripts/dev-instance.mjs list [--json]
  *   node scripts/dev-instance.mjs stop <id>
  *   node scripts/dev-instance.mjs clean <id> --yes
@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url'
 import {
   parseArgs, buildInstanceId, sanitizeName, isPidAlive,
   readManifests, pickFreePort, isPortFree, buildChildEnv, isOwnedProcessCommand,
-  getCdpPage, openCdp,
+  getCdpPage, openCdp, seedInstanceHome,
 } from './dev-instance-lib.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -51,10 +51,6 @@ function readJson(file, fallback = null) {
 function writeJson(file, value) {
   ensureDir(path.dirname(file))
   fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n')
-}
-function copyIfExists(src, dst) {
-  if (!fs.existsSync(src)) return
-  fs.cpSync(src, dst, { recursive: true, force: true })
 }
 function instanceDir(id) { return path.join(instancesRoot, id) }
 function manifestPath(id) { return path.join(instanceDir(id), 'manifest.json') }
@@ -104,11 +100,7 @@ async function start(options) {
   ensureDir(path.join(home, '.config'))
   if (project) ensureDir(project)
 
-  const sourceHome = path.join(os.homedir(), '.novelforge')
-  for (const file of ['config.json', 'models.json', 'credentials.json']) {
-    copyIfExists(path.join(sourceHome, file), path.join(home, '.novelforge', file))
-  }
-  copyIfExists(path.join(sourceHome, 'prompts'), path.join(home, '.novelforge', 'prompts'))
+  seedInstanceHome(path.join(os.homedir(), '.novelforge'), home, Boolean(options.fresh))
 
   // 隔离实例不继承真实最近项目列表，避免 UI 里出现未隔离的路径
   const configPath = path.join(home, '.novelforge', 'config.json')
@@ -143,7 +135,7 @@ async function start(options) {
   // 从 UI 启动时，CLI 自己由 ELECTRON_RUN_AS_NODE=1 执行；
   // 该变量绝不能传给新窗口，否则 Electron 会以纯 Node 模式跑 main.js。
   // Windows 上 HOME/XDG 不生效，buildChildEnv 会同时设置 USERPROFILE/APPDATA/LOCALAPPDATA。
-  const childEnv = buildChildEnv(process.env, home, process.platform)
+  const childEnv = buildChildEnv(process.env, home, process.platform, Boolean(options.fresh))
   childEnv.NOVELFORGE_DEV_INSTANCE = id
   childEnv.NOVELFORGE_DEV_INSTANCES_ROOT = instancesRoot
   if (process.platform === 'win32') {
@@ -433,7 +425,8 @@ async function main() {
     default:
       console.log(`NovelForge isolated instance CLI
 
-  start [--project <path>] [--port <n>] [--name <label>] [--dev-console] [--json]
+  start [--project <path>] [--port <n>] [--name <label>] [--dev-console] [--fresh] [--json]
+    --fresh skips config/models/credentials/prompts copying and clears credential environment variables
   list [--json]
   stop <id> [--force]
   clean <id> --yes [--force]

@@ -1,7 +1,7 @@
 import type { AgentMessage, AgentConversation, RewoundBranch } from '../../stores/agent-store'
 import { toolRegistry } from './tool-registry'
 import { estimateTokens } from './token-budget'
-import { sanitizeMessageList } from './conversation-recovery'
+import { sanitizeMessageList, sanitizeToolCalls } from './conversation-recovery'
 import { stripDsmlMarkup } from './dsml-tool-calls'
 import { computePrefixFingerprint } from './prefix-accounting'
 import { MAX_SUB_SESSIONS, MAX_SUBAGENT_MESSAGES, type SubAgentSession } from './subagent/types'
@@ -44,7 +44,7 @@ export function computeConversationDependencyHash(conv: { messages: AgentMessage
 export interface SideEffectReceipt {
   tool: string
   target: string
-  outcome: 'ok' | 'failed'
+  outcome: 'ok' | 'failed' | 'unknown'
   artifactPaths: string[]
 }
 
@@ -66,10 +66,12 @@ export function extractSideEffectReceipts(messages: AgentMessage[]): SideEffectR
       // 只抽**有副作用**的工具（评审 I5）：否则一批 40 次 read_file 会把
       // 真正的写入回执挤出 32 条上限。未知工具保守跳过。
       const tool = toolRegistry.get(tc.toolName)
-      if (tool?.isReadOnly !== false) continue
+      if (!tc.receipt && tool?.isReadOnly !== false) continue
 
       const args = (tc.arguments ?? {}) as Record<string, unknown>
-      const target = String(args.file_path ?? args.path ?? tc.toolName)
+      const target = tc.receipt
+        ? `${tc.receipt.projectPath ?? ''}:${tc.receipt.target}`
+        : tc.toolName === 'update_config' ? `config:${String(args.field)}` : String(args.file_path ?? args.path ?? tc.toolName)
       const artifactPaths = (m.artifacts ?? [])
         .map(a => (a as { path?: string }).path)
         .filter((p): p is string => typeof p === 'string' && p.length > 0)
@@ -78,7 +80,7 @@ export function extractSideEffectReceipts(messages: AgentMessage[]): SideEffectR
       byKey.set(target, {
         tool: tc.toolName,
         target,
-        outcome: tc.status === 'failed' ? 'failed' : 'ok',
+        outcome: tc.receipt ? (tc.receipt.outcome === 'committed' ? 'ok' : tc.receipt.outcome) : tc.status === 'failed' ? 'failed' : 'ok',
         artifactPaths: [...new Set(artifactPaths)],
       })
     }
@@ -187,7 +189,7 @@ export function parseArchive(raw: string): AgentConversation | null {
             // 永久返回「该子任务已在执行中」= 这个子任务在本会话里再也跑不了
             status: s.status === 'running' ? 'cancelled' : s.status,
             error: s.status === 'running' ? t('subagent.interrupted') : s.error,
-            toolCalls: Array.isArray(s.toolCalls) ? s.toolCalls : [],
+            toolCalls: sanitizeToolCalls(s.toolCalls),
             artifacts: Array.isArray(s.artifacts) ? s.artifacts : [],
             allowedTools: Array.isArray(s.allowedTools) ? s.allowedTools : [],
             // 2026-10-17（核查反例 G）：旧版 runner 泄漏的 DSML 可能落在 result（不在 messages）；

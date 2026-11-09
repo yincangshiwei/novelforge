@@ -70,6 +70,7 @@ export const promptTexts = {
   'prompt.var.chapter_name': { 'zh-CN': '章节标题', 'en-US': 'Chapter title', 'ru-RU': 'Название главы' },
   'prompt.var.cards_json': { 'zh-CN': '现有角色卡 JSON 数组（包含 name/role 等基础信息）', 'en-US': 'Existing character cards (JSON with name/role)', 'ru-RU': 'Существующие карточки (JSON: name/role)' },
   'prompt.var.char_map_text': { 'zh-CN': '角色图谱纯文本', 'en-US': 'Character map (plain text)', 'ru-RU': 'Карта персонажей (текст)' },
+  'prompt.var.planned_characters_json': { 'zh-CN': '已有姓名与章节蓝图 JSON', 'en-US': 'Existing names and chapter blueprints (JSON)', 'ru-RU': 'Существующие имена и планы глав (JSON)' },
   'prompt.var.character_name': { 'zh-CN': '角色名', 'en-US': 'Character name', 'ru-RU': 'Имя персонажа' },
   'prompt.var.chapters_segments': { 'zh-CN': '该角色出现的章节相关段落(带章节号)', 'en-US': 'Chapter segments where the character appears (with chapter numbers)', 'ru-RU': 'Фрагменты глав с персонажем (с номерами глав)' },
   'prompt.var.characters_segments': { 'zh-CN': '多角色及其相关章节段落(带章节号)', 'en-US': 'Multiple characters with their chapter segments (with chapter numbers)', 'ru-RU': 'Персонажи с фрагментами глав (с номерами глав)' },

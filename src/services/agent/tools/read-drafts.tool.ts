@@ -3,7 +3,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 
 
@@ -28,7 +28,9 @@ export const readDraftsTool = buildAgentTool({
     required: ['chapter_number'],
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
@@ -44,7 +46,7 @@ export const readDraftsTool = buildAgentTool({
 
     try {
       // 从数据库获取章节的草稿列表
-      const draftsResult = await ipc.invoke('db:draft-list', chapterNum)
+      const draftsResult = await toolIpc.invoke('db:draft-list', chapterNum)
       const drafts = (Array.isArray(draftsResult) ? draftsResult : []) as unknown as Array<Record<string, unknown>>
       if (!drafts || drafts.length === 0) {
         return { success: true, content: t('tool.readDraftsNone').replace('{chapter}', String(chapterNum)) }
@@ -73,7 +75,7 @@ export const readDraftsTool = buildAgentTool({
         targetName = `v${target.version as number}`
       }
 
-      const fullDraft = await ipc.invoke('db:draft-get-full', targetId as number) as { content?: string } | null
+      const fullDraft = await toolIpc.invoke('db:draft-get-full', targetId as number) as { content?: string } | null
       if (!fullDraft) {
         return { success: false, content: '', error: t('tool.readDraftsContentFailed').replace('{id}', String(targetId)) }
       }

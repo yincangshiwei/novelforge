@@ -13,7 +13,15 @@ import { logger } from '../utils/logger'
 import { safeErrorMessage } from '../utils/error-utils'
 import { GlobalConfig, ModelProfile } from '../../src/shared/ipc-channels'
 import { embeddingService } from '../embedding-service'
-import { guardedHandle } from '../security/ipc-guard'
+import { guardedHandle as registerGuardedHandle } from '../security/ipc-guard'
+import { checkOperationCancellation } from '../services/agent-operation-journal'
+
+const guardedHandle: typeof registerGuardedHandle = (channel, handler) => {
+  registerGuardedHandle(channel, async (event, ...args) => {
+    checkOperationCancellation()
+    return handler(event, ...args)
+  })
+}
 // L4 S8：对话框结果由主进程直接签发授权（取代渲染层自行调用的 fs:grant-external-file）
 import { grantDirectory, grantExternalFile } from './fs-controller'
 
@@ -216,6 +224,7 @@ export function registerKBController() {
             })
 
             if (updates.length > 0) {
+              checkOperationCancellation()
               const res = await updateChunkVectors(projectPath, updates)
               if (!res.success) {
                 // T4 R1（M2）：透传 updateChunkVectors 的**具体**错误（维度拒绝时含「重建索引」指引）
@@ -234,6 +243,7 @@ export function registerKBController() {
               failed += updates.length - res.count
             }
           } catch (e) {
+            if (e instanceof Error && e.name === 'AbortError') throw e
             failed = vectorless.length
             return { success: false, processed: 0, failed, error: t('kb.llmWriteFailedDetail').replace('{error}', String(e)) }
           }
@@ -241,6 +251,7 @@ export function registerKBController() {
 
         return { success: true, processed, failed }
       } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') throw error
         logger.warn('KB', t('log.kb.llmBackfillFailed').replace('{err}', String(error)))
       }
     }

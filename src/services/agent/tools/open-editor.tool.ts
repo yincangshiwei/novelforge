@@ -5,7 +5,7 @@ import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
 import { useEditorStore } from '../../../stores/editor-store'
 import { useProjectStore } from '../../../stores/project-store'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { validatePath } from './safe-path'
 
 export const openEditorTool = buildAgentTool({
@@ -30,7 +30,9 @@ export const openEditorTool = buildAgentTool({
   },
   requiresConfirmation: true,
   isReadOnly: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const filePath = args.file_path as string
     const tabType = (args.tab_type as string) ?? 'chapter'
 
@@ -56,10 +58,12 @@ export const openEditorTool = buildAgentTool({
     const fullPath = fullPath_check.fullPath
 
     // 读取文件内容
-    const result = await ipc.invoke('fs:read-file', fullPath)
+    const result = await toolIpc.invoke('fs:read-file', fullPath)
     if (!result.success) {
       return { success: false, content: '', error: t('tool.openEditorReadFailed').replace('{error}', result.error ?? '') }
     }
+
+    if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path || (context?.scope && context.scope !== project.path)) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消或项目已切换，未打开编辑器' }
 
     // 在编辑器中打开
     const fileName = filePath.split('/').pop() ?? filePath
@@ -73,6 +77,7 @@ export const openEditorTool = buildAgentTool({
 
     return {
       success: true,
+      executionState: 'committed',
       content: t('tool.openEditorSuccess').replace('{name}', fileName),
       artifacts: [{ type: 'tab_opened', path: fullPath, name: fileName }],
     }

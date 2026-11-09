@@ -8,6 +8,8 @@ import { runSubAgent, formatSubAgentResult, formatSubAgentTranscript, type SubAg
 import { SUBAGENT_MAX_MS, SUBAGENT_RESULT_MAX_TOKENS, type SubAgentTask } from './types'
 import { estimateTokens } from '../token-budget'
 import { t } from '../../../shared/locale'
+import { toolRegistry } from '../tool-registry'
+import type { LLMGenerateFn } from '../agent-engine'
 
 /**
  * 生成函数的测试形态：**必须显式声明形参类型**——
@@ -76,12 +78,197 @@ describe('runSubAgent', () => {
     expect(s.messages.length).toBeGreaterThan(0)
   })
 
+  it('父 signal 已取消：不装配提示词、不发起生成', async () => {
+    const ac = new AbortController()
+    ac.abort()
+    const buildPrompt = vi.fn(async () => 'SUBPROMPT')
+    const generate = vi.fn<LLMGenerateFn>(async () => '不应生成')
+    const s = await runSubAgent(task(), baseDeps({ signal: ac.signal, buildPrompt, generate }))
+    expect(s.status).toBe('cancelled')
+    expect(buildPrompt).not.toHaveBeenCalled()
+    expect(generate).not.toHaveBeenCalled()
+  })
+
+  it('真实定时器中止挂起生成：及时失败，晚到 chunk 和结果不污染终态', async () => {
+    const realTimer = globalThis.setTimeout
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation((handler, delay, ...args) =>
+      realTimer(handler, delay === SUBAGENT_MAX_MS ? 20 : delay, ...args))
+    let chunk: ((text: string) => void) | undefined
+    let generationSignal: AbortSignal | undefined
+    let resolve!: (text: string) => void
+    const generate = vi.fn<LLMGenerateFn>((_messages, _modelId, onChunk, _onRequestId, signal) => {
+      chunk = onChunk
+      generationSignal = signal
+      expect(signal?.aborted).toBe(false)
+      onChunk?.('已生成部分')
+      return new Promise<string>(r => { resolve = r })
+    })
+    const onUpdate = vi.fn()
+    const onProgress = vi.fn()
+    try {
+      const s = await runSubAgent(task(), baseDeps({ generate, onUpdate, onProgress }))
+      expect(s.status).toBe('failed')
+      expect(s.error).toBe(t('subagent.timeout'))
+      expect(generationSignal?.aborted).toBe(true)
+      expect(s.messages.some(m => m.content.includes('已生成部分'))).toBe(true)
+      expect(s.messages.every(m => !m.streaming)).toBe(true)
+      const snapshot = JSON.stringify(s)
+      const updates = onUpdate.mock.calls.length
+      const progress = onProgress.mock.calls.length
+      chunk?.('晚到内容')
+      resolve('晚到完整结果')
+      await new Promise<void>(r => realTimer(r, 10))
+      expect(JSON.stringify(s)).toBe(snapshot)
+      expect(onUpdate).toHaveBeenCalledTimes(updates)
+      expect(onProgress).toHaveBeenCalledTimes(progress)
+    } finally {
+      timer.mockRestore()
+    }
+  })
+
+  it('父取消挂起生成：不等待模型返回，晚到拒绝不改写取消会话', async () => {
+    const ac = new AbortController()
+    let reject!: (error: Error) => void
+    let generationSignal: AbortSignal | undefined
+    let started!: () => void
+    const generating = new Promise<void>(r => { started = r })
+    const generate = vi.fn<LLMGenerateFn>((_messages, _modelId, _onChunk, _onRequestId, signal) => {
+      generationSignal = signal
+      started()
+      return new Promise<string>((_resolve, r) => { reject = r })
+    })
+    const running = runSubAgent(task(), baseDeps({ generate, signal: ac.signal }))
+    await generating
+    expect(generationSignal).toBeDefined()
+    expect(generationSignal).not.toBe(ac.signal)
+    ac.abort()
+    const s = await running
+    expect(s.status).toBe('cancelled')
+    expect(generationSignal?.aborted).toBe(true)
+    const snapshot = JSON.stringify(s)
+    reject(new Error('晚到网络异常'))
+    await new Promise<void>(r => setTimeout(r, 10))
+    expect(JSON.stringify(s)).toBe(snapshot)
+  })
+
+  it.each(['parent', 'timeout'] as const)('挂起审批 %s 取消：收到 runner signal、不执行工具，晚到批准不污染转录', async (cause) => {
+    const realTimer = globalThis.setTimeout
+    const timer = cause === 'timeout'
+      ? vi.spyOn(globalThis, 'setTimeout').mockImplementation((handler, delay, ...args) =>
+        realTimer(handler, delay === SUBAGENT_MAX_MS ? 20 : delay, ...args))
+      : undefined
+    const ac = new AbortController()
+    let approvalSignal: AbortSignal | undefined
+    let approve!: (value: boolean) => void
+    let waiting!: () => void
+    const pending = new Promise<void>(r => { waiting = r })
+    const execute = vi.fn(async () => ({ success: true, content: '不应执行' }))
+    const toolName = 'runner_cancel_approval_test'
+    toolRegistry.register({
+      name: toolName, description: '测试写入审批', source: 'builtin',
+      inputSchema: { type: 'object', properties: {} },
+      requiresConfirmation: true, isReadOnly: false, execute,
+    })
+    const confirm = vi.fn<SubAgentDeps['confirm']>((_tc, signal) => {
+      approvalSignal = signal
+      waiting()
+      return new Promise<boolean>(r => { approve = r })
+    })
+    const generate = vi.fn<LLMGenerateFn>(async () => `<tool_call>{"name":"${toolName}","arguments":{}}</tool_call>`)
+    try {
+      const running = runSubAgent(task({ allowedTools: [toolName] }), baseDeps({ generate, confirm, signal: ac.signal }))
+      await pending
+      expect(approvalSignal).toBeDefined()
+      expect(approvalSignal).not.toBe(ac.signal)
+      if (cause === 'parent') ac.abort()
+      const s = await running
+      expect(s.status).toBe(cause === 'timeout' ? 'failed' : 'cancelled')
+      expect(s.error).toBe(t(cause === 'timeout' ? 'subagent.timeout' : 'subagent.cancelled'))
+      expect(approvalSignal?.aborted).toBe(true)
+      expect(s.toolCalls.every(tc => tc.status === 'failed')).toBe(true)
+      expect(s.messages.flatMap(m => m.toolCalls ?? []).every(tc => tc.status === 'failed')).toBe(true)
+      expect(execute).not.toHaveBeenCalled()
+      const snapshot = JSON.stringify(s)
+      approve(true)
+      await new Promise<void>(r => realTimer(r, 10))
+      expect(JSON.stringify(s)).toBe(snapshot)
+      expect(execute).not.toHaveBeenCalled()
+      expect(generate).toHaveBeenCalledTimes(1)
+    } finally {
+      toolRegistry.unregister(toolName)
+      timer?.mockRestore()
+    }
+  })
+
   it('墙钟超时 → failed + 超时原因（用注入的 now 驱动，测试不等待真实时间）', async () => {
     let clock = 0
     const generate = vi.fn(async () => { clock += SUBAGENT_MAX_MS + 1; return 'ok' })
     const s = await runSubAgent(task(), baseDeps({ generate, now: () => clock }))
     expect(s.status).toBe('failed')
     expect(s.error).toBe(t('subagent.timeout'))
+  })
+
+  it.each(['false', 'reject'] as const)('子执行前归档屏障 %s：写入零执行，session 与工具转录均为失败终态', async mode => {
+    const name = `runner_barrier_${mode}`
+    const execute = vi.fn(async () => ({ success: true, content: '不应写入' }))
+    toolRegistry.register({
+      name, description: 'child archive barrier write', source: 'builtin',
+      inputSchema: { type: 'object', properties: {} }, isReadOnly: false,
+      requiresConfirmation: false, execute,
+    })
+    const snapshots: string[] = []
+    const beforeExecute = vi.fn<NonNullable<SubAgentDeps['beforeExecute']>>(async session => {
+      expect(session.toolCalls).toEqual([expect.objectContaining({ toolName: name, status: 'running' })])
+      if (mode === 'reject') throw new Error('child archive unavailable')
+      return false
+    })
+    const generate = vi.fn<LLMGenerateFn>()
+      .mockResolvedValueOnce(`<tool_call>{"name":"${name}","arguments":{}}</tool_call>`)
+      .mockResolvedValueOnce('写入失败，未执行。')
+    try {
+      const s = await runSubAgent(task({ allowedTools: [name] }), baseDeps({
+        generate, beforeExecute, onUpdate: session => snapshots.push(JSON.stringify(session)),
+      }))
+      expect(beforeExecute).toHaveBeenCalledOnce()
+      expect(execute).not.toHaveBeenCalled()
+      expect(s.status).toBe('failed')
+      expect(s.error).toBeTruthy()
+      expect(s.toolCalls).toEqual([expect.objectContaining({ status: 'failed', receipt: expect.objectContaining({ outcome: 'failed', verified: false }) })])
+      expect(s.messages.flatMap(m => m.toolCalls ?? [])).toEqual(s.toolCalls)
+      expect(s.messages.every(m => !m.streaming)).toBe(true)
+      expect(JSON.parse(snapshots.at(-1)!).status).toBe('failed')
+    } finally { toolRegistry.unregister(name) }
+  })
+
+  it('子屏障挂起期间父取消：晚到归档成功不能执行写入或污染取消终态', async () => {
+    const name = 'runner_cancel_barrier'
+    const controller = new AbortController()
+    const execute = vi.fn(async () => ({ success: true, content: '不应写入' }))
+    toolRegistry.register({
+      name, description: 'child cancellable archive barrier', source: 'builtin',
+      inputSchema: { type: 'object', properties: {} }, isReadOnly: false,
+      requiresConfirmation: false, execute,
+    })
+    let release!: (saved: boolean) => void
+    const beforeExecute = vi.fn<NonNullable<SubAgentDeps['beforeExecute']>>(() => new Promise(resolve => { release = resolve }))
+    const onUpdate = vi.fn()
+    const generate = vi.fn<LLMGenerateFn>().mockResolvedValue(`<tool_call>{"name":"${name}","arguments":{}}</tool_call>`)
+    try {
+      const running = runSubAgent(task({ allowedTools: [name] }), baseDeps({ generate, beforeExecute, signal: controller.signal, onUpdate }))
+      await vi.waitFor(() => expect(beforeExecute).toHaveBeenCalledOnce())
+      controller.abort()
+      const s = await running
+      expect(s.status).toBe('cancelled')
+      expect(s.toolCalls.every(tc => tc.status === 'failed')).toBe(true)
+      expect(execute).not.toHaveBeenCalled()
+      const snapshot = JSON.stringify(s)
+      const updates = onUpdate.mock.calls.length
+      release(true)
+      await Promise.resolve()
+      expect(JSON.stringify(s)).toBe(snapshot)
+      expect(onUpdate).toHaveBeenCalledTimes(updates)
+      expect(execute).not.toHaveBeenCalled()
+    } finally { toolRegistry.unregister(name) }
   })
 
   it('工具调用进转录（toolCalls 与 assistant 消息同源）', async () => {

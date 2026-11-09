@@ -9,7 +9,7 @@ vi.mock('../../ipc-client', () => ({
 const mockInvoke = vi.mocked(ipc.invoke)
 
 beforeEach(() => {
-  mockInvoke.mockClear()
+  mockInvoke.mockReset()
 })
 
 describe('call_external_api 工具', () => {
@@ -17,12 +17,28 @@ describe('call_external_api 工具', () => {
     mockInvoke.mockResolvedValue({ success: true, status: 200, content: '{"result":"ok"}' })
     const { callExternalApiTool } = await import('./call-external-api.tool')
     const result = await callExternalApiTool.execute({ path: '/search?q=主角' })
-    expect(mockInvoke).toHaveBeenCalledWith('dev:invoke', { path: '/search?q=主角', method: 'GET', body: undefined })
+    expect(mockInvoke).toHaveBeenCalledWith('dev:invoke', { path: '/search?q=主角', method: 'GET' })
     expect(result.success).toBe(true)
     expect(result.content).toContain('HTTP 200')
     expect(result.content).toContain('{"result":"ok"}')
   })
 
+  it('Agent 上下文 GET 参数是严格 JSON，不带 undefined body', async () => {
+    const { canonicalJson } = await import('../../../shared/canonical-json')
+    mockInvoke.mockImplementation(async (_channel, ...args) => {
+      const request = args[0] as { args: unknown[] }
+      expect(() => canonicalJson(request.args)).not.toThrow()
+      expect(request.args).toEqual([{ path: '/search', method: 'GET' }])
+      return { state: 'committed', value: { success: true, status: 200, content: 'ok' } } as never
+    })
+    const { callExternalApiTool } = await import('./call-external-api.tool')
+    const result = await callExternalApiTool.execute({ path: '/search' }, {
+      signal: new AbortController().signal, turnId: 'turn', callId: 'call', step: 1,
+      operationId: 'operation', toolName: 'call_external_api',
+    })
+    expect(result.success).toBe(true)
+    mockInvoke.mockReset()
+  })
   it('POST 带 body 透传', async () => {
     mockInvoke.mockResolvedValue({ success: true, status: 201, content: 'created' })
     const { callExternalApiTool } = await import('./call-external-api.tool')

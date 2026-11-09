@@ -135,6 +135,38 @@ describe('SharedContext：压缩摘要附带提取可复用事实（P3）', () =
     expect(write![2]).toContain('- 主角名苏晚晴')
   })
 
+  it.each(['resolve', 'reject'] as const)('摘要取消后晚到 %s 不写共享记忆', async outcome => {
+    const controller = new AbortController()
+    let resolve!: (value: { success: boolean; content: string }) => void
+    let reject!: (reason: Error) => void
+    mockLlmState.generate.mockReturnValue(new Promise((res, rej) => { resolve = res; reject = rej }))
+    const summarizing = generateConversationSummary({ oldSummary: '', batch: batchMsg, modelId: 'agent-model', signal: controller.signal })
+    const cancelled = expect(summarizing).rejects.toThrow('取消')
+    expect(mockLlmState.generate.mock.calls[0][2].signal).toBe(controller.signal)
+    controller.abort()
+    await cancelled
+    if (outcome === 'resolve') resolve({ success: true, content: '摘要\n[可复用事实]\n- 合成事实' })
+    else reject(new Error('晚到失败'))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(mockIpcInvoke).not.toHaveBeenCalled()
+  })
+
+  it.each(['db:log-llm-call', 'memory:read'] as const)('%s 挂起期间取消，晚到回执不发起共享记忆写入', async channel => {
+    const controller = new AbortController()
+    let release!: (value: null) => void
+    const gate = new Promise<null>(resolve => { release = resolve })
+    mockLlmState.generate.mockResolvedValue({ success: true, content: '摘要\n[可复用事实]\n- 合成事实' })
+    mockIpcInvoke.mockImplementation(async (ch: string) => ch === channel ? gate : null)
+    const summarizing = generateConversationSummary({ oldSummary: '', batch: batchMsg, modelId: 'agent-model', signal: controller.signal })
+    const cancelled = expect(summarizing).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.waitFor(() => expect(mockIpcInvoke.mock.calls.some(c => c[0] === channel)).toBe(true))
+    controller.abort()
+    release(null)
+    await cancelled
+    expect(mockIpcInvoke.mock.calls.some(c => c[0] === 'memory:write')).toBe(false)
+  })
+
   it('摘要无 [可复用事实] 段 → 不写 shared.md（幂等）', async () => {
     mockLlmState.generate.mockResolvedValue({
       success: true, content: '纯摘要', usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2, cachedTokens: 0 },

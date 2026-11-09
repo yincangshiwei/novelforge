@@ -32,7 +32,7 @@ const h = vi.hoisted(() => {
     /** Ollama 原生清单（T8 起：它在直答**之前**，不能被内置目录遮蔽） */
     listOllamaModels: vi.fn(async () => [] as Array<{ name: string }>),
     provider: {
-      generate: vi.fn(async (model: { apiKey?: string }) => {
+      generate: vi.fn(async (model: { apiKey?: string }, _messages?: unknown, _opts?: { signal?: AbortSignal }) => {
         seen.generate = model
         return { success: true, content: 'ok', error: undefined }
       }),
@@ -50,7 +50,7 @@ const h = vi.hoisted(() => {
 })
 
 vi.mock('electron', () => ({
-  BrowserWindow: { fromWebContents: () => null },
+  BrowserWindow: { fromWebContents: (sender: unknown) => ({ webContents: sender }) },
   ipcMain: {
     handle: (channel: string, fn: (event: unknown, ...args: unknown[]) => unknown) => {
       h.handlers.set(channel, fn)
@@ -79,6 +79,7 @@ vi.mock('../ollama-embedding', () => ({
 
 import { t } from '../../src/shared/locale'
 import { registerLLMController } from './llm-controller'
+import { llmConcurrencyController } from '../utils/concurrency-controller'
 import { MODELS_CONFIG_PATH, writeJsonFile, __setConfigFilesForTest } from '../utils/config-utils'
 import { trustWebContents, resetTrustedWebContentsForTest } from '../security/ipc-guard'
 import { __setStoredForTest } from '../credentials/store'
@@ -150,6 +151,91 @@ beforeEach(() => {
   __setStoredForTest({})
   resetTrustedWebContentsForTest()
   trustWebContents(SENDER_ID)
+})
+
+describe('llm:generate 可取消生命周期', () => {
+  it('取消先于登记时不启动，且墓碑消费后可再请求', async () => {
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    await call('llm:cancel', 'early-cancel')
+    const request = { requestId: 'early-cancel', modelId: MODEL_ID, messages: MESSAGES }
+    expect(await call('llm:generate', request)).toMatchObject({ success: false, content: '' })
+    expect(h.provider.generate).not.toHaveBeenCalled()
+    expect(await call('llm:generate', request)).toMatchObject({ success: true })
+  })
+
+  it('运行中传signal，晚到成功不能成为成功结果，终态释放标识', async () => {
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    let finish!: (value: { success: boolean; content: string; error: undefined }) => void
+    let signal: AbortSignal | undefined
+    h.provider.generate.mockImplementationOnce((_model, _messages, opts) => {
+      signal = opts?.signal
+      return new Promise((resolve) => { finish = resolve })
+    })
+    const request = { requestId: 'running-cancel', modelId: MODEL_ID, messages: MESSAGES }
+    const result = call('llm:generate', request)
+    expect(signal?.aborted).toBe(false)
+    await call('llm:cancel', request.requestId)
+    expect(signal?.aborted).toBe(true)
+    finish({ success: true, content: 'late', error: undefined })
+    expect(await result).toMatchObject({ success: false, content: '' })
+    expect(await call('llm:generate', request)).toMatchObject({ success: true })
+  })
+
+  it('占满槽位时排队取消立即移除，不调用provider', async () => {
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    const previous = llmConcurrencyController.getStatus().maxConcurrent
+    llmConcurrencyController.updateConfig({ maxConcurrent: 1 })
+    let release!: () => void
+    const blocker = llmConcurrencyController.execute(() => new Promise<void>((resolve) => { release = resolve }), { timeoutMs: 0 })
+    try {
+      const pending = call('llm:generate', { requestId: 'queued-cancel', modelId: MODEL_ID, messages: MESSAGES })
+      await call('llm:cancel', 'queued-cancel')
+      expect(await pending).toMatchObject({ success: false, content: '' })
+      expect(h.provider.generate).not.toHaveBeenCalled()
+      expect(llmConcurrencyController.getStatus().queueLength).toBe(0)
+    } finally {
+      release()
+      await blocker
+      llmConcurrencyController.updateConfig({ maxConcurrent: previous })
+    }
+  })
+
+  it('模型缺失和provider异常都清理控制器，保留老请求兼容', async () => {
+    const request = { requestId: 'failure-cleanup', modelId: MODEL_ID, messages: MESSAGES }
+    expect(await call('llm:generate', request)).toMatchObject({ success: false })
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    h.provider.generate.mockRejectedValueOnce(new Error('provider failed'))
+    expect(await call('llm:generate', request)).toMatchObject({ success: false, error: 'provider failed' })
+    expect(await call('llm:generate', request)).toMatchObject({ success: true })
+    expect(await call('llm:generate', { modelId: MODEL_ID, messages: MESSAGES })).toMatchObject({ success: true })
+  })
+
+  it('运行中取消后晚到onDone不发送正文和工具调用，清理标识', async () => {
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    let finish!: (text: string, usage?: unknown, step?: unknown) => void
+    let complete!: () => void
+    h.provider.generateStream.mockImplementationOnce((_model, _messages, opts) => {
+      finish = opts.onDone
+      return new Promise<void>((resolve) => { complete = resolve })
+    })
+    fakeEvent.sender.send.mockClear()
+    await call('llm:generate-stream', 'late-stream-cancel', { modelId: MODEL_ID, messages: MESSAGES })
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    await call('llm:cancel', 'late-stream-cancel')
+    finish('late', undefined, { toolCalls: [{ id: 'late', name: 'read', arguments: {} }] })
+    complete()
+    expect(fakeEvent.sender.send).not.toHaveBeenCalledWith('llm:stream-done', expect.anything())
+    expect(fakeEvent.sender.send).toHaveBeenCalledWith('llm:stream-error', expect.objectContaining({ requestId: 'late-stream-cancel' }))
+    await vi.waitFor(() => expect(llmConcurrencyController.getStatus().activeCount).toBe(0))
+    expect(await call('llm:generate-stream', 'late-stream-cancel', { modelId: MODEL_ID, messages: MESSAGES })).toMatchObject({ started: true })
+  })
+
+  it('先到取消也阻止流式晚登记', async () => {
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    await call('llm:cancel', 'early-stream-cancel')
+    expect(await call('llm:generate-stream', 'early-stream-cancel', { modelId: MODEL_ID, messages: MESSAGES })).toMatchObject({ started: false })
+    expect(h.provider.generateStream).not.toHaveBeenCalled()
+  })
 })
 
 describe('llm:generate（生成路径收口点 getModelConfig）', () => {

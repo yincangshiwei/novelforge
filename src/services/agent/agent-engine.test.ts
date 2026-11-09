@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { runAgentLoop, computeMessageBudget, isRecoverableError, type LLMMessage, type AgentEngineDeps, type AgentEngineOptions, type ToolCallInfo } from './agent-engine'
 import { estimateTokens } from './token-budget'
-import { toolRegistry, buildAgentTool } from './tool-registry'
+import { toolRegistry, buildAgentTool, type AgentTool, type ToolExecutionContext, type ToolResult } from './tool-registry'
 import { t } from '../../shared/locale'
+import { ipc } from '../ipc-client'
+import { createToolIpc } from './tool-ipc'
+import { ToolExecutionInterrupted } from './tool-execution'
 
 /** 测试专用纯内存工具名（不触碰 IPC） */
 const TEST_TOOL_NAME = 'agent_test_echo'
@@ -69,6 +72,59 @@ function lastUserMessage(messagesLog: LLMMessage[][], callIndex: number): string
   expect(last.role).toBe('user')
   return last.content
 }
+
+describe('原生结构化步骤', () => {
+  it('纯工具步骤保留调用ID并回填tool消息', async () => {
+    registerEchoTool()
+    const generate = vi.fn().mockResolvedValueOnce({ text: '', toolCalls: [{ id: 'native-id', name: TEST_TOOL_NAME, arguments: {} }], finishReason: 'tool_use', terminalSeen: true }).mockResolvedValueOnce({ text: '结果已读取', toolCalls: [], finishReason: 'stop', terminalSeen: true })
+    const callbacks = createCallbacks()
+    try {
+      await runAgentLoop('system', [], '读取', 'model', generate, callbacks)
+      expect(callbacks.onDone.mock.calls[0][1][0].id).toBe('native-id')
+      expect(generate.mock.calls[1][0]).toContainEqual(expect.objectContaining({ role: 'tool', toolCallId: 'native-id', name: TEST_TOOL_NAME }))
+      expect(generate.mock.calls[1][0]).toContainEqual(expect.objectContaining({ role: 'assistant', toolCalls: [{ id: 'native-id', name: TEST_TOOL_NAME, arguments: {} }] }))
+    } finally { toolRegistry.unregister(TEST_TOOL_NAME) }
+  })
+  it.each(['length', 'unknown', 'error'])('结束原因%s不执行本步工具', async reason => {
+    registerEchoTool()
+    const callbacks = createCallbacks()
+    try {
+      await runAgentLoop('system', [], '读取', 'model', async () => ({ text: '未完整', toolCalls: [{ id: 'a', name: TEST_TOOL_NAME, arguments: {} }], finishReason: reason as 'length', terminalSeen: reason !== 'unknown' }), callbacks)
+      expect(callbacks.onError).toHaveBeenCalledOnce()
+      expect(callbacks.onToolCallStart).not.toHaveBeenCalled()
+      expect(callbacks.onDone).not.toHaveBeenCalled()
+    } finally { toolRegistry.unregister(TEST_TOOL_NAME) }
+  })
+})
+
+describe('配置修改执行声明核验', () => {
+  it('零工具虚报时自动纠正，持续虚报则撤回并记录未验证', async () => {
+    const { generateFn, callbacks } = await runLoopWithResponses([
+      '已经写进了3个核心位置。', '已补充全局写作要求。',
+    ])
+    expect(generateFn).toHaveBeenCalledTimes(2)
+    expect(callbacks.onDone.mock.calls[0][0]).toContain('缺少对应目标的成功写入回执')
+    expect(callbacks.onDone.mock.calls[0][0]).not.toContain('已补充全局写作要求')
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'unverified', receipts: [] })
+  })
+
+  it('自动纠正后实际执行并回读核验，才允许完成声明', async () => {
+    toolRegistry.register(buildAgentTool({
+      name: 'update_config', description: 'test', source: 'builtin', isReadOnly: false,
+      inputSchema: { type: 'object', properties: {} }, requiresConfirmation: false,
+      execute: async () => ({ success: true, content: 'saved', persistence: { target: 'config:globalGuidance', verified: true } }),
+    }))
+    try {
+      const { callbacks } = await runLoopWithResponses([
+        '已更新全局写作要求。',
+        '<tool_call>{"name":"update_config","arguments":{"field":"globalGuidance","value":"要求"}}</tool_call>',
+        '已更新全局写作要求。',
+      ])
+      expect(callbacks.onDone.mock.calls[0][0]).toContain('已更新全局写作要求')
+      expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'completed', receipts: [{ outcome: 'committed', verified: true }] })
+    } finally { toolRegistry.unregister('update_config') }
+  })
+})
 
 describe('工作流执行声明核验', () => {
   it('无工具调用虚报启动时纠正一次，不把原声明写入最终答案', async () => {
@@ -1054,5 +1110,331 @@ describe('工具级超时覆盖（C 档第二轮 C1 修复）', () => {
       'done',
     ])
     expect(statusesOf(callbacks)).toContain(`${SLOW}:completed`)
+  })
+})
+
+describe('真实引擎取消、审批与写入回执', () => {
+  const createdTools: string[] = []
+  const call = (name: string): string => `<tool_call>{"name":"${name}","arguments":{}}</tool_call>`
+  const saved: ToolResult = {
+    success: true, content: 'saved', persistence: { target: 'test:document', verified: true },
+  }
+
+  function registerWrite(name: string, execute: AgentTool['execute'], options: { confirm?: boolean; timeoutMs?: number } = {}): void {
+    toolRegistry.register(buildAgentTool({
+      name, description: 'engine cancellation test write', source: 'builtin',
+      inputSchema: { type: 'object', properties: {} }, isReadOnly: false,
+      requiresConfirmation: options.confirm ?? false, timeoutMs: options.timeoutMs, execute,
+    }))
+    createdTools.push(name)
+  }
+
+  afterEach(() => {
+    for (const name of createdTools.splice(0)) toolRegistry.unregister(name)
+  })
+
+  it('审批已通过但恢复执行前取消：不启动写入且审批行进入失败终态', async () => {
+    const controller = new AbortController()
+    const execute = vi.fn(async () => saved)
+    const name = 'engine_cancel_after_approval'
+    registerWrite(name, execute, { confirm: true })
+    const starts: string[] = []
+    const callbacks = {
+      ...createCallbacks(),
+      onToolCallStart: vi.fn((tc: ToolCallInfo) => { starts.push(tc.status) }),
+      onToolCallConfirmRequired: vi.fn(() => {
+        const approved = Promise.resolve(true)
+        void approved.then(() => { queueMicrotask(() => controller.abort()) })
+        return approved
+      }),
+    }
+    const generate = vi.fn().mockResolvedValue(call(name))
+
+    await runAgentLoop('system', [], '写入', 'model', generate, callbacks, controller.signal)
+
+    expect(callbacks.onToolCallConfirmRequired).toHaveBeenCalledOnce()
+    expect(starts).toEqual(['waiting_confirm'])
+    expect(execute).not.toHaveBeenCalled()
+    expect(generate).toHaveBeenCalledOnce()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledOnce()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', error: expect.stringContaining('取消') }))
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'cancelled', receipts: [] })
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+
+  it('running 开始回调中取消：真正调用工具前检查信号，不产生未知写入回执', async () => {
+    const controller = new AbortController()
+    const execute = vi.fn(async () => saved)
+    const name = 'engine_cancel_at_running'
+    registerWrite(name, execute)
+    const starts: string[] = []
+    const callbacks = {
+      ...createCallbacks(),
+      onToolCallStart: vi.fn((tc: ToolCallInfo) => {
+        starts.push(tc.status)
+        if (tc.status === 'running') controller.abort()
+      }),
+    }
+    const generate = vi.fn().mockResolvedValue(call(name))
+
+    await runAgentLoop('system', [], '写入', 'model', generate, callbacks, controller.signal)
+
+    expect(starts).toEqual(['running'])
+    expect(execute).not.toHaveBeenCalled()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledOnce()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed', receipt: expect.objectContaining({ outcome: 'failed', verified: false }),
+    }))
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'cancelled', receipts: [{ outcome: 'failed' }] })
+    expect(generate).toHaveBeenCalledOnce()
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+
+  it('第一笔写入已提交后取消：第二笔不执行，首笔 committed 回执完整保留', async () => {
+    const controller = new AbortController()
+    const first = 'engine_cancel_after_first_write'
+    const second = 'engine_cancel_before_second_write'
+    const firstExecute = vi.fn(async () => saved)
+    const secondExecute = vi.fn(async () => saved)
+    registerWrite(first, firstExecute)
+    registerWrite(second, secondExecute)
+    const callbacks = {
+      ...createCallbacks(),
+      onToolCallComplete: vi.fn((tc: ToolCallInfo) => {
+        if (tc.toolName === first && tc.status === 'completed') controller.abort()
+      }),
+    }
+    const generate = vi.fn().mockResolvedValue([call(first), call(second)].join('\n'))
+
+    await runAgentLoop('system', [], '顺序写入', 'model', generate, callbacks, controller.signal)
+
+    expect(firstExecute).toHaveBeenCalledOnce()
+    expect(secondExecute).not.toHaveBeenCalled()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledTimes(2)
+    const calls = callbacks.onDone.mock.calls[0][1] as ToolCallInfo[]
+    expect(calls).toEqual([
+      expect.objectContaining({ toolName: first, status: 'completed', receipt: expect.objectContaining({ outcome: 'committed', verified: true, target: 'test:document' }) }),
+      expect.objectContaining({ toolName: second, status: 'failed', error: expect.stringContaining('取消') }),
+    ])
+    expect(calls[1].receipt).toBeUndefined()
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'cancelled', receipts: [calls[0].receipt] })
+    expect(generate).toHaveBeenCalledOnce()
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+
+  it.each(['同步抛错', '异步拒绝'])('审批%s：写入不执行，等待状态终结并向模型注入错误', async mode => {
+    const name = `engine_approval_error_${mode === '同步抛错' ? 'sync' : 'async'}`
+    const execute = vi.fn(async () => saved)
+    registerWrite(name, execute, { confirm: true })
+    const starts: string[] = []
+    const callbacks = {
+      ...createCallbacks(),
+      onToolCallStart: vi.fn((tc: ToolCallInfo) => { starts.push(tc.status) }),
+      onToolCallConfirmRequired: vi.fn(() => {
+        const error = new Error('approval service unavailable')
+        if (mode === '同步抛错') throw error
+        return Promise.reject(error)
+      }),
+    }
+    const messagesLog: LLMMessage[][] = []
+    const responses = [call(name), '审批不可用，尚未执行。']
+    const generate = vi.fn((messages: LLMMessage[]) => {
+      messagesLog.push([...messages])
+      return Promise.resolve(responses.shift() ?? '')
+    })
+
+    await runAgentLoop('system', [], '写入', 'model', generate, callbacks)
+
+    expect(starts).toEqual(['waiting_confirm'])
+    expect(execute).not.toHaveBeenCalled()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledOnce()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', error: 'approval service unavailable' }))
+    expect(lastUserMessage(messagesLog, 1)).toContain(`<tool_result name="${name}" error="true">`)
+    expect(lastUserMessage(messagesLog, 1)).toContain('approval service unavailable')
+    expect(callbacks.onDone).toHaveBeenCalledOnce()
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'partial', receipts: [] })
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+
+  it('审批一直未返回时取消：不等待审批完成，工具行终结且绝不执行', async () => {
+    const controller = new AbortController()
+    const name = 'engine_cancel_pending_approval'
+    const execute = vi.fn(async () => saved)
+    registerWrite(name, execute, { confirm: true })
+    let approve: (allowed: boolean) => void = () => {}
+    const callbacks = {
+      ...createCallbacks(),
+      onToolCallConfirmRequired: vi.fn(() => {
+        queueMicrotask(() => controller.abort())
+        return new Promise<boolean>(resolve => { approve = resolve })
+      }),
+    }
+    const generate = vi.fn().mockResolvedValue(call(name))
+
+    await runAgentLoop('system', [], '写入', 'model', generate, callbacks, controller.signal)
+    approve(true)
+    await Promise.resolve()
+
+    expect(execute).not.toHaveBeenCalled()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledOnce()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', error: expect.stringContaining('取消') }))
+    expect(callbacks.onDone).toHaveBeenCalledOnce()
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'cancelled', receipts: [] })
+    expect(generate).toHaveBeenCalledOnce()
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+
+  it.each(['false', 'reject'] as const)('执行前屏障 %s：真实写工具零执行并保留失败回执', async mode => {
+    const name = `engine_barrier_${mode}`
+    const execute = vi.fn(async () => saved)
+    registerWrite(name, execute)
+    const callbacks = {
+      ...createCallbacks(),
+      onBeforeToolExecution: vi.fn(async (tc: ToolCallInfo) => {
+        expect(tc).toMatchObject({ status: 'running', toolName: name })
+        if (mode === 'reject') throw new Error('archive unavailable')
+        return false
+      }),
+    }
+    const generate = vi.fn().mockResolvedValueOnce(call(name)).mockResolvedValueOnce('未执行。')
+    await runAgentLoop('system', [], '写入', 'model', generate, callbacks)
+    expect(callbacks.onBeforeToolExecution).toHaveBeenCalledOnce()
+    expect(execute).not.toHaveBeenCalled()
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed', receipt: expect.objectContaining({ outcome: 'failed', verified: false }),
+    }))
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'partial' })
+  })
+
+  it('屏障挂起期间取消：立即收尾，晚到成功不启动写入或改写回执', async () => {
+    const controller = new AbortController()
+    const name = 'engine_cancel_pending_barrier'
+    const execute = vi.fn(async () => saved)
+    registerWrite(name, execute)
+    let release!: (saved: boolean) => void
+    const callbacks = {
+      ...createCallbacks(),
+      onBeforeToolExecution: vi.fn(() => new Promise<boolean>(resolve => { release = resolve })),
+    }
+    const generate = vi.fn().mockResolvedValue(call(name))
+    const running = runAgentLoop('system', [], '写入', 'model', generate, callbacks, controller.signal)
+    await vi.waitFor(() => expect(callbacks.onBeforeToolExecution).toHaveBeenCalledOnce())
+    controller.abort()
+    await running
+    expect(execute).not.toHaveBeenCalled()
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'cancelled', receipts: [{ outcome: 'failed' }] })
+    const snapshot = JSON.stringify(callbacks.onDone.mock.calls)
+    release(true)
+    await Promise.resolve()
+    expect(JSON.stringify(callbacks.onDone.mock.calls)).toBe(snapshot)
+    expect(execute).not.toHaveBeenCalled()
+    expect(generate).toHaveBeenCalledOnce()
+  })
+
+  it('屏障成功后才启动真实工具，且只读工具不等待写屏障', async () => {
+    const name = 'engine_barrier_success'
+    const events: string[] = []
+    registerWrite(name, async () => { events.push('execute'); return saved })
+    const callbacks = {
+      ...createCallbacks(),
+      onBeforeToolExecution: vi.fn(async () => { events.push('saved'); return true }),
+    }
+    const generate = vi.fn().mockResolvedValueOnce(call(name)).mockResolvedValueOnce('完成。')
+    await runAgentLoop('system', [], '写入', 'model', generate, callbacks)
+    expect(events).toEqual(['saved', 'execute'])
+    registerEchoTool()
+    const readCallbacks = { ...createCallbacks(), onBeforeToolExecution: vi.fn(async () => false) }
+    await runAgentLoop('system', [], '读取', 'model', vi.fn().mockResolvedValueOnce(call(TEST_TOOL_NAME)).mockResolvedValueOnce('完成。'), readCallbacks)
+    expect(readCallbacks.onBeforeToolExecution).not.toHaveBeenCalled()
+  })
+
+  it('已启动写入超时标记 unknown，模型再次请求同一写入时不得盲重试', async () => {
+    const name = 'engine_unknown_write_timeout'
+    let executionContext: ToolExecutionContext | undefined
+    const execute = vi.fn((_args: Record<string, unknown>, context?: ToolExecutionContext): Promise<ToolResult> => {
+      executionContext = context
+      return new Promise(() => {})
+    })
+    registerWrite(name, execute, { timeoutMs: 10 })
+
+    const { generateFn, messagesLog, callbacks } = await runLoopWithResponses([
+      call(name), call(name), '写入状态未知，需要核对。',
+    ])
+
+    expect(generateFn).toHaveBeenCalledTimes(3)
+    expect(execute).toHaveBeenCalledOnce()
+    expect(executionContext?.signal.aborted).toBe(true)
+    expect(callbacks.onToolCallComplete).toHaveBeenCalledTimes(2)
+    const calls = callbacks.onDone.mock.calls[0][1] as ToolCallInfo[]
+    expect(calls).toHaveLength(2)
+    for (const tc of calls) {
+      expect(tc).toMatchObject({ status: 'failed', receipt: { outcome: 'unknown', verified: false } })
+    }
+    expect(executionContext).toMatchObject({ turnId: calls[0].turnId, step: calls[0].step, callId: calls[0].id, operationId: calls[0].id })
+    expect(lastUserMessage(messagesLog, 1)).toContain('工具执行超时')
+    expect(lastUserMessage(messagesLog, 1)).toContain('不得盲重试')
+    expect(lastUserMessage(messagesLog, 2)).toContain('已阻止重复写入')
+    expect(callbacks.onDone.mock.calls[0][3]).toMatchObject({ status: 'partial', receipts: [{ outcome: 'unknown' }, { outcome: 'unknown' }] })
+    expect(callbacks.onError).not.toHaveBeenCalled()
+  })
+})
+
+describe('P2：ToolIPC 主进程回执与取消', () => {
+  const context = (signal: AbortSignal): ToolExecutionContext => ({
+    signal, operationId: 'op-p2', callId: 'call-p2', turnId: 'turn-p2', step: 1,
+    scope: '/project', toolName: 'write_file',
+  })
+  afterEach(() => vi.restoreAllMocks())
+
+  it.each(['committed', 'not_committed'] as const)('%s 保留业务原始返回值及参数，每次 IPC 操作 ID 唯一', async state => {
+    const value = { success: false, error: 'conflict', data: { revision: 42, nested: ['a', 'b'] } }
+    const invoke = vi.spyOn(ipc, 'invoke').mockResolvedValue({ state, value })
+    const client = createToolIpc(context(new AbortController().signal))
+    await expect(client.invoke('fs:write-file', '/project/draft.md', '正文')).resolves.toBe(value)
+    await expect(client.invoke('fs:write-file', '/project/draft.md', '下一版')).resolves.toBe(value)
+    expect(invoke).toHaveBeenNthCalledWith(1, 'agent:operation-invoke', {
+      operationId: 'op-p2:ipc:0', callId: 'call-p2', turnId: 'turn-p2', scope: '/project',
+      toolName: 'write_file', channel: 'fs:write-file', args: ['/project/draft.md', '正文'],
+    })
+    expect(invoke.mock.calls[1][1]).toMatchObject({ operationId: 'op-p2:ipc:1' })
+  })
+
+  it.each(['unknown', 'not_committed'] as const)('%s 无业务返回值时抛出对应执行中断，不伪报成功', async state => {
+    const invoke = vi.spyOn(ipc, 'invoke').mockResolvedValue({ state, error: 'main receipt failure' })
+    const client = createToolIpc(context(new AbortController().signal))
+    const error = await client.invoke('fs:write-file', '/project/draft.md', '正文').catch(error => error)
+    expect(error).toBeInstanceOf(ToolExecutionInterrupted)
+    expect(error.message).toBe('main receipt failure')
+    expect(error).toMatchObject({ unknown: state === 'unknown' })
+    expect(invoke).toHaveBeenCalledWith('agent:operation-cancel', 'call-p2')
+  })
+
+  it.each(['resolve', 'reject'] as const)('执行挂起时取消向主进程传 callId；晚到 %s 不改变取消结果', async late => {
+    const controller = new AbortController()
+    let resolve!: (value: unknown) => void
+    let reject!: (error: Error) => void
+    const pending = new Promise<unknown>((res, rej) => { resolve = res; reject = rej })
+    const invoke = vi.spyOn(ipc, 'invoke')
+      .mockReturnValueOnce(pending as ReturnType<typeof ipc.invoke>)
+      .mockResolvedValue({ success: true })
+    const client = createToolIpc(context(controller.signal))
+    const running = client.invoke('fs:write-file', '/project/draft.md', '正文')
+    const rejected = expect(running).rejects.toThrow('取消')
+    controller.abort()
+    await rejected
+    expect(invoke).toHaveBeenCalledWith('agent:operation-cancel', 'call-p2')
+    if (late === 'resolve') resolve({ state: 'committed', value: { success: true } })
+    else reject(new Error('late failure'))
+    await Promise.resolve()
+    await expect(running).rejects.toThrow('取消')
+  })
+
+  it('启动前已取消不发 operation-invoke；没有 context 直接保留原 IPC', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const invoke = vi.spyOn(ipc, 'invoke')
+    await expect(createToolIpc(context(controller.signal)).invoke('fs:write-file', '/project/draft.md', '正文')).rejects.toThrow('取消')
+    expect(invoke).not.toHaveBeenCalled()
+    expect(createToolIpc()).toBe(ipc)
   })
 })

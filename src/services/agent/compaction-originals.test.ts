@@ -43,6 +43,29 @@ describe('分卷存储（compaction-originals）', () => {
     expect((await readBatchOriginal('c1', 1))?.[0].id).toBe('m1')
   })
 
+  it.each([null, {}, { success: false }])('写入回执 %j 不能被当作保存成功', async receipt => {
+    const original = invokeMock.getMockImplementation()!
+    invokeMock.mockImplementation(async (...args: unknown[]) => args[0] === 'fs:agent-archive-original-write' ? receipt : original(...args))
+    expect(await writeBatchOriginal('c1', 1, [msg('m1')])).toBe(false)
+    expect(files['c1']).toBeUndefined()
+  })
+
+  it('读取分卷期间取消，晚到读取不会继续写入', async () => {
+    const controller = new AbortController()
+    let release!: (value: { success: boolean; content: null }) => void
+    const reading = new Promise<{ success: boolean; content: null }>(resolve => { release = resolve })
+    invokeMock.mockImplementation(() => reading)
+    const writing = writeBatchOriginal('c1', 1, [msg('m1')], controller.signal)
+    const rejected = expect(writing).rejects.toThrow('取消')
+    expect(invokeMock).toHaveBeenCalledWith('fs:agent-archive-original-read', 'c1')
+    controller.abort()
+    await rejected
+    release({ success: true, content: null })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(invokeMock.mock.calls.some(c => c[0] === 'fs:agent-archive-original-write')).toBe(false)
+  })
+
   it('同批次覆盖幂等（重生成/重压缩不叠加）', async () => {
     await writeBatchOriginal('c1', 1, [msg('m1')])
     await writeBatchOriginal('c1', 1, [msg('m2')])
@@ -94,6 +117,20 @@ describe('deleteBatchOriginals（§7.1-C2 评审 I1：批量删必须一次读-�
     const writesAfter = invokeMock.mock.calls.filter(c => c[0] === 'fs:agent-archive-original-write').length
     expect(writesAfter - writesBefore).toBe(1)          // 一次读-改-写
     expect(JSON.parse(files['c1']).batches).toEqual({}) // 三批全释放（不是只释放最后一批）
+  })
+
+  it.each(['success:false', 'IPC reject'])('释放分卷 %s 明确失败，原文仍可读取', async failure => {
+    await writeBatchOriginal('c1', 1, [msg('original')])
+    const original = invokeMock.getMockImplementation()!
+    invokeMock.mockImplementation(async (...args: unknown[]) => {
+      if (args[0] === 'fs:agent-archive-original-write') {
+        if (failure === 'IPC reject') throw new Error('写盘失败')
+        return { success: false }
+      }
+      return original(...args)
+    })
+    await expect(deleteBatchOriginals('c1', [1])).rejects.toThrow()
+    expect((await readBatchOriginal('c1', 1))?.[0].id).toBe('original')
   })
 
   it('待删批次不存在时不写盘（幂等，不制造无谓 IO）', async () => {

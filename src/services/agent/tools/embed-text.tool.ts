@@ -6,7 +6,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useVectorConfigStore } from '../../../stores/vector-config-store'
 
 export const embedTextTool = buildAgentTool({
@@ -24,7 +24,9 @@ export const embedTextTool = buildAgentTool({
     required: ['text'],
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const text = args.text as string
 
     if (!text || text.trim().length === 0) {
@@ -54,7 +56,7 @@ export const embedTextTool = buildAgentTool({
     }
 
     try {
-      const result = await ipc.invoke('embedding:generate', text)
+      const result = await toolIpc.invoke('embedding:generate', text)
 
       if (!result.success) {
         return {

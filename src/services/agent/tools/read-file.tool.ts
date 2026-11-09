@@ -10,11 +10,11 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 import { validatePath } from './safe-path'
 import type { ReadFileRangeOptions } from '../../../shared/ipc-channels'
-import { isVelaProtocol, readVelaContent } from '../../vela-protocol'
+import { isVelaProtocol, readVelaContent, VELA, parseCoreField } from '../../vela-protocol'
 import { resolveAgentFilePath } from '../agent-file-resolver'
 
 /** 绝对路径判定（Windows 盘符 / UNC，与 intent-router 一致） */
@@ -133,7 +133,9 @@ export const readFileTool = buildAgentTool({
     required: ['file_path'],
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const filePath = args.file_path as string
     // offset/limit 解析必须先于去重短路判断（P0-1 契约：短路豁免条件 = !args.offset && !args.limit）
     const { windowed, offset, limit, rangeOptions } = parseReadRange(args)
@@ -160,11 +162,12 @@ export const readFileTool = buildAgentTool({
       }
       // C1：窗口读把 offset/limit 下发主进程（超大文件主进程流式扫描，不再全量回传）
       const res = rangeOptions
-        ? await ipc.invoke('fs:read-external-file', filePath, rangeOptions)
-        : await ipc.invoke('fs:read-external-file', filePath)
+        ? await toolIpc.invoke('fs:read-external-file', filePath, rangeOptions)
+        : await toolIpc.invoke('fs:read-external-file', filePath)
       if (!res.success) {
         return { success: false, content: '', error: res.error ?? t('tool.readFileExternalFailed') }
       }
+      if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path) return { success: false, content: '', error: '操作已取消或项目已切换' }
       if (!windowed) {
         // 读去重：仅「无 offset/limit 的全量读」记录状态（P0-1 修订：分页读不覆盖「全量已读」语义）——
         // 否则分页读把 Map 覆盖为部分内容，后续全量读命中桩时桩长度=分页长度，LLM 拿不到全文
@@ -180,7 +183,26 @@ export const readFileTool = buildAgentTool({
         const state = readState.get(resolvedPath)
         if (state) return { success: true, content: FILE_UNCHANGED_STUB(resolvedPath, state.length) }
       }
-      const content = await readVelaContent(resolvedPath)
+      let content: string
+      if (!context) content = await readVelaContent(resolvedPath)
+      else if (resolvedPath.startsWith(VELA.MEMORY)) content = await toolIpc.invoke('memory:read', resolvedPath.slice(VELA.MEMORY.length)) ?? ''
+      else if (resolvedPath.startsWith(VELA.CORE)) {
+        const field = parseCoreField(resolvedPath)
+        const core = field ? await toolIpc.invoke('db:project-core-get') : null
+        content = field && core ? String((core as unknown as Record<string, unknown>)[field] ?? '') : ''
+      } else {
+        const prefix = [VELA.DRAFT, VELA.MANUSCRIPT, VELA.REVISION, VELA.REVIEW].find(p => resolvedPath.startsWith(p))
+        const rawId = prefix ? resolvedPath.slice(prefix.length) : ''
+        if (!/^\d+$/.test(rawId)) content = ''
+        else {
+          const id = Number(rawId)
+          const full = prefix === VELA.REVISION ? await toolIpc.invoke('db:revision-get-full', id)
+            : prefix === VELA.REVIEW ? await toolIpc.invoke('db:review-get-full', id)
+              : await toolIpc.invoke('db:draft-get-full', id)
+          content = full?.content ?? ''
+        }
+      }
+      if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path) return { success: false, content: '', error: '操作已取消或项目已切换' }
       if (!windowed) readState.set(resolvedPath, { length: content.length })
       return { success: true, content: applyReadWindow(content, offset, limit) }
     }
@@ -201,11 +223,12 @@ export const readFileTool = buildAgentTool({
     }
 
     const result = rangeOptions
-      ? await ipc.invoke('fs:read-file', pathCheck.fullPath, rangeOptions)
-      : await ipc.invoke('fs:read-file', pathCheck.fullPath)
+      ? await toolIpc.invoke('fs:read-file', pathCheck.fullPath, rangeOptions)
+      : await toolIpc.invoke('fs:read-file', pathCheck.fullPath)
     if (!result.success) {
       return { success: false, content: '', error: result.error ?? t('tool.readFileFailed') }
     }
+    if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path) return { success: false, content: '', error: '操作已取消或项目已切换' }
 
     if (!windowed) {
       // 读去重：仅「无 offset/limit 的全量读」记录状态（P0-1 修订：分页读不覆盖「全量已读」语义）——

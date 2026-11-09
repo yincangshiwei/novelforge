@@ -20,10 +20,13 @@ export interface RetryOptions {
   baseDelayMs?: number
   /** 最大延迟毫秒（默认 30000） */
   maxDelayMs?: number
+  /** 用户取消信号，同时取消重试退避等待 */
+  signal?: AbortSignal
 }
 
 /** 判断错误是否可重试 */
 function isRetryableError(error: unknown): boolean {
+  if (error && typeof error === 'object' && 'name' in error && error.name === 'AbortError') return false
   // HTTP 状态码错误（fetch 响应非 2xx）
   if (error && typeof error === 'object' && 'status' in error) {
     const status = (error as { status: number }).status
@@ -98,8 +101,12 @@ export async function withRetry<T>(
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await fn()
+      throwIfAborted(options.signal)
+      const result = await fn()
+      throwIfAborted(options.signal)
+      return result
     } catch (error) {
+      throwIfAborted(options.signal)
       lastError = error
 
       // 最后一次尝试已用完 → 抛出错误
@@ -130,15 +137,31 @@ export async function withRetry<T>(
           .replace('{err}', () => String(error).slice(0, 200)),
       )
 
-      await sleep(delay)
+      await sleep(delay, options.signal)
     }
   }
 
   throw lastError
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    throwIfAborted(signal)
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      reject(new DOMException('Operation cancelled', 'AbortError'))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /**
@@ -169,8 +192,12 @@ export async function withStreamRetry(
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await streamFn()
+      throwIfAborted(options.signal)
+      await streamFn()
+      throwIfAborted(options.signal)
+      return
     } catch (error) {
+      throwIfAborted(options.signal)
       lastError = error
 
       // 最后一次尝试已用完 → 抛出错误
@@ -211,7 +238,7 @@ export async function withStreamRetry(
           .replace('{err}', () => String(error).slice(0, 200)),
       )
 
-      await sleep(delay)
+      await sleep(delay, options.signal)
     }
   }
 

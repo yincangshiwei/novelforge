@@ -100,6 +100,16 @@ const h = vi.hoisted(() => ({
   backfillRows: [{ id: 'row-1', text: '无向量块', vector: null as unknown }],
   backfillFullRows: [{ id: 'row-1', text: '无向量块', vector: null as unknown }],
   vectorlessCount: 0,
+  signal: undefined as AbortSignal | undefined,
+  onReplace: undefined as (() => void) | undefined,
+  onSearch: undefined as (() => void) | undefined,
+}))
+
+vi.mock('./services/agent-operation-journal', () => ({
+  currentOperationSignal: () => h.signal,
+  checkOperationCancellation: () => {
+    if (h.signal?.aborted) throw Object.assign(new Error('操作已取消'), { name: 'AbortError' })
+  },
 }))
 
 vi.mock('./database', () => ({
@@ -122,10 +132,11 @@ vi.mock('./vector-store', () => ({
     chapterScope?: [number, number],
   ) => {
     h.searchCalls.push({ projectPath, query, queryVector, topK, chapterScope })
+    h.onSearch?.()
     return h.searchResults
   },
   // knowledge-base 顶层 import 的其余符号（检索用例不触发，仅为模块图完整 / T3 链用例使用）
-  addChunks: async (
+  replaceDocumentChunks: async (
     projectPath: string,
     docId: string,
     fileName: string,
@@ -133,6 +144,8 @@ vi.mock('./vector-store', () => ({
     vectors?: number[][],
   ) => {
     h.addChunksCalls.push({ projectPath, docId, fileName, chunks, vectors })
+    h.removeDocCalls.push(...h.existingDocs.filter(d => d.fileName === fileName).map(d => d.id))
+    h.onReplace?.()
     return { success: true, chunkCount: chunks.length }
   },
   removeDocument: async (_projectPath: string, docId: string) => {
@@ -300,6 +313,9 @@ function makeCountingCharactersDb(rows: Array<{ name: string; aliases: string }>
 }
 
 beforeEach(() => {
+  h.signal = undefined
+  h.onReplace = undefined
+  h.onSearch = undefined
   h.searchCalls.length = 0
   h.searchResults.length = 0
   h.embedCalls.length = 0
@@ -333,6 +349,30 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+})
+
+describe('KB 操作取消边界', () => {
+  it('替换提交期间取消仍返回已写入成功', async () => {
+    const controller = new AbortController()
+    h.signal = controller.signal
+    h.chunkTextImpl = text => [text]
+    h.onReplace = () => controller.abort()
+    await expect(importText('fixture', 'fixture.md', PROJECT, 'openai', { baseUrl: '', apiKey: '' })).resolves.toMatchObject({ success: true, chunkCount: 1 })
+  })
+
+  it('FTS await 后取消不返回迟到结果', async () => {
+    const controller = new AbortController()
+    h.signal = controller.signal
+    h.onSearch = () => controller.abort()
+    await expect(searchKnowledgeFTS('fixture', PROJECT)).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
+  it('混合检索 await 后取消不返回迟到结果', async () => {
+    const controller = new AbortController()
+    h.signal = controller.signal
+    h.onSearch = () => controller.abort()
+    await expect(searchKnowledge('fixture', PROJECT, 'openai', MODEL)).rejects.toMatchObject({ name: 'AbortError' })
+  })
 })
 
 // ===== ① 纯函数 =====

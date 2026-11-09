@@ -1,5 +1,14 @@
 import { create } from 'zustand'
+import { waitForApproval, waitWithAbort } from '../services/agent/abort-wait'
+import { ArchiveQueue } from '../services/agent/archive-queue'
+import { CLOSE_DRAIN_TIMEOUT_MS, waitForCloseResult } from '../shared/close-deadline'
+import { isCloseCoordinating } from '../shared/close-coordinator'
+import { restoreUnknownExecutions } from '../services/agent/tool-execution'
+import { recoverConversationOperations } from '../services/agent/operation-recovery'
+import { toast } from '../components/ui/Toast'
 import { t } from '../shared/locale'
+import { toolHistoryGroup } from '../services/agent/tool-history'
+import { textProtocolMessages } from '../shared/llm-tool-protocol'
 import { useLLMStore } from './llm-store'
 import { useThinkingStore } from './thinking-store'
 import { thinkingLevelSpec } from '../shared/thinking-level'
@@ -63,6 +72,8 @@ export interface AgentMessage {
   streaming?: boolean
   /** Tool 调用信息（Agent 回复时） */
   toolCalls?: ToolCallInfo[]
+  executionOutcome?: import('../services/agent/execution-evidence').ExecutionOutcome
+  timeline?: import('../services/agent/agent-timeline').AgentTimelineBlock[]
   /** 产物列表（Agent 创建/修改的文件、触发的工作流等） */
   artifacts?: ToolArtifact[]
   /** 用户反馈（2026-09-22）：对模型回复满意/不满意；再次点击同一档即取消。随会话一起落盘 */
@@ -222,7 +233,7 @@ interface AgentState {
   cancelGeneration: () => Promise<void>
   /** C 档第二轮：派发子 agent（task 工具入口）——`ok=false` 表示未完成（工具侧据此报失败）；
    *  `artifacts` 供父消息展示子 agent 改过哪些文件（spec §3.6 的产物合并） */
-  runSubAgentTask: (input: { description: string; prompt?: string; tools?: string[] }) => Promise<{
+  runSubAgentTask: (input: { description: string; prompt?: string; tools?: string[]; signal?: AbortSignal }) => Promise<{
     text: string
     ok: boolean
     artifacts?: ToolArtifact[]
@@ -265,8 +276,11 @@ interface AgentState {
   /** 恢复第 entryIndex 个 rewind 归档：归档消息 append 回 messages（rewind 可逆）；
    *  返回是否成功；无归档或索引无效返回 false */
   restoreRewound: (entryIndex: number) => boolean
-  /** 持久化会话（防抖 500ms，fire-and-forget）；convId 缺省取当前活跃会话 */
-  persistCurrent: (convId?: string) => Promise<void>
+  /** 按会话串行持久化并等待本次写盘；convId 缺省取当前活跃会话 */
+  persistCurrent: (convId?: string) => Promise<boolean>
+  archiveSaveStates: Record<string, import('../services/agent/archive-queue').ArchiveSaveState>
+  flushArchives: () => Promise<boolean>
+  prepareForClose: () => Promise<boolean>
   /** 设置某条消息的反馈（满意/不满意）；再次传入相同值即取消该反馈 */
   setMessageFeedback: (messageId: string, feedback: 'up' | 'down') => void
   /** 线② 2b D5：工作流完成回执——往活跃会话追加一条 workflow_completed 产物消息（对话内卡片为主） */
@@ -283,11 +297,14 @@ const genId = () => crypto.randomUUID()
  * 子 agent 的首轮前缀与父无关，混进父的 `lastPrefixText` 会污染父的缓存命中读数
  * （B 档第二轮的前缀记账是「按会话连续两轮」的语义）。
  */
-const generateForSubAgent: LLMGenerateFn = async (messages, modelId, onChunk, onRequestId) => {
+const generateForSubAgent: LLMGenerateFn = async (messages, modelId, onChunk, onRequestId, signal) => {
+  let requestId: string | undefined
+  const cancel = (): void => { if (requestId) void useLLMStore.getState().cancelGeneration(requestId) }
+  signal?.addEventListener('abort', cancel, { once: true })
   const startTime = Date.now()
   let usage: { promptTokens: number; completionTokens: number; totalTokens: number; cachedTokens?: number } | undefined
   try {
-    const text = await new Promise<string>((resolve, reject) => {
+    const text = await waitWithAbort(new Promise<string>((resolve, reject) => {
       useLLMStore.getState().generateStream(
         messages.map(m => ({ role: m.role, content: m.content })),
         {
@@ -297,17 +314,19 @@ const generateForSubAgent: LLMGenerateFn = async (messages, modelId, onChunk, on
         },
         modelId,
         { priority: 11 }, // 子 agent 略低于父（12），高于批量任务
-      ).then((requestId) => {
-        // 回填 requestId：否则子 agent 飞行中的流式请求**任何 UI 动作都取消不了**
-        // （取消只 abort signal，而引擎只在轮次之间查 abort；请求本身要 llm:cancel）
-        onRequestId?.(requestId)
+      ).then((id) => {
+        requestId = id
+        if (signal?.aborted) cancel()
+        else onRequestId?.(id)
       }).catch((error) => reject(error))
-    })
+    }), signal)
     void logSubAgentCall(modelId, startTime, usage, true, '')
     return text
   } catch (error) {
     void logSubAgentCall(modelId, startTime, undefined, false, String(error))
     throw error
+  } finally {
+    signal?.removeEventListener('abort', cancel)
   }
 }
 
@@ -345,6 +364,7 @@ function linkParentAbort(controller: AbortController): () => void {
   const parent = activeAbortController
   if (!parent) return () => {}
   const onAbort = (): void => controller.abort()
+  if (parent.signal.aborted) controller.abort()
   parent.signal.addEventListener('abort', onAbort, { once: true })
   return () => parent.signal.removeEventListener('abort', onAbort)
 }
@@ -436,7 +456,19 @@ let generationSeq = 0
 
 /** archive 恢复请求序号 — 快速启动/重复调用时旧请求晚到不覆盖新状态 */
 let archiveLoadSeq = 0
-let persistTimer: ReturnType<typeof setTimeout> | null = null
+let flushActiveChunks: (() => void) | null = null
+let preparingClose = false
+let closeDrain: Promise<boolean> | null = null
+const subRuns = new Set<Promise<SubAgentSession>>()
+const activeRuns = new Set<Promise<void>>()
+const preparingRuns = new Set<Promise<void>>()
+const archiveQueue = new ArchiveQueue(
+  (id, snapshot) => ipc.invoke('fs:agent-archive-write', id, snapshot),
+  (id, state) => {
+    useAgentStore.setState(s => ({ archiveSaveStates: { ...s.archiveSaveStates, [id]: state } }))
+    if (state.status === 'failed') toast.error('会话执行记录保存失败，请勿关闭应用；可稍后重试。')
+  },
+)
 
 // ===== 子 agent 派发（C 档第二轮）=====
 /** 运行中的子 agent（sessionId → controller）：单个取消与父取消传播用 */
@@ -541,9 +573,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     clearReadState()
     resetPrefixBaseline()   // P0-1：删除可能改变活跃会话，前缀基线一并重置
     // 同步删除归档文件（主进程幂等删除；fire-and-forget）
-    ipc.invoke('fs:agent-archive-delete', id).catch(() => {
-      console.warn('[Agent] 归档删除失败:', id)
-    })
+    void archiveQueue.remove(id, () => ipc.invoke('fs:agent-archive-delete', id))
     // B3 分卷同步删除 —— "保留全部"的前提就是会话删除时级联清理（评审 C2），
     // 否则 .originals.json 变成 UI 看不见也清不掉的孤儿文件
     void deleteAllOriginals(id).catch(() => { /* 分卷清理失败不阻断 */ })
@@ -556,9 +586,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     clearReadState()
     resetPrefixBaseline()   // P0-1：会话全清 → 前缀基线同清
     for (const id of ids) {
-      ipc.invoke('fs:agent-archive-delete', id).catch(() => {
-        console.warn('[Agent] 归档删除失败:', id)
-      })
+      void archiveQueue.remove(id, () => ipc.invoke('fs:agent-archive-delete', id))
       void deleteAllOriginals(id).catch(() => { /* 分卷清理失败不阻断 */ })
     }
   },
@@ -590,7 +618,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
   },
 
   sendMessage: async (content) => {
-    if (!content.trim() || get().generating) return
+    if (preparingClose || isCloseCoordinating() || !content.trim() || get().generating) return
     if (useProjectStore.getState().loading) return
 
     // 确保 Tool 已初始化
@@ -671,6 +699,19 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       conv = get().createConversation()
     }
     const convId = conv.id
+    const abortController = new AbortController()
+    activeAbortController = abortController
+    const mySeq = ++generationSeq
+    let finishPreparing!: () => void
+    const preparing = new Promise<void>(resolve => { finishPreparing = resolve })
+    preparingRuns.add(preparing)
+    const checkPreparing = (): void => {
+      if (abortController.signal.aborted || mySeq !== generationSeq || preparingClose) {
+        throw Object.assign(new Error('操作已取消'), { name: 'AbortError' })
+      }
+    }
+    set({ generating: true })
+    try {
 
     // ===== 意图预路由（阶段 A）：本地识别 → 澄清 / 增强 / 交 ReAct（方案 B 2026-10-02）=====
     // 守卫：/ 前缀输入（/status 穿透分支、未知/自定义 skill 命令改写分支——皆未 return 到达此处）
@@ -680,7 +721,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     let enhancedContent: string | undefined
     try {
       if (intent.kind !== 'none') {
-        const res = await get().handleWritingIntent(intent, trimmedContent)
+        const res = await waitWithAbort(get().handleWritingIntent(intent, trimmedContent), abortController.signal)
+        checkPreparing()
         if (res.status === 'handled') return
         enhancedContent = res.enhancedContent
         // P0-4：增强后文本同步替换 content——后续 userMsg/标题/RAG/@ 预取/enrichedUserMessage
@@ -688,6 +730,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         if (enhancedContent !== undefined) content = enhancedContent
       }
     } catch (error) {
+      if (abortController.signal.aborted || mySeq !== generationSeq || preparingClose) return
       // 兜底（沿用 I2 评审结论；方案 B 2026-10-02 后直出已退场，handleWritingIntent 对异常一律 rethrow）：
       // 注入 `发生异常` 文案（与下方 ReAct try/catch 的既有形态一致）并 return——不让 sendMessage reject，
       // 会话保持可继续对话
@@ -770,7 +813,6 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
 
     try {
       // 竞态防护：记录本次生成序号，旧请求（取消后）的 onDone/onError 晚到时不覆盖新请求状态
-      const mySeq = ++generationSeq
       const llmStore = useLLMStore.getState()
       const currentConv = get().conversations.find(c => c.id === convId)!
       // A 档动态策略：strategy='dynamic' 时按全局思考等级（用户可见的投入旋钮）决定路由层；
@@ -798,13 +840,13 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
 
       // 构建系统提示词（含项目上下文 + Tool 列表 + 记忆分层；manual 硬门控需要本轮用户消息，
       // 只影响本轮 system 段、不进会话历史，故后续轮次不继承）
-      let systemPrompt = await buildAgentSystemPromptAsync(agentMode, content.trim(), {
+      let systemPrompt = await waitWithAbort(buildAgentSystemPromptAsync(agentMode, content.trim(), {
         toolBudgetTokens: contextPolicy.toolBudgetTokens,
         m1BudgetTokens: contextPolicy.m1BudgetTokens,
         l1BudgetTokens: contextPolicy.l1BudgetTokens,
         // W3（批 3）：仅弱档自动召回记忆（强模型自己会 @ / read_memory）
         autoRecall: contextPolicy.autoRecall,
-      })
+      }), abortController.signal)
 
       // ===== 角色试演注入：会话绑定角色卡时以角色身份回复（OOC 约束在 roleplay prompt 内） =====
       if (currentConv.roleplayCharacter) {
@@ -816,18 +858,18 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
 
       // ===== RAG 自动注入：向量搜索增强上下文 =====
       try {
-        const ragResult = await retrieveContextForQuery(
-          content.trim(),
-          DEFAULT_RAG_CONFIG,
-        )
+        const ragResult = await waitWithAbort(retrieveContextForQuery(
+          content.trim(), DEFAULT_RAG_CONFIG,
+        ), abortController.signal)
         if (ragResult && ragResult.chunks.length > 0) {
           // ⚠️ M 级修复：标注检索片段的「非事实」语义——模型曾把检索结果当既定事实直接采信
           systemPrompt += `\n\n---\n## 知识库相关上下文（自动检索——以下片段为相关度排序的检索结果，可能与定稿有出入；涉及事实请以最新工具查询为准）\n\n${ragResult.formattedContext}`
           console.debug(`[Agent] ${getRAGSummary(ragResult)}`)
         }
       } catch {
-        // RAG 失败不影响主流程
+        checkPreparing()
       }
+      checkPreparing()
 
       // ===== P1-5: @ 提及预取（Token 感知限制） =====
       const MENTION_MAX_TOKENS = 1200
@@ -843,11 +885,17 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         const prefetchResults: string[] = []
         let prefetchTokens = 0
         for (const call of prefetchCalls) {
+          checkPreparing()
           if (prefetchTokens >= MENTION_MAX_TOKENS) break
           const tool = toolRegistry.get(call.toolName)
-          if (tool) {
+          if (tool?.isReadOnly) {
             try {
-              const result = await tool.execute(call.args)
+              const callId = `${assistantMsg.id}:prefetch:${prefetchResults.length}`
+              const result = await waitWithAbort(tool.execute(call.args, {
+                signal: abortController.signal, turnId: assistantMsg.id, callId, operationId: callId,
+                step: 0, toolName: tool.name, scope: currentConv.projectPath ?? convId, conversationId: convId,
+              }), abortController.signal)
+              checkPreparing()
               if (result.success && result.content) {
                 const availableBudget = MENTION_MAX_TOKENS - prefetchTokens
                 const content = availableBudget > 0
@@ -862,7 +910,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
                 prefetchTokens += contentTokens
               }
             } catch {
-              // 预取失败不阻塞主流程
+              checkPreparing()
             }
           }
         }
@@ -891,13 +939,14 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       let learning: CompressionLearningState = defaultCompressionLearning()
       if (totalHistoryTokens > COMPACTION_HISTORY_MIN_TOKENS) {
         try {
-          const cfg = await ipc.invoke('config:get') as { compaction?: unknown; compactionLearning?: unknown } | null
+          const cfg = await waitWithAbort(ipc.invoke('config:get'), abortController.signal) as { compaction?: unknown; compactionLearning?: unknown } | null
+          checkPreparing()
           prefs = resolveCompactionPrefs(cfg, {
             ...DEFAULT_COMPACTION_PREFS,
             budgetPercent: contextPolicy.historyPercent,
           })
           learning = resolveCompressionLearning(cfg?.compactionLearning)
-        } catch { /* 读配置失败：用缺省（与旧行为逐字一致），不阻断对话 */ }
+        } catch { checkPreparing() }
       }
       // 自学习压缩：有效最小降幅 = 用户值 × 学习倍率（关闭时逐字等于用户值）
       const effectiveMinChange = effectiveMinChangeTokens(prefs.minimumChangeTokens, learning)
@@ -921,7 +970,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
           const { batch, rest } = selectCompressionBatch(currentConv.messages, HISTORY_MAX_TOKENS)
           if (batch.length > 0) {
             compressionAttempted = true
-            const summary = await generateConversationSummary({
+            const summary = await waitWithAbort(generateConversationSummary({
               oldSummary: currentConv.rollingSummary ?? '',
               batch,
               modelId,
@@ -929,7 +978,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               hints: composeLearningHints(learning),
               // W1 批 2：生成长度指令与注入上限同源（强档 400 / 弱档 200），避免"死额度"
               maxTokens: contextPolicy.m1BudgetTokens,
-            })
+              signal: abortController.signal,
+            }), abortController.signal)
             const batchTokens = batch.reduce((sum, m) => sum + estimateTokens(m.content), 0)
 
             // ===== B5 副作用回执：**头插**进摘要（评审 I6）=====
@@ -975,14 +1025,16 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               const batchNum = Math.max(0, ...(currentConv.compressed ?? []).map(b => b.batch)) + 1
 
               // ===== B3 原文写分卷：会话 JSON 只留引用，原文永不丢失 =====
+              checkPreparing()
               let recoverable = true
               try {
                 // 主进程写失败返回 {success:false}（不 reject）—— 必须读返回值，
                 // 否则 recoverable 恒真、诚实标记失效（评审 I4）
-                recoverable = await writeBatchOriginal(convId, batchNum, batch)
+                recoverable = await writeBatchOriginal(convId, batchNum, batch, abortController.signal)
               } catch {
                 recoverable = false   // IPC 层 reject
               }
+              checkPreparing()
 
               const newBatch: CompressedBatch = {
                 batch: batchNum,
@@ -1003,25 +1055,14 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
                 fidelity: { extracted: fidelity.extracted, retained: fidelity.retained, ratio: fidelity.ratio },
               }
               let compressed = [...(currentConv.compressed ?? []), newBatch]
+              let droppedBatches: CompressedBatch[] = []
               // §7.1-C2 keepBatches：仅当用户**显式**设了 N>0 才裁剪更旧的批次
               // （连同分卷原文释放 → 该压缩卡片的「恢复原文」随之消失）。默认 0 = 不裁，
               // 维持 B 档第二轮「原文永不删」的承诺。
+              checkPreparing()
               if (prefs.keepBatches > 0 && compressed.length > prefs.keepBatches) {
-                const dropped = compressed.slice(0, compressed.length - prefs.keepBatches)
+                droppedBatches = compressed.slice(0, compressed.length - prefs.keepBatches)
                 compressed = compressed.slice(compressed.length - prefs.keepBatches)
-                // ⚠️ 一次读-改-写删掉全部分卷（评审 I1：逐条并发删会丢更新 —— 每次写都基于
-                //    同一份陈旧快照，只有最后一次存活、其余被"复活"）
-                try {
-                  await deleteBatchOriginals(convId, dropped.map(b => b.batch))
-                  renderLog('info', 'Agent', t('ccr.batchesPruned')
-                    .replace('{n}', String(dropped.length))
-                    .replace('{keep}', String(prefs.keepBatches)))
-                } catch (e) {
-                  // 释放失败要如实说（卡片已消失、原文可能仍在盘上）——不谎报成功
-                  renderLog('warn', 'Agent', t('ccr.batchesPruneOriginalsFailed')
-                    .replace('{n}', String(dropped.length))
-                    .replace('{error}', String(e)))
-                }
               }
               set(state => ({
                 conversations: state.conversations.map(c =>
@@ -1030,10 +1071,24 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
                     : c
                 ),
               }))
-              get().persistCurrent(convId)
+              const saved = await get().persistCurrent(convId)
+              checkPreparing()
+              if (saved && droppedBatches.length > 0) {
+                try {
+                  await deleteBatchOriginals(convId, droppedBatches.map(b => b.batch))
+                  checkPreparing()
+                  renderLog('info', 'Agent', t('ccr.batchesPruned')
+                    .replace('{n}', String(droppedBatches.length)).replace('{keep}', String(prefs.keepBatches)))
+                } catch (error) {
+                  renderLog('warn', 'Agent', t('ccr.batchesPruneOriginalsFailed')
+                    .replace('{n}', String(droppedBatches.length)).replace('{error}', String(error)))
+                }
+                checkPreparing()
+              }
             }
           }
         } catch {
+          checkPreparing()
           // 摘要失败降级：不压缩，走下方硬截断（历史行为，不阻断对话）
           console.warn('[Agent] CCR 摘要生成失败，降级硬截断')
         }
@@ -1043,23 +1098,23 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       // historyMaxTokens；CCR 压缩后剩余消息通常已达标。评审 Minor 9：注释别写死 4000）
       const afterCompress = get().conversations.find(c => c.id === convId)!
       const candidateMessages = afterCompress.messages
-        .filter(m => !m.streaming && m.role !== 'system' && !m.error)
-        .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
-        .reverse() // 从最新到最旧
+        .filter(m => m.id !== userMsg.id && !m.streaming && m.role !== 'system' && !m.error)
+        .map(toolHistoryGroup)
+        .reverse()
       const historyMessages: LLMMessage[] = []
       let historyTokens = 0
-      for (const msg of candidateMessages) {
-        const msgTokens = estimateTokens(msg.content)
+      for (const group of candidateMessages) {
+        const msgTokens = group.reduce((sum, msg) => sum + estimateTokens(msg.content + JSON.stringify(msg.toolCalls ?? [])), 0)
         if (historyTokens + msgTokens > HISTORY_MAX_TOKENS) break
-        historyMessages.unshift(msg) // 还原为正序
+        historyMessages.unshift(...group)
         historyTokens += msgTokens
       }
 
       // ===== P0-2：硬截断兜底必须留痕 =====
       // 真正丢消息的一步此前是**静默的**：压缩失败 / 无收益跳过 / 压缩不足以降到预算下三种
       // 情形下，用户都不知道这轮少了几条历史（消息未删除，只是未发送；日志给出条数与 token 量）
-      const panelHistoryTokens = candidateMessages.reduce((sum, m) => sum + estimateTokens(m.content), 0)
-      const droppedMessages = candidateMessages.slice(historyMessages.length)
+      const panelHistoryTokens = candidateMessages.flat().reduce((sum, m) => sum + estimateTokens(m.content + JSON.stringify(m.toolCalls ?? [])), 0)
+      const droppedMessages = candidateMessages.flat().filter(m => !historyMessages.includes(m))
       if (droppedMessages.length > 0) {
         renderLog('warn', 'Agent', t('ccr.historyTruncated')
           .replace('{n}', String(droppedMessages.length))
@@ -1081,9 +1136,11 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
           truncationDropped: droppedMessages.length,
         })
         if (update.changed) {
-          void ipc.invoke('config:set', { compactionLearning: update.state }).catch(() => {
+          checkPreparing()
+          await ipc.invoke('config:set', { compactionLearning: update.state }).catch(() => {
             console.warn('[Agent] 自学习压缩状态写入失败')
           })
+          checkPreparing()
           for (const ev of update.events) renderLog('info', 'Agent', ev.message)
         }
       }
@@ -1108,45 +1165,59 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         messages: LLMMessage[],
         mid: string,
         onChunk?: (chunk: string) => void,
-      ): Promise<string> => {
+      ): Promise<string | import('../shared/llm-tool-protocol').LLMStepResult> => {
         const startTime = Date.now()
+        let step: import('../shared/llm-tool-protocol').LLMStepResult | undefined
+        const nativeTools = useLLMStore.getState().models.find(m => m.id === mid)?.nativeToolCalling === false ? undefined
+          : toolRegistry.listAll().filter(tool => /^[a-zA-Z0-9_-]{1,64}$/.test(tool.name)).map(tool => ({ name: tool.name, description: tool.description, parameters: tool.inputSchema }))
+        const requestMessages = nativeTools ? messages : textProtocolMessages(messages)
         let streamRequestId: string | null = null
         let usage: { promptTokens: number; completionTokens: number; totalTokens: number; cachedTokens?: number } | undefined
 
         try {
           let streamHadText = false
-          let text = await new Promise<string>((resolve, reject) => {
+          let text = await waitWithAbort(new Promise<string>((resolve, reject) => {
             useLLMStore.getState().generateStream(
-              messages.map(m => ({ role: m.role, content: m.content })),
+              requestMessages,
               {
                 onChunk: (chunk) => {
                   if (chunk.trim()) streamHadText = true
                   onChunk?.(chunk)
                 },
-                onDone: (fullText, u) => {
+                onDone: (fullText, u, result) => {
                   usage = u
+                  step = result
                   resolve(fullText)
                 },
                 onError: (error) => reject(new Error(error)),
               },
               mid,
-              { priority: 12 }, // Agent 任务优先于批量任务
+              { priority: 12, tools: nativeTools, toolChoice: 'auto' },
             ).then((requestId) => {
               streamRequestId = requestId
-              activeStreamRequestId = requestId
+              if (abortController.signal.aborted || mySeq !== generationSeq) {
+                void useLLMStore.getState().cancelGeneration(requestId)
+              } else activeStreamRequestId = requestId
             }).catch((error) => reject(error))
-          })
+          }), abortController.signal)
 
           // 兼容少数 OpenAI-compatible 模型：流式通道成功但 visible content 为空。
           // 同一模型降级到非流式一次，避免 UI 只剩用户消息。
-          if (!text.trim() && !streamHadText) {
-            const fallback = await ipc.invoke('llm:generate', {
-              modelId: mid,
-              messages: messages.map(m => ({ role: m.role, content: m.content })),
-              priority: 12,
-            })
-            if (fallback.success && fallback.content?.trim()) {
+          if (!text.trim() && !streamHadText && !step?.toolCalls.length && (!step || (step.terminalSeen && step.finishReason === 'stop'))) {
+            const fallbackId = crypto.randomUUID()
+            const cancelFallback = (): void => { void ipc.invoke('llm:cancel', fallbackId).catch(() => {}) }
+            if (abortController.signal.aborted) throw new Error('操作已取消')
+            abortController.signal.addEventListener('abort', cancelFallback, { once: true })
+            let fallback: import('../shared/ipc-channels').LLMResponse
+            try {
+              fallback = await waitWithAbort(ipc.invoke('llm:generate', {
+                requestId: fallbackId, modelId: mid, messages: requestMessages,
+                tools: nativeTools, toolChoice: 'auto', priority: 12,
+              }), abortController.signal)
+            } finally { abortController.signal.removeEventListener('abort', cancelFallback) }
+            if (fallback.success && (fallback.content?.trim() || fallback.step?.toolCalls.length)) {
               text = fallback.content
+              step = fallback.step
               usage = fallback.usage
               onChunk?.(fallback.content)
             } else {
@@ -1188,7 +1259,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
             })
           } catch { /* 日志失败不影响主流程 */ }
 
-          return text
+          return step ? { ...step, text } : text
         } catch (error) {
           // 记录失败日志
           const model = llmStore.models.find(m => m.id === mid)
@@ -1214,15 +1285,15 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         }
       }
 
-      // AbortController 用于取消（P1-7: 提升到模块级变量以便 cancelGeneration 访问）
-      const abortController = new AbortController()
-      activeAbortController = abortController
+      if (abortController.signal.aborted || mySeq !== generationSeq || preparingClose) return
       set({ activeRequestId: assistantMsg.id })
 
       // 引擎依赖注入（P0-1 写盘引用）：真实 IPC 实现；失败回退由引擎降级（截断注入）。
       // 走 ipc.invoke（带 30s 超时，同 fs:agent-archive-* 调用惯例）——裸 window.velaAPI.invoke
       // 无超时保护，写盘挂起会让 ReAct 循环该轮永卡；超时 reject → catch → {success:false} → 引擎降级
       const agentDeps: AgentEngineDeps = {
+        executionScope: conv.projectPath ?? conv.id,
+        conversationId: conv.id,
         getWorkflowStatus: (runId) => {
           const state = useWorkflowStore.getState()
           return state.activeRuns.find(r => r.id === runId)?.status ?? state.history.find(r => r.id === runId)?.status
@@ -1242,6 +1313,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       // 按大小立即 flush 会绕过时间间隔 → 高频 setState 阻塞主线程（同 workflow-store 教训）
       let chunkBuffer = ''
       let lastFlushTime = 0 // 0 = 首块立即 flush，首帧无延迟
+      let lastArchiveTime = 0
       const FLUSH_INTERVAL_MS = 50
 
       const flushChunkBuffer = () => {
@@ -1252,9 +1324,14 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         }))
         chunkBuffer = ''
         lastFlushTime = Date.now()
+        if (lastFlushTime - lastArchiveTime >= 1000) {
+          lastArchiveTime = lastFlushTime
+          void get().persistCurrent(convId)
+        }
       }
 
-      await runAgentLoop(
+      flushActiveChunks = flushChunkBuffer
+      const run = runAgentLoop(
         systemPrompt,
         historyMessages,
         enrichedUserMessage,
@@ -1268,7 +1345,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               .replace(/<\/?tool_call>/g, '')
               .replace(/<\/?tool_result[^>]*>/g, '')
             // 原生 DSML 工具标记同属协议残片（无 DSML 时逐字原样返回）
-            const cleaned = stripDsmlMarkup(withoutToolTags).trim()
+            if (mySeq !== generationSeq) return
+            const cleaned = stripDsmlMarkup(withoutToolTags)
             if (!cleaned) return
             chunkBuffer += cleaned
             // 仅时间驱动：两次 flush 之间强制 ≥50ms，大小不再立即触发
@@ -1276,12 +1354,19 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               flushChunkBuffer()
             }
           },
+          onTimeline: (timeline) => {
+            if (mySeq !== generationSeq) return
+            flushChunkBuffer()
+            updateAssistantMsg(m => ({ ...m, timeline }))
+          },
           onTextReplace: (text) => {
             if (mySeq !== generationSeq) return
             chunkBuffer = ''
             updateAssistantMsg(m => ({ ...m, content: text }))
           },
           onToolCallStart: (toolCall) => {
+            if (mySeq !== generationSeq) return
+            flushChunkBuffer()
             // 需确认的工具会收到两次 start（waiting_confirm + running），已存在则更新而非重复追加
             updateAssistantMsg(m => {
               const existing = m.toolCalls ?? []
@@ -1293,17 +1378,20 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
                   : [...existing, toolCall],
               }
             })
+            void get().persistCurrent(convId)
           },
+          onBeforeToolExecution: () => get().persistCurrent(convId),
           onToolCallComplete: (toolCall, artifacts) => {
+            if (mySeq === generationSeq) flushChunkBuffer()
             updateAssistantMsg(m => ({
               ...m,
-              toolCalls: (m.toolCalls ?? []).map(tc =>
-                tc.id === toolCall.id ? toolCall : tc
-              ),
+              toolCalls: (m.toolCalls ?? []).some(tc => tc.id === toolCall.id)
+                ? (m.toolCalls ?? []).map(tc => tc.id === toolCall.id ? toolCall : tc)
+                : [...(m.toolCalls ?? []), toolCall],
               artifacts: artifacts?.length ? [...(m.artifacts ?? []), ...artifacts] : m.artifacts,
             }))
+            void get().persistCurrent(convId)
             if (artifacts?.length) {
-              void get().persistCurrent(convId)
               for (const artifact of artifacts) {
                 const runId = artifact.metadata?.runId
                 if (artifact.type !== 'workflow_started' || typeof runId !== 'string') continue
@@ -1318,7 +1406,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
           onToolCallConfirmRequired: async (toolCall) => {
             // ===== A 档审批策略层：危险硬拒绝 / workspace 规则命中 → 不打扰用户 =====
             const projectPath = useProjectStore.getState().currentProject?.path ?? null
-            const rules = projectPath ? await loadApprovalRules(projectPath) : []
+            const rules = projectPath ? await waitWithAbort(loadApprovalRules(projectPath), abortController.signal) : []
+            if (abortController.signal.aborted || mySeq !== generationSeq) return false
             const tool = toolRegistry.get(toolCall.toolName)
             const args = (toolCall.arguments ?? {}) as Record<string, unknown>
             const decision = evaluateApproval({
@@ -1347,9 +1436,9 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
             }))
 
             // 返回 Promise，等待用户通过 resolveToolConfirmation 响应
-            return new Promise<boolean>((resolve) => {
+            return waitForApproval(abortController.signal, resolve => {
               pendingConfirmations.set(toolCall.id, { resolve, decision, projectPath, args })
-            })
+            }, () => pendingConfirmations.delete(toolCall.id))
           },
           // 进度接线（约束③）：引擎每轮都发 onProgress，此前无人接 → 数据被丢弃。
           // ⚠️ 必须与 onDone 同款 seq 守卫（见 :423 generationSeq 注释）：取消后立即发新消息时，
@@ -1358,7 +1447,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
             if (mySeq !== generationSeq) return
             set({ agentProgress: p })
           },
-          onDone: (fullText, toolCalls, artifacts) => {
+          onDone: (fullText, toolCalls, artifacts, executionOutcome) => {
             // 旧请求晚到（取消后已发新消息）：忽略，避免覆盖新请求的 generating 状态
             if (mySeq !== generationSeq) return
             // 刷新任何残留的缓冲区
@@ -1378,6 +1467,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               content: cleanedText,
               streaming: false,
               toolCalls,
+              executionOutcome,
               artifacts: artifacts.length > 0 ? artifacts : undefined,
             }))
             set(state => ({
@@ -1392,13 +1482,14 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
           },
           onError: (error) => {
             if (mySeq !== generationSeq) return
+            flushChunkBuffer()
             updateAssistantMsg(m => ({
               ...m,
-              content: '',
               streaming: false,
               error: { message: error },
             }))
             set({ generating: false, activeRequestId: null })
+            void get().persistCurrent(convId)
           },
         },
         abortController.signal,
@@ -1413,14 +1504,28 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         },
         agentDeps,
       )
+      activeRuns.add(run)
+      try { await run } finally {
+        activeRuns.delete(run)
+        if (flushActiveChunks === flushChunkBuffer) flushActiveChunks = null
+      }
     } catch (error) {
+      if (mySeq !== generationSeq || abortController.signal.aborted) return
       updateAssistantMsg(m => ({
         ...m,
-        content: '',
         streaming: false,
         error: { message: String(error) },
       }))
       set({ generating: false, activeRequestId: null })
+      void get().persistCurrent(convId)
+    }
+    } finally {
+      finishPreparing()
+      preparingRuns.delete(preparing)
+      if (mySeq === generationSeq) {
+        if (activeAbortController === abortController) activeAbortController = null
+        set({ generating: false })
+      }
     }
   },
 
@@ -1496,6 +1601,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
   },
 
   cancelGeneration: async () => {
+    const cancelSeq = generationSeq
+    flushActiveChunks?.()
     // 触发 AbortSignal，使 ReAct 循环中止（下一轮检查）
     if (activeAbortController) {
       activeAbortController.abort()
@@ -1510,9 +1617,11 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
 
     // 真实取消底层流式请求（旧实现传 assistantMsg.id 给 llm:cancel 无效，底层 API 会跑完）
     if (activeStreamRequestId) {
-      await useLLMStore.getState().cancelGeneration(activeStreamRequestId)
+      const id = activeStreamRequestId
       activeStreamRequestId = null
+      void useLLMStore.getState().cancelGeneration(id)
     }
+    if (cancelSeq !== generationSeq) return
 
     // 清理所有等待确认的 Promise，防止内存泄漏
     for (const [, pending] of pendingConfirmations) {
@@ -1531,9 +1640,12 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         ),
       })),
     }))
+    await Promise.all(get().conversations.map(c => get().persistCurrent(c.id)))
   },
 
-  runSubAgentTask: async ({ description, prompt, tools }) => {
+  runSubAgentTask: async ({ description, prompt, tools, signal }) => {
+    if (signal?.aborted) return { text: '子任务已取消，未启动', ok: false }
+    if (preparingClose || isCloseCoordinating()) return { text: '应用正在保存退出，不启动新任务', ok: false }
     const conv = get().getActiveConversation()
     if (!conv) return { text: t('subagent.noActiveConversation'), ok: false }
     const allowed = resolveSubAgentTools(tools)
@@ -1561,6 +1673,9 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
 
     const task: SubAgentTask = { taskId, description, prompt: prompt || description, allowedTools: allowed, modelId }
     const controller = new AbortController()
+    const abortTask = (): void => controller.abort()
+    signal?.addEventListener('abort', abortTask, { once: true })
+    if (signal?.aborted) controller.abort()
     activeSubAgents.set(taskId, controller)
     // 该子 agent 飞行中的流式请求 id（取消时一并 llm:cancel，否则 signal abort 只作用于轮次之间）
     const requestIds = new Set<string>()
@@ -1569,6 +1684,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
 
     // 50ms 缓冲写回（与父的 chunkBuffer 同口径：避免每个 chunk 一次 setState 阻塞主线程）
     let pending: SubAgentSession | null = null
+    let lastToolState = ''
     let flushTimer: ReturnType<typeof setTimeout> | null = null
     const flush = (): void => {
       flushTimer = null
@@ -1583,22 +1699,39 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       }))
     }
     try {
-      const session = await runSubAgent(task, {
-        generate: (messages, modelId, onChunk, onRequestId) =>
+      const running = runSubAgent(task, {
+        generate: (messages, modelId, onChunk, onRequestId, signal) =>
           generateForSubAgent(messages, modelId, onChunk, (id) => {
             requestIds.add(id)
             onRequestId?.(id)
-          }),
+          }, signal ?? controller.signal),
         buildPrompt: buildSubAgentPrompt,
-        confirm: (tc) => get().requestSubAgentConfirmation(taskId, description, tc, controller.signal),
+        confirm: (tc, signal) => get().requestSubAgentConfirmation(taskId, description, tc, signal ?? controller.signal),
         signal: controller.signal,
+        executionScope: conv.projectPath ?? conv.id,
+        conversationId: conv.id,
+        beforeExecute: async s => {
+          pending = s
+          if (flushTimer) clearTimeout(flushTimer)
+          flush()
+          return get().persistCurrent(conv.id)
+        },
         onUpdate: (s) => {
           pending = s
-          if (!flushTimer) flushTimer = setTimeout(flush, 50)
+          const toolState = JSON.stringify(s.toolCalls)
+          if (toolState !== lastToolState) {
+            lastToolState = toolState
+            if (flushTimer) clearTimeout(flushTimer)
+            flush()
+            void get().persistCurrent(conv.id)
+          } else if (!flushTimer) flushTimer = setTimeout(flush, 50)
         },
         // 子 agent 进度：只进 subAgentProgress（UI），**不进 session**（session 整体落盘）
         onProgress: (p) => get().setSubAgentProgress(taskId, p),
       })
+      subRuns.add(running)
+      let session: SubAgentSession
+      try { session = await running } finally { subRuns.delete(running) }
       pending = session
       flush()
       get().persistCurrent(conv.id)
@@ -1612,6 +1745,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       if (flushTimer) clearTimeout(flushTimer)
       activeSubAgents.delete(taskId)
       activeSubAgentRequests.delete(taskId)
+      signal?.removeEventListener('abort', abortTask)
       unlink()
     }
   },
@@ -1661,23 +1795,13 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     if (decision.action === 'allow') return true
     // 未覆盖的写操作 → 父方审批卡（**无「始终允许」**：委派路径不写 workspace 规则，
     // 否则子 agent 的批准会放大用户的常驻授权；批准只对本次调用有效）
-    return new Promise<boolean>((resolve) => {
-      let settled = false
-      const finish = (allow: boolean): void => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        signal?.removeEventListener('abort', onAbort)
-        pendingSubAgent.resolve = null
-        set({ pendingSubAgentConfirmation: null })
-        resolve(allow)
-      }
-      const timer = setTimeout(() => finish(false), SUBAGENT_CONFIRM_TIMEOUT_MS)   // 无人场不悬挂
-      const onAbort = (): void => finish(false)                                    // 父取消 → 卡消失 + 拒绝
-      signal?.addEventListener('abort', onAbort, { once: true })
-      pendingSubAgent.resolve = finish
+    return waitForApproval(signal ?? new AbortController().signal, resolve => {
+      pendingSubAgent.resolve = resolve
       set({ pendingSubAgentConfirmation: { sessionId, description, toolCall } })
-    })
+    }, () => {
+      pendingSubAgent.resolve = null
+      set({ pendingSubAgentConfirmation: null })
+    }, SUBAGENT_CONFIRM_TIMEOUT_MS)
   },
 
   resolveSubAgentConfirmation: (allow) => { pendingSubAgent.resolve?.(allow) },
@@ -1701,6 +1825,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
   },
 
   restoreArchives: async () => {
+    if (preparingClose || isCloseCoordinating()) return
     const mySeq = ++archiveLoadSeq
     try {
       const list = (await ipc.invoke('fs:agent-archive-list')) as { id: string; title: string; updatedAt: number }[]
@@ -1711,7 +1836,27 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         const conv = parseArchive(raw)
         if (conv) restored.push(conv)
       }
-      if (mySeq !== archiveLoadSeq) return // 旧请求晚到不覆盖
+      if (mySeq !== archiveLoadSeq || preparingClose) return
+      const operationLists = new Map<string, import('../shared/agent-operation-protocol').AgentOperationRecord[]>()
+      for (const conv of restored) {
+        const scope = conv.projectPath ?? conv.id
+        if (!operationLists.has(scope)) {
+          try {
+            const records = await ipc.invoke('agent:operation-list', scope)
+            operationLists.set(scope, Array.isArray(records) ? records : [])
+          } catch { operationLists.set(scope, []) }
+        }
+        if (mySeq !== archiveLoadSeq || preparingClose) return
+        const records = operationLists.get(scope)!.filter(record => record.conversationId === conv.id)
+        Object.assign(conv, recoverConversationOperations(conv, records))
+      }
+      if (mySeq !== archiveLoadSeq || preparingClose) return
+      for (const conv of restored) {
+        if (get().conversations.some(existing => existing.id === conv.id)) continue
+        const calls = [...conv.messages.flatMap(m => m.toolCalls ?? []),
+          ...(conv.subSessions ?? []).flatMap(s => s.toolCalls)]
+        restoreUnknownExecutions(calls, conv.projectPath ?? conv.id, conv.id)
+      }
       set(state => {
         // 顺序二次调用（HMR 重执行/未来刷新入口）按 id 去重，避免整体重复
         const existingIds = new Set(state.conversations.map(c => c.id))
@@ -2060,28 +2205,38 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
   },
 
   persistCurrent: async (convId?: string) => {
-    // 首写立即落盘（快照即时可见，恢复流程依赖首写落盘）；
-    // 500ms 窗口内重复调用走尾写防抖，收尾写合并（fire-and-forget）
+    // 同一会话按快照顺序写入；await 等待本次保存完成。
     // ⚠️ 必须按「变更会话 convId」而非「当前活跃会话」序列化：会话 A 生成中
     //    （ReAct 30-120s）用户切到 B，A 的 onDone 落盘若取活跃会话会把 A 的流式状态
     //    写到 B 名下，A 的 archive 停在 leading 写的空助手占位符（streaming:true），
     //    重启后 A 回复空白。所有调用点均已传 convId。
     const targetId = convId ?? get().activeConversationId
-    if (!targetId) return
-    const doWrite = (cid: string) => {
-      const conv = get().conversations.find(c => c.id === cid)
-      if (!conv) return
-      ipc.invoke('fs:agent-archive-write', conv.id, serializeArchive(conv)).catch(() => {
-        console.warn('[Agent] 会话归档写盘失败:', conv.id)
+    if (!targetId) return true
+    const conv = get().conversations.find(c => c.id === targetId)
+    if (!conv) return true
+    return archiveQueue.save(targetId, serializeArchive(conv))
+  },
+  archiveSaveStates: {},
+  flushArchives: () => archiveQueue.flush(),
+  prepareForClose: async () => {
+    if (!closeDrain) {
+      preparingClose = true
+      ++archiveLoadSeq
+      closeDrain = Promise.resolve().then(async () => {
+        flushActiveChunks?.()
+        if (get().generating || activeSubAgents.size) await get().cancelGeneration()
+        await Promise.allSettled([...preparingRuns, ...activeRuns, ...subRuns])
+        flushActiveChunks?.()
+        await Promise.all(get().conversations.map(c => get().persistCurrent(c.id)))
+        return await get().flushArchives()
+      }).catch(error => {
+        try { renderLog('error', 'Agent', `退出收尾失败：${String(error)}`) } catch { /* 保留失败结论 */ }
+        return false
+      }).finally(() => {
+        preparingClose = false
+        closeDrain = null
       })
     }
-    if (persistTimer) {
-      clearTimeout(persistTimer)
-    }
-    doWrite(targetId)
-    persistTimer = setTimeout(() => {
-      persistTimer = null
-      doWrite(targetId)
-    }, 500)
+    return waitForCloseResult(closeDrain, CLOSE_DRAIN_TIMEOUT_MS)
   },
 }))

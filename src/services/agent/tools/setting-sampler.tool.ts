@@ -7,7 +7,8 @@
  */
 import { buildAgentTool } from '../tool-registry'
 import { t } from '../../../shared/locale'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
+import type { ToolExecutionContext } from '../tool-registry'
 import { useProjectStore } from '../../../stores/project-store'
 
 /** 低频检索词池（与常见网文套路词拉开距离） */
@@ -20,14 +21,15 @@ const COLD_QUERY_POOL = [
  * 从知识库采样冷门设定片段（低相关度尾部）
  * @param count 采样条数
  */
-export async function sampleColdSettings(count = 2): Promise<string> {
+export async function sampleColdSettings(count = 2, context?: ToolExecutionContext): Promise<string> {
+  const toolIpc = createToolIpc(context)
   const project = useProjectStore.getState().currentProject
   if (!project) return ''
 
   try {
     // 随机选一个低频词检索，取尾部（低相关度）结果
     const query = COLD_QUERY_POOL[Math.floor(Math.random() * COLD_QUERY_POOL.length)]
-    const results = (await ipc.invoke('kb:search', query, 8)) as Array<{
+    const results = (await toolIpc.invoke('kb:search', query, 8)) as Array<{
       text: string; fileName: string; score: number
     }> | null
 
@@ -62,13 +64,14 @@ export const settingSamplerTool = buildAgentTool({
     },
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
     }
     const count = Math.min(Math.max(Number(args.count ?? 2), 1), 3)
-    const sampled = await sampleColdSettings(count)
+    const sampled = await sampleColdSettings(count, context)
     if (!sampled) {
       return { success: true, content: t('tool.samplerEmpty') }
     }

@@ -6,7 +6,8 @@
  */
 import { buildAgentTool } from '../tool-registry'
 import { t } from '../../../shared/locale'
-import { loadAllForeshadowing, formatPendingForPrompt } from '../../foreshadowing-manager'
+import { loadAllForeshadowing, formatPendingForPrompt, type ForeshadowingItem } from '../../foreshadowing-manager'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 
 /** 单次注入上限（避免 prompt 膨胀，超出取最近埋设的） */
@@ -31,14 +32,34 @@ export const queryForeshadowingTool = buildAgentTool({
     },
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
     }
 
     try {
-      const all = await loadAllForeshadowing()
+      let all: ForeshadowingItem[]
+      if (!context) all = await loadAllForeshadowing()
+      else {
+        const core = await toolIpc.invoke('db:project-core-get')
+        const raw = JSON.parse(core?.characterStates || '{}').pendingForeshadowing
+        all = Array.isArray(raw) ? raw.flatMap((item: unknown, index: number): ForeshadowingItem[] => {
+          const value = typeof item === 'string' ? { content: item } : item as Partial<ForeshadowingItem> | null
+          if (!value || typeof value.content !== 'string') return []
+          return [{
+            id: 'id' in value && typeof value.id === 'string' && value.id ? value.id : `fs_legacy_${index}`,
+            content: value.content,
+            setChapter: 'setChapter' in value && typeof value.setChapter === 'number' ? value.setChapter : 0,
+            resolvedChapter: 'resolvedChapter' in value && typeof value.resolvedChapter === 'number' ? value.resolvedChapter : 0,
+            type: 'type' in value && ['item', 'character', 'mystery', 'prophecy', 'conflict'].includes(String(value.type)) ? value.type as ForeshadowingItem['type'] : 'mystery',
+            resolved: 'resolved' in value && value.resolved === true,
+            createdAt: 'createdAt' in value && typeof value.createdAt === 'string' ? value.createdAt : '',
+          }]
+        }) : []
+      }
       const pending = all.filter(f => !f.resolved)
 
       // 按当前章节过滤：仅埋设于本章之前（至少相隔 1 章）

@@ -5,9 +5,11 @@ import './index.css'
 import { useEditorStore } from './stores/editor-store'
 import { useCharacterStore } from './stores/character-store'
 import { useAgentStore } from './stores/agent-store'
+import { useWorkflowStore } from './stores/workflow-store'
 import { installRendererErrorCapture, renderLog } from './services/render-logger'
 import { t, getCurrentLocale } from './shared/locale'
 import { ipc } from './services/ipc-client'
+import { coordinateClose } from './shared/close-coordinator'
 
 // 渲染进程全局错误捕获 → ERROR 落盘（必须先注册，确保早期错误也被记录）
 installRendererErrorCapture()
@@ -36,6 +38,7 @@ declare global {
   interface Window {
     __VELA_HTML_READY?: number
     __vela_hasDirtyTabs?: () => boolean
+    __vela_flushAgentArchives?: () => Promise<boolean>
     /** 隔离实例身份（CLI 注入；CDP 客户端用它确认没有连到外部 Chrome/另一实例） */
     __velaDevInstanceId?: string
     /** CLI/自动化远程打开开发者控制台 */
@@ -50,6 +53,10 @@ if (isolatedInstanceId) window.__velaDevInstanceId = isolatedInstanceId
 // 暴露给主进程的关闭前检查（主进程 window.on('close') 通过 executeJavaScript 调用）
 // #34 块 D：纳入角色卡未保存编辑（此前只查编辑器 Tab——角色 dirty 从不传播，
 // 关闭应用/切项目时未保存的角色设定静默丢失）
+window.__vela_flushAgentArchives = () => coordinateClose([
+  () => useAgentStore.getState().prepareForClose(),
+  () => useWorkflowStore.getState().prepareForClose(),
+])
 window.__vela_hasDirtyTabs = () => {
   try {
     const hasDirtyTab = useEditorStore.getState().tabs.some(t => t.dirty)

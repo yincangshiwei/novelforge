@@ -6,7 +6,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 
 export const searchKnowledgeTool = buildAgentTool({
   name: 'search_knowledge',
@@ -41,7 +41,9 @@ export const searchKnowledgeTool = buildAgentTool({
     required: ['query'],
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const query = args.query as string
     // 参数钳制（P1 修复）：top_k 保底 1（-5 此前透传主进程）、min_score 钳制 [0,1]
     // （-1 让过滤失效、99 让所有结果被丢弃且误导 LLM）、倒序章节范围自动交换
@@ -60,8 +62,8 @@ export const searchKnowledgeTool = buildAgentTool({
       // 否则用户 @ 知识库时预取链路拿不到任何内容
       try {
         const [docs, stats] = await Promise.all([
-          ipc.invoke('kb:list-documents'),
-          ipc.invoke('kb:stats'),
+          toolIpc.invoke('kb:list-documents'),
+          toolIpc.invoke('kb:stats'),
         ]) as [Array<{ fileName: string; chunkCount: number; importedAt: string }> | null, { documentCount: number; totalChunks: number } | null]
         const docList = docs && docs.length > 0
           ? docs.map((d, i) => t('tool.searchKbDocItem')
@@ -85,7 +87,7 @@ export const searchKnowledgeTool = buildAgentTool({
 
     // 根据是否有章节范围选择搜索方式
     if (chapterFrom !== undefined && chapterTo !== undefined) {
-      results = await ipc.invoke(
+      results = await toolIpc.invoke(
         'kb:search-with-scope',
         query,
         chapterFrom,
@@ -93,7 +95,7 @@ export const searchKnowledgeTool = buildAgentTool({
         topK,
       )
     } else {
-      results = await ipc.invoke('kb:search', query, topK)
+      results = await toolIpc.invoke('kb:search', query, topK)
     }
 
     if (!results || results.length === 0) {

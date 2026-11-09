@@ -125,7 +125,7 @@ export interface ProjectChannels {
     //   传整份配置 —— 而整份配置一旦来自**过期缓存**，就会把别的字段写回旧值（丢更新，真机实测：
     //   连续改 genre/subGenre/writingStyle 后前两个退回旧值）。
     args: [projectId: string, data: Partial<Omit<ProjectData, 'novelConfig'>> & { novelConfig?: Partial<NovelConfig> }]
-    return: { success: boolean; error?: string }
+    return: { success: boolean; error?: string; persistedConfig?: Partial<NovelConfig>; projectPath?: string; revision?: number }
   }
   'project:recent-list': {
     args: []
@@ -557,7 +557,7 @@ export interface LLMChannels {
 
 export interface LLMStreamEvents {
   'llm:stream-chunk': { requestId: string; chunk: string }
-  'llm:stream-done': { requestId: string; fullText: string; usage?: TokenUsage }
+  'llm:stream-done': { requestId: string; fullText: string; usage?: TokenUsage; step?: import('./llm-tool-protocol').LLMStepResult }
   'llm:stream-error': { requestId: string; error: string }
 }
 
@@ -597,8 +597,11 @@ export interface FileNode {
 }
 
 export interface LLMRequest {
+  requestId?: string
   modelId: string
-  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+  messages: import('./llm-tool-protocol').LLMChatMessage[]
+  tools?: import('./llm-tool-protocol').LLMToolDefinition[]
+  toolChoice?: import('./llm-tool-protocol').LLMToolChoice
   temperature?: number
   maxTokens?: number
   stream?: boolean
@@ -611,6 +614,7 @@ export interface LLMResponse {
   success: boolean
   content: string
   usage?: TokenUsage
+  step?: import('./llm-tool-protocol').LLMStepResult
   error?: string
 }
 
@@ -657,6 +661,7 @@ export interface ModelProfile {
   name: string
   provider: 'openai' | 'gemini' | 'deepseek' | 'ollama' | 'bigmodel' | 'custom'
   protocol: LLMProtocol
+  nativeToolCalling?: boolean
   modelName: string
   /**
    * 凭据引用名（模型管理 v3 §3.2）：派生条目 = 所属账户的 `apiKeyRef`；手工条目 = 迁移/新建时分配。
@@ -1605,7 +1610,13 @@ export interface MenuEvents {
 }
 
 // ===== 合并所有频道 =====
-export type AllInvokeChannels = ConfigChannels & ProjectChannels & FileChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & EmbeddingChannels & ImportChannels & MCPChannels & UpdateChannels & ExportChannels & LogChannels & DevChannels & BrowserChannels & ReportChannels & TemplateChannels & MemoryChannels & StyleChannels & HealthChannels & CredentialChannels
+export interface AgentOperationChannels {
+  'agent:operation-invoke': { args: [request: import('./agent-operation-protocol').AgentOperationRequest]; return: import('./agent-operation-protocol').AgentOperationResult }
+  'agent:operation-cancel': { args: [callId: string]; return: { success: boolean } }
+  'agent:operation-list': { args: [scope: string]; return: import('./agent-operation-protocol').AgentOperationRecord[] }
+}
+
+export type AllInvokeChannels = AgentOperationChannels & ConfigChannels & ProjectChannels & FileChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & EmbeddingChannels & ImportChannels & MCPChannels & UpdateChannels & ExportChannels & LogChannels & DevChannels & BrowserChannels & ReportChannels & TemplateChannels & MemoryChannels & StyleChannels & HealthChannels & CredentialChannels
 export type AllEventChannels = LLMStreamEvents & UpdateEvents & ImportEvents & MenuEvents & EmbeddingEvents
 
 /** 提取 invoke 频道名 */

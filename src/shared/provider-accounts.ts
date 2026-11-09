@@ -69,6 +69,7 @@ export interface ModelOverride {
   contextWindow?: number | null
   maxTokens?: number | null
   inputTypes?: Array<'text' | 'image'>
+  nativeToolCalling?: boolean
 }
 
 /** 模型名 → 字段覆盖（目录区一次「应用」提交的整份差异） */
@@ -89,6 +90,7 @@ function cleanOverride(override: ModelOverride | undefined): ModelOverride | und
   if (override.contextWindow !== undefined) out.contextWindow = override.contextWindow
   if (override.maxTokens !== undefined) out.maxTokens = override.maxTokens
   if (override.inputTypes !== undefined) out.inputTypes = override.inputTypes
+  if (override.nativeToolCalling !== undefined) out.nativeToolCalling = override.nativeToolCalling
   return Object.keys(out).length > 0 ? out : undefined
 }
 
@@ -117,6 +119,7 @@ function mergeOverride(
   if (override.contextWindow !== undefined) next.contextWindow = override.contextWindow ?? defaults.contextWindow
   if (override.maxTokens !== undefined) next.maxTokens = override.maxTokens ?? defaults.maxTokens
   if (override.inputTypes !== undefined) next.inputTypes = [...override.inputTypes]
+  if (override.nativeToolCalling !== undefined) next.nativeToolCalling = override.nativeToolCalling
   return next
 }
 

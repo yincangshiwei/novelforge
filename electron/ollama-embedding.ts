@@ -11,7 +11,7 @@
  * 错误信息一律结构化返回 / 英文（用户可见文案由渲染层 i18n 负责，见 T5）。
  */
 
-import { fetchWithTimeout } from './net/fetch-with-timeout'
+import { fetchWithTimeout, throwIfAborted, withAbortSignal, withDeadline } from './net/fetch-with-timeout'
 import { readListingJson } from './llm/model-listing'
 
 /** 拉模型是分钟级长任务——默认 10s 超时会把大模型 pull 腰斩（T1 导出 fetchWithTimeout 的动机） */
@@ -54,10 +54,12 @@ function sanitize(text: string, max: number = ERROR_DETAIL_MAX): string {
 }
 
 /** 读取错误响应体（失败时退化为空串，不让二次异常覆盖主错误） */
-async function safeText(res: Response): Promise<string> {
+async function safeText(res: Response, signal?: AbortSignal): Promise<string> {
   try {
-    return sanitize(await res.text())
-  } catch {
+    return sanitize(await withAbortSignal(() => res.text(), signal, () => { void res.body?.cancel().catch(() => {}) }))
+  } catch (error) {
+    throwIfAborted(signal)
+    if (error instanceof Error && error.name === 'AbortError') throw error
     return ''
   }
 }
@@ -68,16 +70,18 @@ async function safeText(res: Response): Promise<string> {
  * 探测本地 Ollama 是否可用。
  * 三态**不抛**：可用 → `{ok:true, version}`；连接拒绝 / 非 200 / 响应畸形 → `{ok:false, error}`。
  */
-export async function detectOllama(baseUrl: string): Promise<{ ok: boolean; version?: string; error?: string }> {
+export async function detectOllama(baseUrl: string, signal?: AbortSignal): Promise<{ ok: boolean; version?: string; error?: string }> {
   try {
-    const res = await fetchWithTimeout(apiUrl(baseUrl, '/api/version'), { method: 'GET' })
+    const res = await fetchWithTimeout(apiUrl(baseUrl, '/api/version'), { method: 'GET', signal })
     if (!res.ok) {
       return { ok: false, error: `Ollama /api/version failed: HTTP ${res.status}` }
     }
-    const data = await res.json() as { version?: unknown } | null
+    const data = await withAbortSignal(() => res.json(), signal, () => { void res.body?.cancel().catch(() => {}) }) as { version?: unknown } | null
     const version = data && typeof data.version === 'string' ? data.version : undefined
     return version ? { ok: true, version } : { ok: true }
   } catch (e) {
+    throwIfAborted(signal)
+    if (e instanceof Error && e.name === 'AbortError') throw e
     return { ok: false, error: describeError(e) }
   }
 }
@@ -143,20 +147,35 @@ export async function pullModel(
   baseUrl: string,
   model: string,
   onProgress?: (p: PullProgress) => void,
+  signal?: AbortSignal,
 ): Promise<{ success: boolean; error?: string }> {
+  try {
+    return await withDeadline(deadlineSignal => pullModelRequest(baseUrl, model, onProgress, deadlineSignal), PULL_TIMEOUT_MS, signal)
+  } catch (error) {
+    throwIfAborted(signal)
+    if (error instanceof Error && error.name === 'AbortError') throw error
+    return { success: false, error: describeError(error) }
+  }
+}
+
+async function pullModelRequest(baseUrl: string, model: string, onProgress: ((p: PullProgress) => void) | undefined, signal: AbortSignal): Promise<{ success: boolean; error?: string }> {
+  throwIfAborted(signal)
   let res: Response
   try {
     res = await fetchWithTimeout(apiUrl(baseUrl, '/api/pull'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model, stream: true }),
+      signal,
     }, PULL_TIMEOUT_MS)
   } catch (e) {
+    throwIfAborted(signal)
+    if (e instanceof Error && e.name === 'AbortError') throw e
     return { success: false, error: describeError(e) }
   }
 
   if (!res.ok) {
-    const detail = await safeText(res)
+    const detail = await safeText(res, signal)
     return { success: false, error: `Ollama /api/pull failed: HTTP ${res.status}${detail ? ` ${detail}` : ''}` }
   }
 
@@ -182,6 +201,7 @@ export async function pullModel(
 
   /** 解析单行 NDJSON：空行跳过；非法 JSON → warn 跳过（不炸整条流） */
   const handleLine = (line: string): void => {
+    throwIfAborted(signal)
     const trimmed = line.trim()
     if (!trimmed) return
 
@@ -215,7 +235,8 @@ export async function pullModel(
 
   try {
     for (;;) {
-      const { done, value } = await reader.read()
+      const { done, value } = await withAbortSignal(() => reader.read(), signal, () => { void reader.cancel().catch(() => {}) })
+      throwIfAborted(signal)
       if (done) break
 
       buffer += decoder.decode(value, { stream: true })
@@ -231,14 +252,17 @@ export async function pullModel(
     // 流结束：flush 残留行（末行通常没有尾随 \n）
     if (!failure && buffer.trim()) handleLine(buffer)
   } catch (e) {
+    throwIfAborted(signal)
+    if (e instanceof Error && e.name === 'AbortError') throw e
     return { success: false, error: describeError(e) }
   } finally {
-    if (failure) {
-      // 失败帧后主动取消流：不继续消费剩余 chunk，也不让连接悬挂
+    if (failure || signal?.aborted) {
       void reader.cancel().catch(() => {})
     }
+    reader.releaseLock()
   }
 
+  throwIfAborted(signal)
   if (failure) {
     return { success: false, error: `Ollama /api/pull failed: ${sanitize(failure)}` }
   }
@@ -290,24 +314,32 @@ function normalizeEmbeddings(data: { embeddings?: unknown; data?: unknown } | nu
  * 超时用 `LOCAL_EMBED_TIMEOUT_MS`（120s）而**不是**默认 10s：冷启动要加载整个模型
  * （真机实测 9.53s），10s 会让本地档必然失败。请求带 `keep_alive` 避免闲置后反复重载。
  */
-export async function embedLocal(texts: string[], baseUrl: string, model: string): Promise<number[][]> {
+export async function embedLocal(texts: string[], baseUrl: string, model: string, signal?: AbortSignal): Promise<number[][]> {
+  return withDeadline(deadlineSignal => embedLocalRequest(texts, baseUrl, model, deadlineSignal), LOCAL_EMBED_TIMEOUT_MS, signal)
+}
+
+async function embedLocalRequest(texts: string[], baseUrl: string, model: string, signal: AbortSignal): Promise<number[][]> {
+  throwIfAborted(signal)
   if (texts.length === 0) return []
 
   const res = await fetchWithTimeout(apiUrl(baseUrl, '/api/embed'), {
     method: 'POST',
+    signal,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model, input: texts, keep_alive: LOCAL_EMBED_KEEP_ALIVE }),
   }, LOCAL_EMBED_TIMEOUT_MS)
 
   if (!res.ok) {
-    const detail = await safeText(res)
+    const detail = await safeText(res, signal)
     throw new Error(`Ollama /api/embed failed: HTTP ${res.status}${detail ? ` ${detail}` : ''}`)
   }
 
   let data: { embeddings?: unknown; data?: unknown } | null
   try {
-    data = await res.json() as { embeddings?: unknown; data?: unknown } | null
+    data = await withAbortSignal(() => res.json(), signal, () => { void res.body?.cancel().catch(() => {}) }) as { embeddings?: unknown; data?: unknown } | null
   } catch (e) {
+    throwIfAborted(signal)
+    if (e instanceof Error && e.name === 'AbortError') throw e
     throw new Error(`Ollama /api/embed returned invalid JSON: ${describeError(e)}`)
   }
 

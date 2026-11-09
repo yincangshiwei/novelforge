@@ -9,6 +9,7 @@
  * - 增强：FTS + 向量近邻混合检索（需配置 Embedding 模型）
  */
 import { t } from '../src/shared/locale'
+import { checkOperationCancellation, currentOperationSignal } from './services/agent-operation-journal'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -24,7 +25,7 @@ import { detectOllama, embedLocal } from './ollama-embedding'
 import { tokenize } from './chinese-tokenizer'
 import { getCurrentProjectPath, getProjectDb } from './database'
 import {
-  addChunks,
+  replaceDocumentChunks,
   removeDocument as removeDocFromStore,
   searchWithScope as storeSearchWithScope,
   listDocuments as storeListDocuments,
@@ -42,6 +43,7 @@ const migratedProjects = new Set<string>()
 
 /** 确保旧数据已迁移 */
 async function ensureMigration(projectPath: string): Promise<void> {
+  checkOperationCancellation()
   if (migratedProjects.has(projectPath)) return
   migratedProjects.add(projectPath)
 
@@ -63,15 +65,20 @@ async function ensureMigration(projectPath: string): Promise<void> {
  * - 空输入/空结果（T2：空输入返回 `[]`）→ `[]` → 由 `hasUsableVectors` 判为该档失败
  */
 async function tryLocalEmbedding(texts: string[], cfg: LocalEmbeddingConfig): Promise<number[][]> {
+  checkOperationCancellation()
   if (!cfg.baseUrl || !cfg.model) return []
 
-  const probe = await detectOllama(cfg.baseUrl)
+  const probe = await detectOllama(cfg.baseUrl, currentOperationSignal())
+  checkOperationCancellation()
   if (!probe.ok) {
     logger.warn('KB', t('log.embedding.localUnavailable').replace('{err}', probe.error ?? 'unknown'))
     return []
   }
 
-  return embedLocal(texts, cfg.baseUrl, cfg.model)
+  checkOperationCancellation()
+  const vectors = await embedLocal(texts, cfg.baseUrl, cfg.model, currentOperationSignal())
+  checkOperationCancellation()
+  return vectors
 }
 
 /**
@@ -146,7 +153,9 @@ async function importContent(
   model: { baseUrl: string; apiKey: string },
   options?: { filePath?: string; onProgress?: (pct: number, msg: string) => void },
 ): Promise<{ success: boolean; docId?: string; chunkCount?: number; error?: string }> {
+  checkOperationCancellation()
   await ensureMigration(projectPath)
+  checkOperationCancellation()
 
   // 1. 分块
   options?.onProgress?.(10, t('kb.chunking'))
@@ -163,6 +172,7 @@ async function importContent(
   let vectors: number[][] | undefined
 
   for (const source of order) {
+    checkOperationCancellation()
     // fts 是**终态**档（不尝试向量化）：落到循环外统一按 FTS-only 处理
     if (source === 'fts') break
 
@@ -173,6 +183,7 @@ async function importContent(
           .replace('{count}', String(chunks.length)))
         vectors = await tryLocalEmbedding(chunks, localCfg)
       } catch (e) {
+        checkOperationCancellation()
         // T2：embedLocal 抛出的错误串为英文，只进日志（LogsView），不作为 UI 文案
         logger.warn('KB', t('log.embedding.localFailed').replace('{err}', String(e)))
       }
@@ -183,8 +194,9 @@ async function importContent(
         options?.onProgress?.(20, t('kb.vectorizingWith')
           .replace('{method}', 'Embedding API')
           .replace('{count}', String(chunks.length)))
-        vectors = await generateEmbeddings(chunks, protocol, model)
+        vectors = await generateEmbeddings(chunks, protocol, model, currentOperationSignal())
       } catch (e) {
+        checkOperationCancellation()
         logger.warn('KB', t('log.embedding.apiFailedTryLlm').replace('{err}', String(e)))
       }
     } else if (source === 'llm') {
@@ -203,6 +215,7 @@ async function importContent(
           }
         }
       } catch (e) {
+        checkOperationCancellation()
         logger.warn('KB', t('log.kb.llmAlsoFailedFtsOnly').replace('{err}', String(e)))
       }
     }
@@ -216,31 +229,30 @@ async function importContent(
     options?.onProgress?.(30, t('kb.ftsFallback'))
   }
 
+  checkOperationCancellation()
   // 3.5 向量维度硬校验（T3 v1 必做）：**写入前、删旧文档前**拒绝混维。
   //     ⚠️ 必须在删除同名旧文档之前——否则"校验失败"会伴随旧文档已被删除（半写入/数据丢失）。
   if (hasUsableVectors(vectors)) {
     await assertVectorDimCompatible(projectPath, firstVectorDim(vectors))
   }
 
-  // 4. 删除同名旧文档，确保幂等性
+  // 4. 准备提交；存储层最终检查取消后完成暂存、替换或恢复，不中断收尾。
   options?.onProgress?.(70, t('kb.cleaning'))
-  const existingDocs = await storeListDocuments(projectPath)
-  const existingDoc = existingDocs.find(d => d.fileName === fileName)
-  if (existingDoc) {
-    await removeDocFromStore(projectPath, existingDoc.id)
-  }
-
-  // 5. 写入 LanceDB
   options?.onProgress?.(80, t('kb.saving'))
-  const result = await addChunks(projectPath, docId, fileName, chunks, vectors, options?.filePath, chapterMeta)
+  checkOperationCancellation()
+  const result = await replaceDocumentChunks(projectPath, docId, fileName, chunks, vectors, options?.filePath, chapterMeta)
 
   if (!result.success) {
     return { success: false, error: result.error }
   }
 
-  options?.onProgress?.(100, t('kb.imported')
-    .replace('{name}', fileName)
-    .replace('{count}', String(chunks.length)))
+  try {
+    options?.onProgress?.(100, t('kb.imported')
+      .replace('{name}', fileName)
+      .replace('{count}', String(chunks.length)))
+  } catch (error) {
+    logger.warn('KB', `import progress notification failed after commit: ${safeErrorMessage(error)}`)
+  }
   return { success: true, docId, chunkCount: chunks.length }
 }
 
@@ -274,7 +286,9 @@ export async function importDocument(
     if (stat.size === 0) {
       return { success: false, error: t('error.fileEmpty') }
     }
+    checkOperationCancellation()
     const content = fs.readFileSync(filePath, 'utf-8')
+    checkOperationCancellation()
 
     // 2. 委托核心导入逻辑
     // ⚠️ 必须显式 await（不能用 `return importContent(...)`）：async 函数里 `return <promise>` 会让
@@ -284,6 +298,7 @@ export async function importDocument(
     const result = await importContent(projectPath, fileName, content, protocol, model, { filePath, onProgress })
     return result
   } catch (error) {
+    checkOperationCancellation()
     return { success: false, error: safeErrorMessage(error) }
   }
 }
@@ -397,6 +412,7 @@ function readCharacterAliasMap(projectPath: string): Map<string, string[]> {
     const rows = db.prepare('SELECT name, aliases FROM characters').all() as Array<{ name: string; aliases: string }>
     return buildCharacterAliasMap(rows)
   } catch (e) {
+    checkOperationCancellation()
     logger.warn('KB', `character alias read failed, query kept as-is: ${safeErrorMessage(e)}`)
     return new Map()
   }
@@ -434,6 +450,7 @@ async function resolveQueryVector(
   try {
     tableDim = await getChunksTableVectorDim(projectPath)
   } catch (e) {
+    checkOperationCancellation()
     logger.warn('KB', t('log.embedding.queryDimReadFailed').replace('{err}', String(e)))
   }
 
@@ -453,25 +470,30 @@ async function resolveQueryVector(
   }
 
   for (const tier of order) {
+    checkOperationCancellation()
     if (tier === 'fts') break // 终态：无向量可写
     if (tier === 'llm') continue // 查询侧无 LLM 档（写侧才有）
 
     if (tier === 'local') {
       try {
-        const [vec] = await embedLocal([effectiveQuery], localCfg.baseUrl, localCfg.model)
+        const [vec] = await embedLocal([effectiveQuery], localCfg.baseUrl, localCfg.model, currentOperationSignal())
+        checkOperationCancellation()
         const adopted = adoptable(vec, tier)
         if (adopted) return adopted
       } catch (e) {
+        checkOperationCancellation()
         // Ollama 未运行是最常见的生产形态（T2：错误串为英文，只进日志、不作 UI 文案）
         logger.warn('KB', t('log.embedding.localFailed').replace('{err}', String(e)))
       }
     } else if (tier === 'api') {
       if (!model.apiKey) continue // 与改造前的 gate 一致：无 Key 不进 api 档
       try {
-        const [vec] = await generateEmbeddings([effectiveQuery], protocol, model)
+        const [vec] = await generateEmbeddings([effectiveQuery], protocol, model, currentOperationSignal())
+        checkOperationCancellation()
         const adopted = adoptable(vec, tier)
         if (adopted) return adopted
       } catch {
+        checkOperationCancellation()
         // Embedding 不可用，静默降级（沿用改造前行为）
       }
     }
@@ -503,7 +525,9 @@ export async function searchKnowledge(
   topK: number = 5,
   chapterScope?: [number, number],
 ): Promise<Array<{ text: string; score: number; fileName: string }>> {
+  checkOperationCancellation()
   await ensureMigration(projectPath)
+  checkOperationCancellation()
 
   // 可选：生成查询向量
   let queryVector: number[] | undefined
@@ -534,11 +558,13 @@ export async function searchKnowledge(
     if (model.apiKey && query.trim()) {
       const effectiveQuery = rewriteQuery(query, readCharacterAliasMap(projectPath))
       try {
-        const [vec] = await generateEmbeddings([effectiveQuery], protocol, model)
+        const [vec] = await generateEmbeddings([effectiveQuery], protocol, model, currentOperationSignal())
+        checkOperationCancellation()
         if (vec && vec.length > 0) {
           queryVector = vec
         }
       } catch {
+        checkOperationCancellation()
         // Embedding 不可用，降级为 FTS
       }
     }
@@ -550,7 +576,10 @@ export async function searchKnowledge(
   // 空/纯空白 query：显式不进语义通道（与改造前的 `query.trim()` 门一致），故也不报「不可用」
 
   // ⚠️ 词法通道拿到的**始终是原 query**（别名扩展只喂语义通道，见上）
-  return storeSearchWithScope(projectPath, query, queryVector, topK, chapterScope)
+  checkOperationCancellation()
+  const results = await storeSearchWithScope(projectPath, query, queryVector, topK, chapterScope)
+  checkOperationCancellation()
+  return results
 }
 
 /**
@@ -601,6 +630,7 @@ export async function importFolder(
   try {
     // 递归收集所有 .txt / .md 文件
     const collectFiles = (dir: string): string[] => {
+      checkOperationCancellation()
       const result: string[] = []
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const fullPath = path.join(dir, entry.name)
@@ -620,6 +650,7 @@ export async function importFolder(
     let importedCount = 0
 
     for (let i = 0; i < files.length; i++) {
+      checkOperationCancellation()
       const filePath = files[i]
       const fileName = path.basename(filePath)
       onProgress?.(i + 1, files.length, fileName)
@@ -634,6 +665,7 @@ export async function importFolder(
 
     return { success: true, importedCount, failedFiles }
   } catch (error) {
+    checkOperationCancellation()
     return { success: false, importedCount: 0, failedFiles: [], error: safeErrorMessage(error) }
   }
 }
@@ -671,6 +703,7 @@ export async function importText(
     const result = await importContent(projectPath, fileName, text, protocol, model)
     return result
   } catch (error) {
+    checkOperationCancellation()
     return { success: false, error: safeErrorMessage(error) }
   }
 }
@@ -732,12 +765,14 @@ export async function backfillVectors(
     let vectors: number[][] = []
 
     for (const source of order) {
+      checkOperationCancellation()
       if (source === 'fts') break
 
       if (source === 'local') {
         try {
           vectors = await tryLocalEmbedding(texts, localCfg)
         } catch (e) {
+          checkOperationCancellation()
           logger.warn('KB', t('log.embedding.localFailed').replace('{err}', String(e)))
         }
       } else if (source === 'api') {
@@ -750,8 +785,9 @@ export async function backfillVectors(
         // `log.kb.backfillApiFailed`（「Embedding API 回填失败」）——用户根本没配远端 API。
         if (!model.apiKey) continue
         try {
-          vectors = await generateEmbeddings(texts, protocol, model)
+          vectors = await generateEmbeddings(texts, protocol, model, currentOperationSignal())
         } catch (e) {
+          checkOperationCancellation()
           logger.warn('KB', t('log.kb.backfillApiFailed').replace('{err}', String(e)))
         }
       } else if (source === 'llm') {
@@ -770,6 +806,7 @@ export async function backfillVectors(
             logger.info('KB', t('log.kb.llmNotEnabledSkipVectors'))
           }
         } catch (e2) {
+          checkOperationCancellation()
           logger.warn('KB', t('log.kb.llmAlsoFailedFtsMode').replace('{err}', String(e2)))
         }
       }
@@ -777,6 +814,7 @@ export async function backfillVectors(
       if (hasUsableVectors(vectors)) break
     }
 
+    checkOperationCancellation()
     // 构建更新后的完整数据
     const idToVector = new Map<string, number[]>()
     allRecords.forEach((r, i) => {
@@ -839,8 +877,11 @@ export async function backfillVectors(
 
     // 先写入临时表，写入成功后再替换，防止 drop→create 中间中断导致数据丢失
     const TEMP_TABLE = 'chunks_backfill'
+    checkOperationCancellation()
     try { await db.dropTable(TEMP_TABLE) } catch { /* 临时表不存在，忽略 */ }
+    checkOperationCancellation()
     await db.createTable(TEMP_TABLE, updatedRows, { schema: arrowSchema })
+    checkOperationCancellation()
 
     // 验证临时表写入成功
     const tempTable = await db.openTable(TEMP_TABLE)
@@ -851,6 +892,7 @@ export async function backfillVectors(
 
     // 临时表写入成功 → 替换正式表（⚠️ P1 修复：替换失败时从临时表恢复——
     //    此前 drop chunks 后 createTable 失败则 chunks 表彻底消失，直到下次导入）
+    checkOperationCancellation()
     await db.dropTable('chunks')
     try {
       await db.createTable('chunks', updatedRows, { schema: arrowSchema })
@@ -865,6 +907,7 @@ export async function backfillVectors(
       await db.dropTable(TEMP_TABLE).catch(() => {})
     }
 
+    checkOperationCancellation()
     // 重建 FTS 索引
     const newTable = await db.openTable('chunks')
     try {
@@ -885,8 +928,10 @@ export async function backfillVectors(
       return { success: false, processed: 0, failed: total, error: t('error.vectorBackfillEmpty') }
     }
 
+    checkOperationCancellation()
     return { success: true, processed: idToVector.size, failed: total - idToVector.size }
   } catch (error) {
+    checkOperationCancellation()
     logger.error('KB', t('log.kb.backfillError').replace('{err}', String(error)))
     // T4/A4.2：维度不匹配是**终态** —— 显式标记，避免调用方把它当成「该档失败，换下一种方式」
     // （controller 侧曾经因此静默降级到无维度守卫的 updateChunkVectors 路径）
@@ -907,6 +952,7 @@ export async function backfillTokens(
   try {
     return await storeBackfillTokens(projectPath)
   } catch (error) {
+    checkOperationCancellation()
     // T2 M4：分词回填失败必须用**分词**文案（此前复用 log.kb.backfillError「向量回填异常」→ LogsView 误导）
     logger.error('KB', t('log.kb.backfillTokensError').replace('{err}', String(error)))
     return { success: false, processed: 0, failed: 0, error: safeErrorMessage(error) }
@@ -928,6 +974,10 @@ export async function searchKnowledgeFTS(
   topK: number = 5,
   chapterScope?: [number, number],
 ): Promise<Array<{ text: string; score: number; fileName: string }>> {
+  checkOperationCancellation()
   await ensureMigration(projectPath)
-  return storeSearchWithScope(projectPath, query, undefined, topK, chapterScope)
+  checkOperationCancellation()
+  const results = await storeSearchWithScope(projectPath, query, undefined, topK, chapterScope)
+  checkOperationCancellation()
+  return results
 }

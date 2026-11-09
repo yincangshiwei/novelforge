@@ -42,7 +42,8 @@ export const calculatorTool = buildAgentTool({
     required: ['expression'],
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const expression = String(args.expression ?? '').trim()
     if (!expression) {
       // 工具内部错误注入给 LLM 的 observation，不走 UI i18n

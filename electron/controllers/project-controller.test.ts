@@ -5,12 +5,32 @@ import { registerProjectController } from './project-controller'
 const h = vi.hoisted(() => ({
   handlers: new Map<string, (event: unknown, ...args: unknown[]) => unknown>(),
   currentPath: '/projects/original-folder' as string | null,
-  core: { projectName: '数据库名称' },
+  core: { projectName: '数据库名称' } as Record<string, unknown>,
   update: vi.fn(),
   writeJson: vi.fn(),
   prepare: vi.fn(),
   close: vi.fn(),
   readonlyOpen: vi.fn(),
+  cancelled: false,
+}))
+
+vi.mock('../services/agent-operation-journal', () => ({
+  isOperationRollback: (error: unknown) => error instanceof Error && 'notCommitted' in error && error.notCommitted === true,
+  withOperationCommit: <T>(work: () => T): T => {
+    if (h.cancelled) throw Object.assign(new Error('Operation cancelled'), { name: 'AbortError', notCommitted: true })
+    const before = { ...h.core }
+    try {
+      const result = work()
+      if (result && (result as { success?: boolean }).success === false) throw Object.assign(new Error('业务操作未提交'), { notCommitted: true })
+      return result
+    } catch (error) {
+      h.core = before
+      throw error
+    }
+  },
+  checkOperationCancellation: () => {
+    if (h.cancelled) throw Object.assign(new Error('Operation cancelled'), { name: 'AbortError' })
+  },
 }))
 
 vi.mock('electron', () => ({ dialog: {}, BrowserWindow: {} }))
@@ -47,6 +67,7 @@ function call(channel: string, ...args: unknown[]) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  h.cancelled = false
   h.currentPath = '/projects/original-folder'
   h.core = { projectName: '数据库名称' }
   h.update.mockImplementation((data: { projectName?: string }) => {
@@ -60,6 +81,42 @@ beforeEach(() => {
   }))
   h.handlers.clear()
   registerProjectController()
+})
+
+describe('project:update-config 回读核验', () => {
+  it('已取消的配置更新不触及数据库', async () => {
+    h.cancelled = true
+    await expect(call('project:update-config', 'main', { path: h.currentPath, novelConfig: { globalGuidance: '要求' } })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(h.update).not.toHaveBeenCalled()
+  })
+  it('配置提交后取消仍返回成功', async () => {
+    h.update.mockImplementation(data => {
+      Object.assign(h.core, data, { updatedAt: 123 })
+      h.cancelled = true
+    })
+    expect(await call('project:update-config', 'main', { path: h.currentPath, novelConfig: { globalGuidance: '要求' } })).toMatchObject({ success: true, revision: 123 })
+  })
+  it('项目路径不匹配或缺失时不写库', async () => {
+    for (const data of [{ novelConfig: { globalGuidance: '要求' } }, { path: '/projects/other', novelConfig: { globalGuidance: '要求' } }]) {
+      expect(await call('project:update-config', 'main', data)).toMatchObject({ success: false })
+    }
+    expect(h.update).not.toHaveBeenCalled()
+  })
+  it('保存后返回实际字段值和项目路径', async () => {
+    h.update.mockImplementation(data => Object.assign(h.core, data, { updatedAt: 123 }))
+    expect(await call('project:update-config', 'main', { path: h.currentPath, novelConfig: { globalGuidance: '要求', narrativePOV: 'third_limited' } })).toEqual({
+      success: true, projectPath: h.currentPath, revision: 123,
+      persistedConfig: { globalGuidance: '要求', narrativePOV: 'third_limited' },
+    })
+  })
+  it('回读与请求不一致不能成功', async () => {
+    h.update.mockImplementation(() => undefined)
+    expect(await call('project:update-config', 'main', { path: h.currentPath, novelConfig: { globalGuidance: '要求' } })).toMatchObject({ success: false })
+  })
+  it('空更新不写库', async () => {
+    expect(await call('project:update-config', 'main', { path: h.currentPath, novelConfig: {} })).toMatchObject({ success: false })
+    expect(h.update).not.toHaveBeenCalled()
+  })
 })
 
 describe('project-controller 项目改名', () => {

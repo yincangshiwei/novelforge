@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { withRetry } from './retry-handler'
+import { withRetry, withStreamRetry } from './retry-handler'
 
 // 带 HTTP 状态码的错误对象（模拟 openai/gemini provider 中的 HttpError）
 class HttpError extends Error {
@@ -10,6 +10,41 @@ class HttpError extends Error {
     this.status = status
   }
 }
+
+describe.each([['withRetry', withRetry], ['withStreamRetry', withStreamRetry]] as const)('%s取消', (_name, retry) => {
+  it('预取消不执行请求', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const fn = vi.fn().mockResolvedValue(undefined)
+    await expect(retry(fn, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it('AbortError优先于status和网络文案，不重试', async () => {
+    const error = Object.assign(new Error('network failed'), { name: 'AbortError', status: 503 })
+    const fn = vi.fn().mockRejectedValue(error)
+    await expect(retry(fn)).rejects.toBe(error)
+    expect(fn).toHaveBeenCalledOnce()
+  })
+
+  it('退避取消立即结束且清理timer和监听器', async () => {
+    vi.useFakeTimers()
+    try {
+      const controller = new AbortController()
+      const remove = vi.spyOn(controller.signal, 'removeEventListener')
+      const fn = vi.fn().mockRejectedValue(new HttpError(503, 'unavailable'))
+      const pending = retry(fn, { signal: controller.signal, baseDelayMs: 30000 })
+      const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+      await Promise.resolve()
+      expect(vi.getTimerCount()).toBe(1)
+      controller.abort()
+      await rejected
+      expect(fn).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
+      expect(remove).toHaveBeenCalledWith('abort', expect.any(Function))
+    } finally { vi.useRealTimers() }
+  })
+})
 
 describe('withRetry', () => {
   it('returns result on first success', async () => {

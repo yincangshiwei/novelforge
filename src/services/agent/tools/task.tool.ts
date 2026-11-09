@@ -26,11 +26,13 @@ export const taskTool = buildAgentTool({
     required: ['description'],
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    if (context?.signal.aborted) return { success: false, content: '', error: '子任务已取消，未启动' }
     // ⚠️ 动态 import（不用顶层静态 import）：`task.tool → agent-store → tools/index → task.tool`
     // 是静态环，在「tools/index 先被求值」的顺序下 `builtinTools` 数组里的 taskTool 会是
     // undefined（registerBuiltinTools 崩在 tool.name 上）。延迟到调用时解析即断开环。
     const { useAgentStore } = await import('../../../stores/agent-store')
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '子任务已取消，未启动' }
     const store = useAgentStore.getState()
     const taskId = (args.task_id as string | undefined)?.trim()
     if (taskId) {
@@ -64,6 +66,7 @@ export const taskTool = buildAgentTool({
         description,
         prompt: (args.prompt as string | undefined)?.trim(),
         tools: tools.length > 0 ? tools : undefined,
+        signal: context?.signal,
       })
       // 评审 M4：子会话 failed/cancelled → 工具如实报**失败**（spec §3.6：success:false + 原因）；
       // 结论与回放线索仍在文本里（放 error 位，引擎在失败分支注入 error）

@@ -1,8 +1,12 @@
 import { create } from 'zustand'
 import { getCurrentLocale, t } from '../shared/locale'
 import { randomUUID } from '../utils/id'
+import { useProjectStore } from './project-store'
 import { renderLog } from '../services/render-logger'
+import { toast } from '../components/ui/Toast'
 import { ipc } from '../services/ipc-client'
+import { CLOSE_DRAIN_TIMEOUT_MS, waitForCloseResult } from '../shared/close-deadline'
+import { isCloseCoordinating } from '../shared/close-coordinator'
 import { sanitizeCheckpointData, cleanupMessageText } from '../services/agent/conversation-recovery'
 import { mirrorStepAppend, deleteRunOutput, readStepOutputTail } from '../services/workflow-output'
 
@@ -22,7 +26,10 @@ export interface CheckpointData {
   contextData?: Record<string, Record<string, unknown>>
 }
 
-function saveCheckpoint(state: WorkflowState): void {
+let checkpointTail: Promise<void> = Promise.resolve()
+let checkpointError: unknown
+
+async function saveCheckpoint(state: WorkflowState, required = false): Promise<void> {
   try {
     const active = state.activeRuns.filter(r => r.status === 'running' || r.status === 'waiting' || r.status === 'paused')
     const data: CheckpointData = {
@@ -42,9 +49,26 @@ function saveCheckpoint(state: WorkflowState): void {
           .map(([id, ctx]): [string, Record<string, unknown>] => [id, ctx.data]),
       ),
     }
-    if (active.length > 0 || state.history.length > 0) void ipc.invoke('db:checkpoint-save', data).catch(() => {})
-    else void ipc.invoke('db:checkpoint-clear').catch(() => {})
-  } catch { /* 持久化不可用（非 Electron / 浏览器模式）时静默 */ }
+    const snapshot = JSON.parse(JSON.stringify(data)) as CheckpointData
+    const write = checkpointTail.then(async () => {
+      const result = active.length > 0 || state.history.length > 0
+        ? await ipc.invoke('db:checkpoint-save', snapshot)
+        : await ipc.invoke('db:checkpoint-clear')
+      if (result?.success !== true) throw new Error('工作流执行记录保存失败')
+      checkpointError = undefined
+    })
+    checkpointTail = write.catch(error => { checkpointError = error })
+    await write
+  } catch (error) {
+    checkpointError = error
+    renderLog('error', 'Workflow', `工作流执行记录保存失败：${String(error)}`)
+    try {
+      toast.error('工作流执行记录保存失败，请勿关闭应用；可重试保存。')
+    } catch (notificationError) {
+      renderLog('error', 'Workflow', `保存失败通知异常：${String(notificationError)}`)
+    }
+    if (required) throw error
+  }
 }
 
 async function loadCheckpoint(): Promise<CheckpointData | null> {
@@ -107,6 +131,20 @@ export interface WorkflowRun {
   completedAt?: string
   /** L2：可重建参数快照（rehydrateParams；Task 5 save 消费；confirmContinue 跨重启重放读） */
   rehydrateParams?: WorkflowParams
+  operationId?: string
+  scope?: string
+  /** 启动意图先落盘；尚未执行的意图恢复后不自动运行。 */
+  startupState?: 'intent' | 'started' | 'cancelled' | 'failed'
+  cancellationRequestedAt?: string
+}
+
+export interface WorkflowStartOptions {
+  headless?: boolean
+  onStarted?: (runId: string) => void
+  signal?: AbortSignal
+  operationId?: string
+  scope?: string
+  beforeStart?: () => void | Promise<void>
 }
 
 /** 工作流类型 */
@@ -212,11 +250,13 @@ interface WorkflowState {
 
   // ===== Actions =====
   /** 启动一个工作流（可并发），返回 runId */
-  startWorkflow: (definition: WorkflowDefinition, stepByStep?: boolean, options?: { headless?: boolean; onStarted?: (runId: string) => void }) => Promise<string>
+  startWorkflow: (definition: WorkflowDefinition, stepByStep?: boolean, options?: WorkflowStartOptions) => Promise<string>
   /** 步进模式下确认继续执行下一步（需指定 runId） */
   confirmContinue: (runId?: string) => void
   /** 取消工作流（传 runId 取消指定，不传取消全部） */
   cancelWorkflow: (runId?: string) => void
+  flushCheckpoint: () => Promise<boolean>
+  prepareForClose: () => Promise<boolean>
   /** 添加全局日志 */
   addLog: (level: 'info' | 'warn' | 'error', message: string) => void
   /** 清空日志 */
@@ -243,6 +283,18 @@ const runDefs = new Map<string, { type: WorkflowType; params: WorkflowParams }>(
 /** L2 v2（IMP-1）：跨重启 waiting 续跑的断点上下文——restoreCheckpoint 时从 checkpoint contextData 快照；
  *  waiting run 恢复时无 activeContexts 条目，confirmContinue 重放用它恢复 ctx.data（否则 ?? {} 恒为空丢共享数据）。 */
 const resumeContextData = new Map<string, Record<string, unknown>>()
+const startupReceipts = new Map<string, Promise<string>>()
+
+function checkStartSignal(options?: WorkflowStartOptions): void {
+  if (options?.signal?.aborted || (options?.scope !== undefined && options.scope !== useProjectStore.getState().currentProject?.path)) {
+    throw new DOMException('工作流启动已取消或项目已切换', 'AbortError')
+  }
+}
+
+export function findWorkflowOperation(operationId: string, scope?: string): WorkflowRun | undefined {
+  const state = useWorkflowStore.getState()
+  return [...state.activeRuns, ...state.history].find(run => run.operationId === operationId && run.scope === scope)
+}
 
 // ===== appendText 流式缓冲（共享限频调度器） =====
 // LLM 流式 chunk 逐片 setState 会高频重渲染整个面板，阻塞主线程。
@@ -285,7 +337,8 @@ function writeStepResultAppend(key: string, text: string): void {
   const stepIndex = parseInt(key.slice(sepIdx + 1), 10)
   if (isNaN(stepIndex)) return
 
-  const activeRun = useWorkflowStore.getState().activeRuns.find(r => r.id === runId)
+  const state = useWorkflowStore.getState()
+  const activeRun = [...state.activeRuns, ...state.history].find(r => r.id === runId)
   if (!activeRun) return
   const step = activeRun.steps[stepIndex]
   if (!step) return
@@ -412,6 +465,32 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
   },
 
   startWorkflow: async (definition, stepByStep = false, options) => {
+    if (closingWorkflows || isCloseCoordinating()) throw new Error('正在保存退出，不启动新工作流')
+    checkStartSignal(options)
+    const operationKey = options?.operationId ? JSON.stringify([options.scope, options.operationId]) : undefined
+    if (operationKey) {
+      const pendingReceipt = startupReceipts.get(operationKey)
+      if (pendingReceipt) {
+        const id = await pendingReceipt
+        checkStartSignal(options)
+        options?.onStarted?.(id)
+        return id
+      }
+      const existing = findWorkflowOperation(options!.operationId!, options?.scope)
+      if (existing) {
+        if (existing.startupState === 'intent' || existing.startupState === 'cancelled' || existing.startupState === 'failed') {
+          throw new Error(`工作流已有未执行或失败的启动记录：${existing.id}`)
+        }
+        options?.onStarted?.(existing.id)
+        return existing.id
+      }
+    }
+    let resolveReceipt: (id: string) => void = () => {}
+    let rejectReceipt: (error: unknown) => void = () => {}
+    const startupKey = operationKey ?? randomUUID()
+    const receipt = new Promise<string>((resolve, reject) => { resolveReceipt = resolve; rejectReceipt = reject })
+    void receipt.catch(() => {})
+    startupReceipts.set(startupKey, receipt)
     const run: WorkflowRun = {
       id: randomUUID(),
       type: definition.type,
@@ -427,6 +506,9 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
         logs: [],
       })),
       rehydrateParams: definition.rehydrateParams ?? {},
+      operationId: options?.operationId,
+      scope: options?.scope,
+      startupState: 'intent',
     }
 
     // 添加到活跃列表
@@ -450,17 +532,45 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
     // 记录 run 可重建参数快照（Task 5 saveCheckpoint 消费；confirmContinue 跨重启重放读 run.rehydrateParams）
     runDefs.set(run.id, { type: run.type, params: definition.rehydrateParams ?? {} })
 
-    // 启动即回执（D 档 Critical 2）：本函数要等整个 run 结束才 return，
-    // 自动化侧不能为此阻塞（否则 tick 会自锁到工作流跑完）
-    options?.onStarted?.(run.id)
+    try {
+      checkStartSignal(options)
+      await options?.beforeStart?.()
+      checkStartSignal(options)
+      await saveCheckpoint(get(), true)
+      checkStartSignal(options)
+      await options?.beforeStart?.()
+      checkStartSignal(options)
+      updateRunById(set, run.id, { startupState: 'started' })
+      await saveCheckpoint(get(), true)
+      checkStartSignal(options)
+      await options?.beforeStart?.()
+      checkStartSignal(options)
+      if (!get().activeRuns.some(r => r.id === run.id)) throw new DOMException('工作流启动已取消', 'AbortError')
+    } catch (error) {
+      updateRunById(set, run.id, { startupState: options?.signal?.aborted || (error instanceof Error && error.name === 'AbortError') ? 'cancelled' : 'failed' })
+      get().cancelWorkflow(run.id)
+      await saveCheckpoint(get())
+      rejectReceipt(error)
+      startupReceipts.delete(startupKey)
+      throw error
+    }
 
-    // 交给可重入执行函数（断点 index 0 + 空上下文字段）——行为与原内联循环 + 收尾等价
-    await executeRunFromIndex(run, definition, 0, {}, stepByStep)
-    return run.id
+    const cancelParent = () => get().cancelWorkflow(run.id)
+    options?.signal?.addEventListener('abort', cancelParent, { once: true })
+    resolveReceipt(run.id)
+    startupReceipts.delete(startupKey)
+    try {
+      options?.onStarted?.(run.id)
+      await executeRunFromIndex(run, definition, 0, {}, stepByStep)
+      return run.id
+    } finally {
+      options?.signal?.removeEventListener('abort', cancelParent)
+    }
   },
 
   cancelWorkflow: (runId) => {
     if (runId) {
+      flushAllPendingAppends()
       // 取消指定工作流
       const ctx = activeContexts.get(runId)
       if (ctx) ctx.cancelled = true
@@ -474,7 +584,7 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
         const newWaiting = { ...s.waitingRuns }
         delete newWaiting[runId]
         const newHistory = targetRun
-          ? [{ ...targetRun, status: 'failed' as const, completedAt: new Date().toISOString() }, ...s.history].slice(0, 50)
+          ? [{ ...targetRun, status: 'failed' as const, cancellationRequestedAt: new Date().toISOString(), completedAt: new Date().toISOString() }, ...s.history].slice(0, 50)
           : s.history
         return {
           activeRuns: newRuns,
@@ -487,11 +597,10 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
       clearAppendBuffers(runId)
       resumeContextData.delete(runId)
       // M2：取消 = 任务级清理（用户不再需要该任务输出；崩溃恢复窗口关闭）
-      deleteRunOutput(runId)
       saveCheckpoint(get())
     } else {
       // 取消全部
-      const allRunIds = get().activeRuns.map(r => r.id)
+      flushAllPendingAppends()
       for (const [id, ctx] of activeContexts) {
         ctx.cancelled = true
         const resolve = continueResolveRefs.get(id)
@@ -499,7 +608,7 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
       }
       set(s => {
         const cancelledRuns = s.activeRuns.map(r => ({
-          ...r, status: 'failed' as const, completedAt: new Date().toISOString(),
+          ...r, status: 'failed' as const, cancellationRequestedAt: new Date().toISOString(), completedAt: new Date().toISOString(),
         }))
         return {
           activeRuns: [],
@@ -513,9 +622,32 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
       get().addLog('warn', '[Cancel] All workflows cancelled')
       resumeContextData.clear()
       saveCheckpoint(get())
-      // M2：取消全部 = 逐个任务级清理（被取消 run 的输出文件不再保留）
-      for (const id of allRunIds) deleteRunOutput(id)
     }
+  },
+
+  flushCheckpoint: async () => {
+    await checkpointTail
+    try { await saveCheckpoint(get(), true) } catch { return false }
+    return checkpointError === undefined
+  },
+  prepareForClose: async () => {
+    if (!workflowCloseDrain) {
+      closingWorkflows = true
+      ++workflowCloseEpoch
+      workflowCloseDrain = Promise.resolve().then(async () => {
+        get().cancelWorkflow()
+        await Promise.allSettled([...executingRuns, ...startupReceipts.values()])
+        flushAllPendingAppends()
+        return await get().flushCheckpoint()
+      }).catch(error => {
+        try { renderLog('error', 'Workflow', `退出收尾失败：${String(error)}`) } catch { /* 保留失败结论 */ }
+        return false
+      }).finally(() => {
+        closingWorkflows = false
+        workflowCloseDrain = null
+      })
+    }
+    return waitForCloseResult(workflowCloseDrain, CLOSE_DRAIN_TIMEOUT_MS)
   },
 
   addLog: (level, message) => {
@@ -535,7 +667,10 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
     // L2 v2：从 DB 读 checkpoint（loadCheckpoint 自有 localStorage 兜底迁移）。
     // 恢复决断：可重建（rehydrateWorkflow 有 factory）→ 真续跑；
     //   不可重建 → 旧兜底（waiting→failed 提示重跑 / running→paused 可取消重跑）。
+    if (closingWorkflows || isCloseCoordinating()) return null
+    const restoreEpoch = workflowCloseEpoch
     const cp = await loadCheckpoint()
+    if (closingWorkflows || restoreEpoch !== workflowCloseEpoch) return null
     if (!cp) return cp
     const existingIds = new Set([...get().activeRuns, ...get().history].map(r => r.id))
     set(s => ({ history: [...s.history, ...(cp.history ?? []).filter(r => !existingIds.has(r.id))].slice(0, 50) }))
@@ -546,6 +681,7 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
     const interruptedWaitingIds = new Set(Object.keys(cp.waitingRuns ?? {}))
     // 动态 import 规避 store←→registry 静态循环（registry type-only import store，store 运行时 import registry）
     const m = await import('../services/workflows/workflow-registry')
+    if (closingWorkflows || restoreEpoch !== workflowCloseEpoch) return null
     const restored: WorkflowRun[] = []
     // 恢复为「等待确认」的 run（其 waitingAfterStepIndex 需保留给 confirmContinue 定位断点）
     const keptWaitingIds: string[] = []
@@ -555,6 +691,10 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
     // 不计 completed/不触发 onComplete → run 永久 stuck running（final review Finding 2）。
     const runningReplays: Array<{ rr: WorkflowRun; def: WorkflowDefinition; startIndex: number }> = []
     for (const r of cp.activeRuns) {
+      if (r.operationId || r.startupState === 'intent' || r.startupState === 'failed' || r.startupState === 'cancelled') {
+        restored.push({ ...r, status: 'paused' })
+        continue
+      }
       // IMP-1：等待确认 run 无 activeContexts 条目，confirmContinue 重放靠此重建 ctx.data
       resumeContextData.set(r.id, cp.contextData?.[r.id] ?? {})
       // L2 final（§4.8）：runDefs 缺失（legacy pre-L2 localStorage checkpoint）→ 视为不可重建，走
@@ -643,7 +783,7 @@ function updateRunById(
     const newRuns = s.activeRuns.map(r =>
       r.id === runId ? { ...r, ...updates } : r
     )
-    return { activeRuns: newRuns, ...computeCompat(newRuns, s.waitingRuns) }
+    return { activeRuns: newRuns, history: s.history.map(r => r.id === runId ? { ...r, ...updates } : r), ...computeCompat(newRuns, s.waitingRuns) }
   })
 }
 
@@ -661,7 +801,13 @@ function updateStepById(
       steps[stepIndex] = { ...steps[stepIndex], ...updates }
       return { ...r, steps }
     })
-    return { activeRuns: newRuns, ...computeCompat(newRuns, s.waitingRuns) }
+    const history = s.history.map(r => {
+      if (r.id !== runId) return r
+      const steps = [...r.steps]
+      steps[stepIndex] = { ...steps[stepIndex], ...updates }
+      return { ...r, steps }
+    })
+    return { activeRuns: newRuns, history, ...computeCompat(newRuns, s.waitingRuns) }
   })
 }
 
@@ -696,7 +842,27 @@ function appendStepLogById(
  * `activeContexts`/`continueResolveRefs` 保持模块级进程内语义（此函数重建 context）。
  * `stepByStep`（可选，仅 startWorkflow 传入）：重放/续跑路径默认 false（不再暂停）。
  */
+const executingRuns = new Set<Promise<void>>()
+let closingWorkflows = false
+let workflowCloseDrain: Promise<boolean> | null = null
+let workflowCloseEpoch = 0
+
 export async function executeRunFromIndex(
+  run: WorkflowRun,
+  definition: WorkflowDefinition,
+  startIndex: number,
+  contextData: Record<string, unknown>,
+  stepByStep = false,
+): Promise<void> {
+  const state = useWorkflowStore.getState()
+  if (closingWorkflows || isCloseCoordinating() || run.cancellationRequestedAt || state.history.some(r => r.id === run.id)
+    || !state.activeRuns.some(r => r.id === run.id)) return
+  const execution = executeRunBody(run, definition, startIndex, contextData, stepByStep)
+  executingRuns.add(execution)
+  try { await execution } finally { executingRuns.delete(execution) }
+}
+
+async function executeRunBody(
   run: WorkflowRun,
   definition: WorkflowDefinition,
   startIndex: number,
@@ -707,7 +873,10 @@ export async function executeRunFromIndex(
   const get = () => useWorkflowStore.getState()
 
   // 重建执行上下文（模块级进程内 Map 语义）
-  const context: WorkflowContext = { data: contextData, cancelled: false }
+  const context: WorkflowContext = {
+    data: contextData,
+    cancelled: !!get().history.find(r => r.id === run.id)?.cancellationRequestedAt,
+  }
   activeContexts.set(run.id, context)
 
   // I-1（跨任务硬约束）：进入执行循环前把 run 状态对齐为 running——保证完成判定
@@ -759,7 +928,7 @@ export async function executeRunFromIndex(
         status: 'completed',
         completedAt: new Date().toISOString(),
         progress: 100,
-        result: result || get().activeRuns.find(r => r.id === run.id)?.steps[i].result,
+        result: result || [...get().activeRuns, ...get().history].find(r => r.id === run.id)?.steps[i].result,
       })
       get().addLog('info', `[${definition.title}] ${stepDef.name} — OK`)
       saveCheckpoint(get())
@@ -777,6 +946,7 @@ export async function executeRunFromIndex(
         updateRunById(set, run.id, { status: 'running' })
       }
     } catch (error) {
+      flushAppendTextNow(`${run.id}:${i}`)
       const errorMsg = error instanceof Error ? error.message : String(error)
       updateStepById(set, run.id, i, {
         status: 'failed',
@@ -843,9 +1013,10 @@ export async function executeRunFromIndex(
   continueResolveRefs.delete(run.id)
   resumeContextData.delete(run.id)
   clearAppendBuffers(run.id)
-  // M2 任务级清理：run 已移入历史（完成/失败），删除其输出目录（崩溃恢复窗口已过）
-  deleteRunOutput(run.id)
-
-  // 持久化 checkpoint
-  saveCheckpoint(get())
+  try {
+    await saveCheckpoint(get(), true)
+    if (!get().history.find(r => r.id === run.id)?.cancellationRequestedAt) deleteRunOutput(run.id)
+  } catch {
+    get().addLog('error', '工作流执行记录保存失败，恢复输出已保留，请重试保存后再退出。')
+  }
 }

@@ -44,7 +44,8 @@ export const skillTool = buildAgentTool({
   },
   requiresConfirmation: false,
   isReadOnly: true,
-  execute: async (input) => {
+  execute: async (input, context) => {
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const name = typeof input.name === 'string' ? input.name.trim() : ''
 
     // 无参：列目录（模型的第一步）

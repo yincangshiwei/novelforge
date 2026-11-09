@@ -10,7 +10,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 
 /** 架构字段预览长度上限——避免把整篇世界观灌进上下文（需要全文时让 LLM 调 read_architecture） */
@@ -29,7 +29,9 @@ export const listOutlineTool = buildAgentTool({
   inputSchema: { type: 'object', properties: {} },
   requiresConfirmation: false,
   isReadOnly: true,
-  execute: async () => {
+  execute: async (_args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
@@ -38,9 +40,9 @@ export const listOutlineTool = buildAgentTool({
     try {
       // 三个数据源并发读（都是只读通道）
       const [core, blueprints, draftChapters] = await Promise.all([
-        ipc.invoke('db:project-core-get'),
-        ipc.invoke('db:blueprint-get-all'),
-        ipc.invoke('db:draft-get-all-chapter-numbers'),
+        toolIpc.invoke('db:project-core-get'),
+        toolIpc.invoke('db:blueprint-get-all'),
+        toolIpc.invoke('db:draft-get-all-chapter-numbers'),
       ])
 
       const parts: string[] = []

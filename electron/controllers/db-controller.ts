@@ -30,7 +30,15 @@ import { getGlobalUsageStats } from '../repositories/usage-repository'
 import { PublicationRepository, type PublicationEntry } from '../repositories/publication-repository'
 import { analyzeExternalChapter } from '../../src/services/publication-analysis'
 import { SummaryRepository } from '../repositories/summary-repository'
-import { guardedHandle } from '../security/ipc-guard'
+import { guardedHandle as registerGuardedHandle } from '../security/ipc-guard'
+import { checkOperationCancellation, withOperationCommit, isOperationRollback, currentOperationSignal } from '../services/agent-operation-journal'
+
+const guardedHandle: typeof registerGuardedHandle = (channel, handler) => {
+  registerGuardedHandle(channel, async (event, ...args) => {
+    checkOperationCancellation()
+    return handler(event, ...args)
+  })
+}
 
 export function registerDatabaseController() {
   guardedHandle('db:close', async () => {
@@ -71,6 +79,7 @@ export function registerDatabaseController() {
       BlueprintRepository.upsert(data)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -80,6 +89,7 @@ export function registerDatabaseController() {
       BlueprintRepository.upsertMany(items)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -89,6 +99,7 @@ export function registerDatabaseController() {
       BlueprintRepository.updateNotes(chapterNumber, notes)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -98,6 +109,7 @@ export function registerDatabaseController() {
       BlueprintRepository.delete(chapterNumber)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -115,6 +127,7 @@ export function registerDatabaseController() {
       BlueprintRepository.updateSortOrder(orders)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -124,6 +137,7 @@ export function registerDatabaseController() {
       BlueprintRepository.updatePriority(chapterNumber, priority)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -133,6 +147,7 @@ export function registerDatabaseController() {
       BlueprintRepository.updatePriorityBatch(items)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -146,17 +161,21 @@ export function registerDatabaseController() {
 
   guardedHandle('db:character-upsert', async (_event, data: CharacterData) => {
     try {
-      CharacterRepository.upsert(data)
-      return { success: true }
+      return withOperationCommit(() => {
+        CharacterRepository.upsert(data)
+        return { success: true }
+      })
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
 
   guardedHandle('db:character-create-missing', async (_event, items: CharacterData[]) => {
     try {
-      return { success: true, created: CharacterRepository.createMissing(items) }
+      return withOperationCommit(() => ({ success: true, created: CharacterRepository.createMissing(items) }))
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, created: 0, error: String(err) }
     }
   })
@@ -166,6 +185,7 @@ export function registerDatabaseController() {
       CharacterRepository.saveAll(items)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -175,6 +195,7 @@ export function registerDatabaseController() {
       CharacterRepository.delete(name)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -184,6 +205,7 @@ export function registerDatabaseController() {
       CharacterRepository.mergeCharacters(target, source)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -193,6 +215,7 @@ export function registerDatabaseController() {
       CharacterRepository.updateAppearanceStats(name, stats)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -202,6 +225,7 @@ export function registerDatabaseController() {
       CharacterRepository.updateState(name, state, extra)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -211,6 +235,7 @@ export function registerDatabaseController() {
       CharacterRepository.mergeFields(name, fields)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -229,6 +254,7 @@ export function registerDatabaseController() {
       const id = DraftRepository.create(params)
       return { success: true, id }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -309,6 +335,7 @@ export function registerDatabaseController() {
       DraftRepository.updateStatus(id, status, wordCount)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -319,6 +346,7 @@ export function registerDatabaseController() {
       try { maybeCreateAutoSnapshot(id) } catch (e) { logger.warn('DB', '自动快照失败（不阻断保存）: ' + String(e)) }
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -333,32 +361,44 @@ export function registerDatabaseController() {
     try {
       const meta = DraftRepository.getMeta(params.draftId)
       const before = DraftRepository.getFull(params.draftId)
-      if (!meta || !before) return { success: false, error: 'draft-not-found' }
-      if (meta.status === 'finalized') return { success: false, error: 'draft-finalized-readonly' }
+      if (!meta || !before) return withOperationCommit(() => ({ success: false, error: 'draft-not-found' }))
+      if (meta.status === 'finalized') return withOperationCommit(() => ({ success: false, error: 'draft-finalized-readonly' }))
       if (meta.contentHash !== params.expectedHash || meta.updatedAt !== params.expectedUpdatedAt) {
-        return { success: false, conflict: true, currentHash: meta.contentHash, currentUpdatedAt: meta.updatedAt }
+        return withOperationCommit(() => ({ success: false, conflict: true, currentHash: meta.contentHash, currentUpdatedAt: meta.updatedAt }))
       }
-      // pre-agent 快照：先存旧内容，再 CAS（CAS 仍会二次校验，防并发覆盖）
-      DraftSnapshotRepository.create({
-        chapterNumber: meta.chapterNumber,
-        draftId: meta.id,
-        branchId: meta.branchId,
-        label: '',
-        kind: 'pre-agent',
-        content: before.content,
-        contentHash: meta.contentHash,
-        wordCount: meta.wordCount,
-        createdBy: 'agent',
+      return withOperationCommit(() => {
+        DraftSnapshotRepository.create({
+          chapterNumber: meta.chapterNumber,
+          draftId: meta.id,
+          branchId: meta.branchId,
+          label: '',
+          kind: 'pre-agent',
+          content: before.content,
+          contentHash: meta.contentHash,
+          wordCount: meta.wordCount,
+          createdBy: 'agent',
+        })
+        const res = DraftRepository.applyContentIfUnchanged(
+          params.draftId,
+          params.expectedHash,
+          params.expectedUpdatedAt,
+          params.content,
+          params.wordCount,
+        )
+        if (!res.ok) {
+          throw Object.assign(new Error('draft-conflict'), {
+            draftConflict: { success: false, conflict: true, currentHash: res.currentHash, currentUpdatedAt: res.currentUpdatedAt },
+          })
+        }
+        return { success: true }
       })
-      const res = DraftRepository.applyContentIfUnchanged(
-        params.draftId,
-        params.expectedHash,
-        params.expectedUpdatedAt,
-        params.content,
-        params.wordCount,
-      )
-      return res.ok ? { success: true } : { success: false, conflict: true, currentHash: res.currentHash, currentUpdatedAt: res.currentUpdatedAt }
     } catch (err) {
+      if (!currentOperationSignal() && isOperationRollback(err) && err instanceof Error) {
+        if ('operationFailureValue' in err) return err.operationFailureValue
+        if ('draftConflict' in err) return err.draftConflict
+      }
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
+      if (err instanceof Error && 'draftConflict' in err) return err.draftConflict
       return { success: false, error: String(err) }
     }
   })
@@ -378,6 +418,7 @@ export function registerDatabaseController() {
       const id = DraftSnapshotRepository.create(params)
       return { success: true, id }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -395,6 +436,7 @@ export function registerDatabaseController() {
       const removed = DraftSnapshotRepository.pruneAuto(chapterNumber, keep ?? 50)
       return { success: true, removed }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -407,6 +449,7 @@ export function registerDatabaseController() {
     try {
       return { success: true, ...createDraftBranch(chapterNumber, name, baseDraftId) }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -415,6 +458,7 @@ export function registerDatabaseController() {
     try {
       return { success: true, ...mergeDraftBranch(branchId) }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -424,6 +468,7 @@ export function registerDatabaseController() {
       DraftBranchRepository.archive(branchId)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -432,6 +477,7 @@ export function registerDatabaseController() {
     try {
       return { success: true, ...reorderChapter(params.chapterNumber, params.toVolumeNumber, params.targetIndex) }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -442,6 +488,7 @@ export function registerDatabaseController() {
     try {
       return { success: true, id: SceneRepository.upsert(data) }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -451,6 +498,7 @@ export function registerDatabaseController() {
       SceneRepository.delete(id)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -460,6 +508,7 @@ export function registerDatabaseController() {
       SceneRepository.reorder(params.chapterNumber, params.orderedIds)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -502,6 +551,7 @@ export function registerDatabaseController() {
       const id = RevisionRepository.create(params)
       return { success: true, id }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -527,6 +577,7 @@ export function registerDatabaseController() {
       RevisionRepository.markMerged(id, mergedToDraftId)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -536,6 +587,7 @@ export function registerDatabaseController() {
       RevisionRepository.markDiscarded(id)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -636,6 +688,7 @@ export function registerDatabaseController() {
       const id = ReviewRepository.create(params)
       return { success: true, id }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -687,6 +740,7 @@ export function registerDatabaseController() {
 
       return { success: true, id: result.lastInsertRowid as number }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -713,6 +767,7 @@ export function registerDatabaseController() {
       const id = PostProcessRepository.createRun(params)
       return { success: true, id }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -730,6 +785,7 @@ export function registerDatabaseController() {
       PostProcessRepository.markStepOk(runId, stepKey)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -739,6 +795,7 @@ export function registerDatabaseController() {
       PostProcessRepository.markStepFailed(runId, stepKey, errorMsg)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -812,6 +869,7 @@ export function registerDatabaseController() {
       VolumeRepository.upsert(data)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -821,6 +879,7 @@ export function registerDatabaseController() {
       VolumeRepository.delete(volumeNumber)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })
@@ -833,6 +892,7 @@ export function registerDatabaseController() {
       PreferenceRepository.record(aiText, userText, chapterNumber)
       return { success: true }
     } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
       return { success: false, error: String(err) }
     }
   })

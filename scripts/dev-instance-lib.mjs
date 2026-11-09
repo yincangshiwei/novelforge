@@ -123,7 +123,7 @@ export async function isPortFree(port) {
 }
 
 /** 构造隔离子进程环境（Windows 需要 USERPROFILE/APPDATA/LOCALAPPDATA，HOME/XDG 不生效） */
-export function buildChildEnv(baseEnv, home, platform = process.platform) {
+export function buildChildEnv(baseEnv, home, platform = process.platform, fresh = false) {
   const env = {
     ...baseEnv,
     HOME: home,
@@ -142,7 +142,22 @@ export function buildChildEnv(baseEnv, home, platform = process.platform) {
     }
   }
   delete env.ELECTRON_RUN_AS_NODE
+  if (fresh) {
+    for (const key of Object.keys(env)) {
+      if (/API_?KEY|ACCESS_?TOKEN|AUTH_?TOKEN|SECRET|CREDENTIAL|PASSWORD/i.test(key)) delete env[key]
+    }
+  }
   return env
+}
+
+export function seedInstanceHome(sourceHome, home, fresh = false) {
+  if (fresh) return
+  const target = path.join(home, '.novelforge')
+  fs.mkdirSync(target, { recursive: true })
+  for (const name of ['config.json', 'models.json', 'credentials.json', 'prompts']) {
+    const source = path.join(sourceHome, name)
+    if (fs.existsSync(source)) fs.cpSync(source, path.join(target, name), { recursive: true, force: true })
+  }
 }
 
 /** 进程归属校验：只认 CLI 注入的 --dev-instance=<id>，防 PID 复用误杀 */

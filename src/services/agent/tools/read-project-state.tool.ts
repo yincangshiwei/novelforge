@@ -4,7 +4,7 @@
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
 import { useProjectStore } from '../../../stores/project-store'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useWorkflowStore } from '../../../stores/workflow-store'
 
 
@@ -28,7 +28,9 @@ export const readProjectStateTool = buildAgentTool({
     },
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
@@ -49,7 +51,8 @@ export const readProjectStateTool = buildAgentTool({
     if (includeConfig) {
       // 读取小说配置
       try {
-        const core = await ipc.invoke('db:project-core-get')
+        const core = await toolIpc.invoke('db:project-core-get')
+        if (!core) return { success: false, content: '', error: t('tool.readStateConfigFailed') }
         if (core) {
           parts.push(t('tool.readStateConfigSection').replace('{json}', JSON.stringify({
             projectName: core.projectName,
@@ -70,8 +73,7 @@ export const readProjectStateTool = buildAgentTool({
           }, null, 2)))
         }
       } catch {
-        // Fallback
-        parts.push(t('tool.readStateConfigFailed'))
+        return { success: false, content: '', error: t('tool.readStateConfigFailed') }
       }
     }
 
@@ -79,7 +81,7 @@ export const readProjectStateTool = buildAgentTool({
       // 读取最近 5 章蓝图的 notes 字段作为进度摘要
       const notesParts: string[] = []
       try {
-        const bps = await ipc.invoke('db:blueprint-get-all')
+        const bps = await toolIpc.invoke('db:blueprint-get-all')
         if (bps && Array.isArray(bps)) {
           // 倒序遍历
           const sorted = bps.sort((a, b) => b.chapterNumber - a.chapterNumber)

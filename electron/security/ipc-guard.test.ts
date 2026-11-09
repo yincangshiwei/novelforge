@@ -18,6 +18,8 @@ import {
   trustWebContents,
   untrustWebContents,
   resetTrustedWebContentsForTest,
+  dispatchAgentOperationIpc,
+  isAgentOperationChannelAllowed,
   type SenderProbe,
   type SenderTrustPolicy,
 } from './ipc-guard'
@@ -112,6 +114,35 @@ describe('guardedHandle 接线（策略表 + 来源校验）', () => {
     // 注销后再次拒绝（窗口销毁 → 不留后门）
     untrustWebContents(7)
     await expect(wrapper(fakeEvent(7, 'file:///app/index.html'))).rejects.toThrow(/sender not trusted/)
+  })
+
+  it('操作dispatch保留原event、参数及同步返回值', () => {
+    trustWebContents(7)
+    const event = fakeEvent(7, 'file:///app/index.html')
+    const handler = vi.fn(() => ({ success: true }))
+    guardedHandle('fs:write-file', handler as never)
+    expect(dispatchAgentOperationIpc(event, 'fs:write-file', ['/project/a', 'text'])).toEqual({ success: true })
+    expect(handler).toHaveBeenCalledWith(event, '/project/a', 'text')
+  })
+
+  it('操作dispatch仍拒绝不可信sender和子frame', () => {
+    const handler = vi.fn()
+    guardedHandle('fs:read-file', handler as never)
+    expect(() => dispatchAgentOperationIpc(fakeEvent(7, 'file:///app/index.html'), 'fs:read-file', [])).toThrow(/sender not trusted/)
+    trustWebContents(7)
+    expect(() => dispatchAgentOperationIpc(fakeEvent(7, 'file:///app/index.html', {}), 'fs:read-file', [])).toThrow(/sender not trusted/)
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it.each(['agent:operation-invoke', 'credential:set', 'config:set', 'fs:delete-file', 'db:character-delete', 'mcp:add-server', 'embedding:set-model', 'nope:channel'])('操作dispatch拒绝非工具白名单通道 %s', channel => {
+    trustWebContents(7)
+    expect(isAgentOperationChannelAllowed(channel)).toBe(false)
+    expect(() => dispatchAgentOperationIpc(fakeEvent(7, 'file:///app/index.html'), channel, [])).toThrow(/channel not allowed/)
+  })
+
+  it('操作dispatch拒绝尚未注册的工具handler', () => {
+    trustWebContents(7)
+    expect(() => dispatchAgentOperationIpc(fakeEvent(7, 'file:///app/index.html'), 'mcp:call-tool', [])).toThrow(/handler not registered/)
   })
 
   it('非 top frame 即使窗口已登记 → 仍拒绝', async () => {

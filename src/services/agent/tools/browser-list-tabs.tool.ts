@@ -7,7 +7,7 @@
  */
 import { buildAgentTool } from '../tool-registry'
 import { t } from '../../../shared/locale'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 
 export const browserListTabsTool = buildAgentTool({
   name: 'browser_list_tabs',
@@ -18,8 +18,10 @@ export const browserListTabsTool = buildAgentTool({
     type: 'object',
     properties: {},
   },
-  execute: async () => {
-    const res = await ipc.invoke('browser:list-tabs')
+  execute: async (_args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
+    const res = await toolIpc.invoke('browser:list-tabs')
     if (!res.success) {
       return {
         success: false,

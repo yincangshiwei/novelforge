@@ -6,7 +6,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useVectorConfigStore } from '../../../stores/vector-config-store'
 
 export const compareTextsTool = buildAgentTool({
@@ -28,7 +28,9 @@ export const compareTextsTool = buildAgentTool({
     required: ['query', 'candidates'],
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const query = args.query as string
     const candidatesStr = args.candidates as string
 
@@ -87,7 +89,7 @@ export const compareTextsTool = buildAgentTool({
         }
       }
 
-      const result = await ipc.invoke('embedding:compare', query, candidates)
+      const result = await toolIpc.invoke('embedding:compare', query, candidates)
 
       if (!result.success) {
         return {

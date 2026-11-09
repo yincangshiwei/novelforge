@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import fsPromises from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { FileNode, WorkflowOutputTailOptions } from '../../src/shared/ipc-channels'
 import { VELA_HOME } from '../utils/config-utils'
 import { getCurrentProjectPath } from '../database'
@@ -20,7 +20,15 @@ import { safeErrorMessage } from '../utils/error-utils'
 import { scanTextWindow } from '../utils/read-text-window'
 import { logger } from '../utils/logger'
 import { WorkflowOutputFileStore } from '../utils/workflow-output-store'
-import { guardedHandle } from '../security/ipc-guard'
+import { guardedHandle as registerGuardedHandle } from '../security/ipc-guard'
+import { checkOperationCancellation, currentOperationSignal } from '../services/agent-operation-journal'
+
+const guardedHandle: typeof registerGuardedHandle = (channel, handler) => {
+  registerGuardedHandle(channel, async (event, ...args) => {
+    checkOperationCancellation()
+    return handler(event, ...args)
+  })
+}
 
 /**
  * 路径权限（L4 S8）——判定逻辑在 `electron/security/grants.ts`（纯模块，可离线单测）。
@@ -194,6 +202,7 @@ async function withFileMutex<T>(filePath: string, task: () => Promise<T>): Promi
     try {
       await previousTask
     } catch { /* 前置任务错误不影响后续任务启动 */ }
+    checkOperationCancellation()
     return task()
   })()
 
@@ -208,6 +217,25 @@ async function withFileMutex<T>(filePath: string, task: () => Promise<T>): Promi
     if (fileMutexMap.get(normalPath) === stored) {
       fileMutexMap.delete(normalPath)
     }
+  }
+}
+
+async function writeFileAtomically(target: string, content: string | Uint8Array): Promise<void> {
+  checkOperationCancellation()
+  await fsPromises.mkdir(path.dirname(target), { recursive: true })
+  checkOperationCancellation()
+  const temp = `${target}.${randomUUID()}.tmp`
+  try {
+    await fsPromises.writeFile(temp, content, { encoding: 'utf-8', flag: 'wx', signal: currentOperationSignal() })
+    checkOperationCancellation()
+    await fsPromises.rename(temp, target)
+  } catch (error) {
+    try { await fsPromises.unlink(temp) } catch (cleanupError) {
+      if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.warn('FS', `Temporary file cleanup failed: ${safeErrorMessage(cleanupError)}`)
+      }
+    }
+    throw error
   }
 }
 
@@ -239,6 +267,7 @@ export function registerFSController() {
         return { success: true, content: w.content, ...(w.totalChars !== undefined ? { totalChars: w.totalChars } : {}), ...(w.beyond ? { beyond: true } : {}) }
       })
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, content: '', error: safeErrorMessage(error) }
     }
   })
@@ -297,6 +326,7 @@ export function registerFSController() {
       const w = await windowFromHugeFile(filePath, spec, stat.size)
       return { success: true, content: w.content, ...(w.totalChars !== undefined ? { totalChars: w.totalChars } : {}), ...(w.beyond ? { beyond: true } : {}) }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, content: '', error: safeErrorMessage(error) }
     }
   })
@@ -306,13 +336,11 @@ export function registerFSController() {
     try {
       const safePath = validateSandbox(filePath, 'write')
       return await withFileMutex(filePath, async () => {
-        await fsPromises.mkdir(path.dirname(safePath), { recursive: true })
-        const tempPath = `${safePath}.${Date.now()}.tmp`
-        await fsPromises.writeFile(tempPath, Buffer.from(content))
-        await fsPromises.rename(tempPath, safePath)
+        await writeFileAtomically(safePath, Buffer.from(content))
         return { success: true }
       })
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -322,14 +350,11 @@ export function registerFSController() {
     try {
       const safePath = validateSandbox(filePath, 'write')
       return await withFileMutex(filePath, async () => {
-        await fsPromises.mkdir(path.dirname(safePath), { recursive: true })
-        // 先写到临时文件再原位替换，绝对防止 0KB 碎屑踩空现象
-        const tempPath = `${safePath}.${Date.now()}.tmp`
-        await fsPromises.writeFile(tempPath, content, 'utf-8')
-        await fsPromises.rename(tempPath, safePath)
+        await writeFileAtomically(safePath, content)
         return { success: true }
       })
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -348,6 +373,7 @@ export function registerFSController() {
       fs.mkdirSync(safePath, { recursive: true })
       return { success: true }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
@@ -380,6 +406,7 @@ export function registerFSController() {
         return { success: true, data: JSON.parse(content) }
       })
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, data: null, error: safeErrorMessage(error) }
     }
   })
@@ -388,28 +415,25 @@ export function registerFSController() {
     try {
       const safePath = validateSandbox(filePath, 'write')
       return await withFileMutex(filePath, async () => {
-        await fsPromises.mkdir(path.dirname(safePath), { recursive: true })
-        const tempPath = `${safePath}.${Date.now()}.tmp`
-        await fsPromises.writeFile(tempPath, JSON.stringify(data, null, 2), 'utf-8')
-        await fsPromises.rename(tempPath, safePath)
+        await writeFileAtomically(safePath, JSON.stringify(data, null, 2))
         return { success: true }
       })
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })
 
   // ===== Agent 会话归档（~/.novelforge/agent-archive/<id>.json，CCR 持久化层） =====
   // 渲染进程不持有 VELA_HOME 路径，归档目录由主进程统一定位（同模板/技能/日志惯例）
-  const archivePath = (id: string): string => {
-    const safe = String(id).replace(/[^a-zA-Z0-9_-]/g, '') // uuid 防御性清洗，防路径穿越
-    return path.join(VELA_HOME, 'agent-archive', `${safe}.json`)
+  const isValidArchiveId = (id: unknown): id is string =>
+    typeof id === 'string' && id.length > 0 && !/[^a-zA-Z0-9_-]/.test(id)
+  const archivePath = (id: string, original = false): string => {
+    if (!isValidArchiveId(id)) throw new Error('Invalid archive ID')
+    return path.join(VELA_HOME, 'agent-archive', `${id}${original ? '.originals' : ''}.json`)
   }
   /** 被压缩对话的原文分卷（B 档第二轮）：与会话 JSON 同目录、不同后缀 */
-  const archiveOriginalsPath = (id: string): string => {
-    const safe = String(id).replace(/[^a-zA-Z0-9_-]/g, '')
-    return path.join(VELA_HOME, 'agent-archive', `${safe}.originals.json`)
-  }
+  const archiveOriginalsPath = (id: string): string => archivePath(id, true)
 
   guardedHandle('fs:agent-archive-list', async (): Promise<{ id: string; title: string; updatedAt: number }[]> => {
     const dir = path.join(VELA_HOME, 'agent-archive')
@@ -418,8 +442,9 @@ export function registerFSController() {
       const entries = await fsPromises.readdir(dir, { withFileTypes: true })
       const out: { id: string; title: string; updatedAt: number }[] = []
       for (const entry of entries) {
-        if (!entry.isFile() || !entry.name.endsWith('.json')) continue
+        if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name.endsWith('.originals.json')) continue
         const id = entry.name.slice(0, -5)
+        if (!isValidArchiveId(id)) continue
         try {
           const raw = await fsPromises.readFile(path.join(dir, entry.name), 'utf-8')
           const data = JSON.parse(raw) as { title?: string; updatedAt?: number }
@@ -442,30 +467,51 @@ export function registerFSController() {
     }
   })
 
-  guardedHandle('fs:agent-archive-write', async (_e, id: string, content: string): Promise<{ success: boolean }> => {
+  const writeArchive = async (resolveTarget: () => string, content: string): Promise<{ success: boolean; error?: string }> => {
     try {
-      const dir = path.join(VELA_HOME, 'agent-archive')
-      await fsPromises.mkdir(dir, { recursive: true })
-      const target = archivePath(id)
-      const temp = `${target}.${Date.now()}.tmp`
-      await fsPromises.writeFile(temp, content, 'utf-8')
-      await fsPromises.rename(temp, target)
-      return { success: true }
-    } catch {
-      return { success: false }
-    }
-  })
-
-  guardedHandle('fs:agent-archive-delete', async (_e, id: string): Promise<{ success: boolean }> => {
-    try {
-      await fsPromises.unlink(archivePath(id))
-      return { success: true }
+      const target = resolveTarget()
+      return await withFileMutex(target, async () => {
+        await fsPromises.mkdir(path.dirname(target), { recursive: true })
+        const temp = `${target}.${randomUUID()}.tmp`
+        try {
+          await fsPromises.writeFile(temp, content, { encoding: 'utf-8', flag: 'wx', signal: currentOperationSignal() })
+          checkOperationCancellation()
+          await fsPromises.rename(temp, target)
+        } catch (error) {
+          try {
+            await fsPromises.unlink(temp)
+          } catch (cleanupError) {
+            if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+              logger.warn('FS', `Archive temporary file cleanup failed: ${safeErrorMessage(cleanupError)}`)
+            }
+          }
+          throw error
+        }
+        return { success: true }
+      })
     } catch (error) {
-      // 文件不存在视为成功（幂等删除），与 fs:delete-file 惯例对齐
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { success: true }
-      return { success: false }
+      if (error instanceof Error && error.name === 'AbortError') throw error
+      return { success: false, error: safeErrorMessage(error) }
     }
-  })
+  }
+  const deleteArchive = async (resolveTarget: () => string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const target = resolveTarget()
+      return await withFileMutex(target, async () => {
+        try {
+          await fsPromises.unlink(target)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+        return { success: true }
+      })
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
+      return { success: false, error: safeErrorMessage(error) }
+    }
+  }
+  guardedHandle('fs:agent-archive-write', async (_e, id: string, content: string) => writeArchive(() => archivePath(id), content))
+  guardedHandle('fs:agent-archive-delete', async (_e, id: string) => deleteArchive(() => archivePath(id)))
 
   // 原文分卷（B 档第二轮）：写用临时文件 + rename（与 archive-write 同款原子写）
   guardedHandle('fs:agent-archive-original-read', async (_e, id: string): Promise<{ success: boolean; content?: string | null }> => {
@@ -477,28 +523,8 @@ export function registerFSController() {
       return { success: false }
     }
   })
-  guardedHandle('fs:agent-archive-original-write', async (_e, id: string, content: string): Promise<{ success: boolean }> => {
-    try {
-      const dir = path.join(VELA_HOME, 'agent-archive')
-      await fsPromises.mkdir(dir, { recursive: true })
-      const target = archiveOriginalsPath(id)
-      const temp = `${target}.${Date.now()}.tmp`
-      await fsPromises.writeFile(temp, content, 'utf-8')
-      await fsPromises.rename(temp, target)
-      return { success: true }
-    } catch {
-      return { success: false }
-    }
-  })
-  guardedHandle('fs:agent-archive-original-delete', async (_e, id: string): Promise<{ success: boolean }> => {
-    try {
-      await fsPromises.unlink(archiveOriginalsPath(id))
-      return { success: true }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { success: true }
-      return { success: false }
-    }
-  })
+  guardedHandle('fs:agent-archive-original-write', async (_e, id: string, content: string) => writeArchive(() => archiveOriginalsPath(id), content))
+  guardedHandle('fs:agent-archive-original-delete', async (_e, id: string) => deleteArchive(() => archiveOriginalsPath(id)))
 
   // ===== Agent 长工具结果落盘（~/.novelforge/agent-results/<sha1-12>.txt，P0-1 写盘引用） =====
   // 同内容同哈希同文件（确定性命名 + wx 防重 = 决策冻结）；文件保留（rewind/fork/存档重放需引用仍在）
@@ -522,6 +548,7 @@ export function registerFSController() {
       grantExternalFile(path.resolve(target))
       return { success: true, path: target }
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw error
       return { success: false, error: safeErrorMessage(error) }
     }
   })

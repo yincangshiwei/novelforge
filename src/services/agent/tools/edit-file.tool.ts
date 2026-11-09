@@ -11,7 +11,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 import { isProtectedRelativePath, validatePath } from './safe-path'
 import { clearReadState } from './read-file.tool'
@@ -26,6 +26,8 @@ import {
   detectRegionAwareQuoteStyle,
   findEditMatch,
 } from './edit-file-utils'
+
+const pendingEdits = new Map<string, { projectPath: string; target: string; content: string }>()
 
 export const editFileTool = buildAgentTool({
   name: 'edit_file',
@@ -51,7 +53,25 @@ export const editFileTool = buildAgentTool({
   },
   requiresConfirmation: true,
   isReadOnly: false,
-  execute: async (args) => {
+  reconcile: async (_args, context) => {
+    const toolIpc = createToolIpc(context)
+    const expected = pendingEdits.get(context.operationId)
+    const project = useProjectStore.getState().currentProject
+    if (!expected || !project || project.path !== expected.projectPath || context.signal.aborted || (context.scope && context.scope !== project.path)) return undefined
+    let actual: string | undefined
+    if (expected.target.startsWith(VELA.DRAFT)) actual = (await toolIpc.invoke('db:draft-get-full', Number(expected.target.slice(VELA.DRAFT.length))))?.content
+    else {
+      const result = await toolIpc.invoke('fs:read-file', expected.target)
+      if (!result.success) return undefined
+      actual = result.content
+    }
+    if (context.signal.aborted || useProjectStore.getState().currentProject?.path !== expected.projectPath || actual !== expected.content) return undefined
+    pendingEdits.delete(context.operationId)
+    return { success: true, executionState: 'committed', content: '已只读核验实际内容与原编辑结果一致；不重复编辑。', persistence: { target: expected.target, verified: true, projectPath: expected.projectPath } }
+  },
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     // 类型归一化铁律：inputSchema 的 string 只是声明，LLM 可能传任意类型
     const filePath = typeof args.file_path === 'string' ? args.file_path : ''
     const oldString = typeof args.old_string === 'string' ? args.old_string : undefined
@@ -91,7 +111,8 @@ export const editFileTool = buildAgentTool({
       const draftId = Number(rawId)
       const openTab = useEditorStore.getState().tabs.find(x => x.filePath === resolvedPath || x.id === resolvedPath)
       if (openTab?.dirty) return { success: false, content: '', error: t('tool.draftDirty') }
-      const full = await ipc.invoke('db:draft-get-full', draftId)
+      const full = await toolIpc.invoke('db:draft-get-full', draftId)
+      if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path || (context?.scope && context.scope !== project.path)) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消或项目已切换，未提交' }
       if (!full) return { success: false, content: '', error: t('tool.draftNotFound') }
       if (full.status === 'finalized') return { success: false, content: '', error: t('tool.draftReadonly') }
 
@@ -106,7 +127,11 @@ export const editFileTool = buildAgentTool({
         return { success: true, content: t('tool.editNoChange').replace('{path}', filePath) }
       }
 
-      const res = await ipc.invoke('db:draft-apply-content', {
+      if (context) {
+        if (pendingEdits.size >= 200) pendingEdits.delete(pendingEdits.keys().next().value!)
+        pendingEdits.set(context.operationId, { projectPath: project.path, target: resolvedPath, content: edit.content })
+      }
+      const res = await toolIpc.invoke('db:draft-apply-content', {
         draftId,
         expectedHash: full.contentHash,
         expectedUpdatedAt: full.updatedAt,
@@ -119,13 +144,16 @@ export const editFileTool = buildAgentTool({
       }
       clearReadState(filePath)
       const tab = useEditorStore.getState().tabs.find(x => x.filePath === filePath || x.id === filePath)
-      if (tab) {
-        if (tab.inlineSession) useEditorStore.getState().endInlineSession(tab.id)
-        useEditorStore.getState().markTabSaved(tab.id)
-        useEditorStore.getState().syncTabContent(tab.id, edit.content)
+      if (!context?.signal.aborted && useProjectStore.getState().currentProject?.path === project.path && tab) {
+        try {
+          if (tab.inlineSession) useEditorStore.getState().endInlineSession(tab.id)
+          useEditorStore.getState().markTabSaved(tab.id)
+          useEditorStore.getState().syncTabContent(tab.id, edit.content)
+        } catch (error) { console.warn('[edit_file] 已提交，编辑器刷新失败', error) }
       }
       return {
         success: true,
+        executionState: 'committed',
         content: t('tool.fileEdited')
           .replace('{path}', filePath)
           .replace('{line}', String(currentText.slice(0, match.start).split('\n').length))
@@ -147,7 +175,7 @@ export const editFileTool = buildAgentTool({
 
     // 读全文（既有沙箱通道；> 单次全量上限 5MB 的整读由主进程拒绝 → 错误透传，
     // edit_file 只在可整读大小内工作——正常小说/设定文件不受影响）
-    const readRes = await ipc.invoke('fs:read-file', pathCheck.fullPath)
+    const readRes = await toolIpc.invoke('fs:read-file', pathCheck.fullPath)
     if (!readRes.success) {
       return { success: false, content: '', error: readRes.error ?? t('tool.readFileFailed') }
     }
@@ -177,7 +205,12 @@ export const editFileTool = buildAgentTool({
       }
     }
 
-    const writeRes = await ipc.invoke('fs:write-file', pathCheck.fullPath, edit.content)
+    if (context?.signal.aborted || useProjectStore.getState().currentProject?.path !== project.path || (context?.scope && context.scope !== project.path)) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消或项目已切换，未提交' }
+    if (context) {
+      if (pendingEdits.size >= 200) pendingEdits.delete(pendingEdits.keys().next().value!)
+      pendingEdits.set(context.operationId, { projectPath: project.path, target: pathCheck.fullPath, content: edit.content })
+    }
+    const writeRes = await toolIpc.invoke('fs:write-file', pathCheck.fullPath, edit.content)
     if (!writeRes.success) {
       return { success: false, content: '', error: writeRes.error ?? t('tool.writeFileFailed') }
     }
@@ -207,6 +240,7 @@ export const editFileTool = buildAgentTool({
 
     return {
       success: true,
+      executionState: 'committed',
       content,
       artifacts: [{ type: 'file_modified', path: pathCheck.fullPath, name: filePath }],
     }

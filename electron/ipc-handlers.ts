@@ -2,6 +2,7 @@ import { ensureVelaHome, VELA_HOME } from './utils/config-utils'
 import { logger } from './utils/logger'
 import { t } from '../src/shared/locale'
 
+import { registerAgentOperationController } from './controllers/agent-operation-controller'
 import { registerConfigController } from './controllers/config-controller'
 import { registerProjectController } from './controllers/project-controller'
 import { registerFSController } from './controllers/fs-controller'
@@ -38,6 +39,7 @@ export function registerIPCHandlers() {
   ensureVelaHome()
 
   // 挂载控制器路由
+  registerAgentOperationController()
   registerConfigController()
   registerProjectController()
   registerFSController()

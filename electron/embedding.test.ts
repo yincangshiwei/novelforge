@@ -8,8 +8,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { embedOpenAI } from './embedding'
+import { embedGemini, embedOpenAI, generateEmbeddings } from './embedding'
 import { fetchWithTimeout } from './net/fetch-with-timeout'
+
+const operation = vi.hoisted(() => ({ signal: undefined as AbortSignal | undefined }))
+vi.mock('./services/agent-operation-journal', () => ({ currentOperationSignal: () => operation.signal }))
 
 const EMBEDDING_TIMEOUT_MS = 10_000
 
@@ -23,7 +26,7 @@ describe('embedOpenAI fetchWithTimeout（abort 兜底，2026-08-29 根因修复�
     vi.unstubAllGlobals()
   })
 
-  it('fetch 挂起（永不 settle）→ 超时后立即 reject AbortError（不等待 undici 延迟）', async () => {
+  it('fetch 挂起（永不 settle）→ 超时后立即 reject TimeoutError（不等待 undici 延迟）', async () => {
     // 挂起连接：promise 永不 settle——旧实现下 abort 后 reject 延迟，此测试挂起/超时
     vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})))
 
@@ -35,7 +38,7 @@ describe('embedOpenAI fetchWithTimeout（abort 兜底，2026-08-29 根因修复�
 
     const err = await rejection
     expect(err).toBeInstanceOf(Error)
-    expect((err as DOMException).name).toBe('AbortError')
+    expect((err as DOMException).name).toBe('TimeoutError')
   })
 
   it('正常响应 → resolve（超时 timer 清理，无 abort 副作用）', async () => {
@@ -80,7 +83,7 @@ describe('fetchWithTimeout 超时参数化（T1：Ollama pull 长任务复用）
     vi.unstubAllGlobals()
   })
 
-  it('不传第三参 → 默认超时仍为 10s（挂起 fetch 在 10s 时刻 reject AbortError）', async () => {
+  it('不传第三参 → 默认超时仍为 10s（挂起 fetch 在 10s 时刻 reject TimeoutError）', async () => {
     // 挂起连接：promise 永不 settle
     vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})))
 
@@ -99,10 +102,10 @@ describe('fetchWithTimeout 超时参数化（T1：Ollama pull 长任务复用）
     const err = await pending
     expect(settled).toBe('rejected')
     expect(err).toBeInstanceOf(Error)
-    expect((err as DOMException).name).toBe('AbortError')
+    expect((err as DOMException).name).toBe('TimeoutError')
   })
 
-  it('显式长超时 300s → 10s 不 reject，推进到 300s 才 reject AbortError', async () => {
+  it('显式长超时 300s → 10s 不 reject，推进到 300s 才 reject TimeoutError', async () => {
     vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})))
 
     let settled: 'pending' | 'rejected' | 'resolved' = 'pending'
@@ -121,7 +124,7 @@ describe('fetchWithTimeout 超时参数化（T1：Ollama pull 长任务复用）
     await vi.advanceTimersByTimeAsync(300_000 - pastDefault)
     const err = await pending
     expect(settled).toBe('rejected')
-    expect((err as DOMException).name).toBe('AbortError')
+    expect((err as DOMException).name).toBe('TimeoutError')
   })
 
   it('正常返回不误伤 → 返回 Response，signal 未被 abort，timer 已清理', async () => {
@@ -149,5 +152,115 @@ describe('fetchWithTimeout 超时参数化（T1：Ollama pull 长任务复用）
     // 若 `fetchWithTimeout` 的 `finally` 漏掉 `clearTimeout`，此处会是 1 → 转红。
     await vi.advanceTimersByTimeAsync(EMBEDDING_TIMEOUT_MS + 1)
     expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+describe('embedding 取消和重试分类', () => {
+  const model = { baseUrl: 'http://127.0.0.1:11434/v1', apiKey: 'test' }
+  beforeEach(() => { vi.useFakeTimers() })
+  afterEach(() => {
+    operation.signal = undefined
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('预取消不发请求；挂起 fetch 主动取消立即抛原始原因并清 timer', async () => {
+    const fetchMock = vi.fn(() => new Promise<Response>(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const cancelled = new AbortController()
+    cancelled.abort()
+    await expect(fetchWithTimeout(model.baseUrl, { signal: cancelled.signal })).rejects.toBe(cancelled.signal.reason)
+    expect(fetchMock).not.toHaveBeenCalled()
+    const controller = new AbortController()
+    const result = fetchWithTimeout(model.baseUrl, { signal: controller.signal }).catch(error => error)
+    await vi.advanceTimersByTimeAsync(0)
+    controller.abort()
+    expect(await result).toBe(controller.signal.reason)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('headers 返回后传给 fetch 的合并 signal 仍响应取消', async () => {
+    let received: AbortSignal | null | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      received = init.signal
+      return new Response('{}')
+    }))
+    const controller = new AbortController()
+    await fetchWithTimeout(model.baseUrl, { signal: controller.signal })
+    controller.abort()
+    expect(received?.aborted).toBe(true)
+    expect(received?.reason).toBe(controller.signal.reason)
+  })
+
+  it('默认当前操作 signal 在挂起读体期间可取消，取消结果不进入 query cache', async () => {
+    const controller = new AbortController()
+    operation.signal = controller.signal
+    const cancel = vi.fn()
+    const fetchMock = vi.fn(async () => new Response(new ReadableStream({ cancel })))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = generateEmbeddings(['cancel-cache-query'], 'openai', model).catch(error => error)
+    await vi.advanceTimersByTimeAsync(0)
+    controller.abort()
+    expect(await pending).toBe(controller.signal.reason)
+    operation.signal = undefined
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ data: [{ embedding: [1], index: 0 }] })))
+    expect(await generateEmbeddings(['cancel-cache-query'], 'openai', model)).toEqual([[1]])
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['openai', 'gemini'] as const)('%s 收到 headers 后读体挂起也在总时限结束', async protocol => {
+    let received: AbortSignal | null | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      received = init.signal
+      return new Response(new ReadableStream())
+    }))
+    const pending = (protocol === 'openai' ? embedOpenAI(['deadline'], model) : embedGemini(['deadline'], model)).catch(error => error)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(await pending).toMatchObject({ name: 'TimeoutError' })
+    expect(received?.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each(['openai', 'gemini'] as const)('%s 永久 HTTP 401 不重试', async protocol => {
+    const fetchMock = vi.fn(async () => new Response('invalid key', { status: 401 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(generateEmbeddings([`401-${protocol}`], protocol, model)).rejects.toThrow('401')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('429 可重试；退避中取消立即停止且不留下 timer', async () => {
+    const controller = new AbortController()
+    const fetchMock = vi.fn(async () => new Response('rate limited', { status: 429 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = generateEmbeddings(['backoff-cancel'], 'openai', model, controller.signal).catch(error => error)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    controller.abort()
+    expect(await pending).toBe(controller.signal.reason)
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('500 短暂失败仍按 500ms 退避重试', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response('busy', { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ embedding: [2], index: 0 }] })))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = generateEmbeddings(['retry-500-query'], 'openai', model)
+    await vi.advanceTimersByTimeAsync(499)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await pending).toEqual([[2]])
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('Gemini 显式 signal 取消传播，不包装响应读体错误', async () => {
+    const controller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream())))
+    const pending = embedGemini(['gemini-cancel'], model, controller.signal).catch(error => error)
+    await vi.advanceTimersByTimeAsync(0)
+    controller.abort()
+    expect(await pending).toBe(controller.signal.reason)
   })
 })

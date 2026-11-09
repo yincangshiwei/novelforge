@@ -28,6 +28,44 @@
 import type { AgentMessage } from '../../stores/agent-store'
 import type { CheckpointData, WorkflowRun, WorkflowStep, WorkflowType, WorkflowParams } from '../../stores/workflow-store'
 import { stripDsmlMarkup } from './dsml-tool-calls'
+import type { ToolCallInfo } from './agent-engine'
+import { executionTarget } from './execution-evidence'
+
+export const TOOL_INTERRUPTED_NOTICE = '应用中断，工具执行已停止；恢复不会自动重放。'
+export const TOOL_UNKNOWN_NOTICE = '应用中断，工具执行结果未知；请先读取实际状态核对，勿直接重放。'
+
+/** 恢复仅封存执行状态，不执行工具；已提交回执不得被中断状态覆盖。 */
+export function sanitizeToolCalls(value: unknown): ToolCallInfo[] {
+  if (!Array.isArray(value)) return []
+  let changed = false
+  const calls: ToolCallInfo[] = []
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || typeof raw.toolName !== 'string') {
+      changed = true
+      continue
+    }
+    const call = raw as ToolCallInfo
+    if (!['pending', 'running', 'waiting_confirm'].includes(call.status)) {
+      calls.push(call)
+      continue
+    }
+    changed = true
+    const unknown = call.status === 'running' && call.receipt?.outcome !== 'committed'
+    calls.push({
+      ...call,
+      status: 'failed',
+      error: [call.error, unknown ? TOOL_UNKNOWN_NOTICE : TOOL_INTERRUPTED_NOTICE].filter(Boolean).join('\n'),
+      ...(unknown ? {
+        receipt: {
+          turnId: call.turnId ?? '', step: call.step ?? 0, callId: call.id,
+          toolName: call.toolName, target: executionTarget(call.toolName, call.arguments ?? {}),
+          ...call.receipt, outcome: 'unknown', verified: false,
+        },
+      } : {}),
+    })
+  }
+  return changed ? calls : value as ToolCallInfo[]
+}
 
 // ===== 文本残片清理（tool_call / tool_result / think 标签） =====
 
@@ -81,15 +119,14 @@ const VALID_ROLES: ReadonlySet<string> = new Set(['user', 'assistant', 'system']
 export function sanitizeAgentMessage(msg: AgentMessage): AgentMessage | null {
   if (!msg || typeof msg.content !== 'string' || !VALID_ROLES.has(msg.role)) return null
   const cleaned = msg.role === 'assistant' ? cleanupMessageText(msg.content) : msg.content
-  // 线②：错误消息 content 为空、失败回执承载在 error 字段——不得按「纯空白消息」过滤
-  // （否则失败回执在会话持久化 → parseArchive → sanitizeMessageList 时被静默丢弃）
-  if (cleaned.trim() === '' && !msg.error && !msg.artifacts?.length) return null
-  if (cleaned === msg.content && msg.streaming !== true) return msg
-  if (cleaned === msg.content) {
-    // 仅陈旧 streaming flag：清 flag，正文不变
-    return { ...msg, streaming: false }
+  const toolCalls = msg.toolCalls === undefined ? undefined : sanitizeToolCalls(msg.toolCalls)
+  // 错误、产物、tool-only 消息均承载执行证据，不按空正文过滤。
+  if (cleaned.trim() === '' && !msg.error && !msg.artifacts?.length && !toolCalls?.length) return null
+  if (cleaned === msg.content && msg.streaming !== true && toolCalls === msg.toolCalls) return msg
+  return {
+    ...msg, content: cleaned, streaming: msg.streaming === true ? false : msg.streaming,
+    ...(toolCalls !== undefined ? { toolCalls } : {}),
   }
-  return { ...msg, content: cleaned, streaming: msg.streaming === true ? false : msg.streaming }
 }
 
 /**

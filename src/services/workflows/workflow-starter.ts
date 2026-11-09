@@ -23,6 +23,22 @@ import { useWorkflowStore } from '../../stores/workflow-store'
 import type { WorkflowDefinition } from '../../stores/workflow-store'
 import { toast } from '../../components/ui/Toast'
 import { DEFAULT_WORDS_PER_CHAPTER } from '../../shared/constants'
+import { useProjectStore } from '../../stores/project-store'
+import type { ToolExecutionContext } from '../agent/tool-registry'
+
+function captureContext(context?: ToolExecutionContext): ToolExecutionContext | undefined {
+  if (!context) return undefined
+  const captured = { ...context, scope: context.scope ?? useProjectStore.getState().currentProject?.path }
+  checkStartup(captured)
+  return captured
+}
+
+function checkStartup(context?: ToolExecutionContext): void {
+  if (!context) return
+  if (context.signal.aborted || context.scope !== useProjectStore.getState().currentProject?.path) {
+    throw new DOMException('工作流启动已取消或项目已切换', 'AbortError')
+  }
+}
 
 /** 工作流启动失败：带错误 code，供调用方语义化映射文案 */
 export class WorkflowStartError extends Error {
@@ -56,9 +72,16 @@ function getWorkflowDisplayName(workflow: string): string {
  * run 一开始就 resolve runId，不等整个 run 跑完。run 体晚到的 rejection 在此吞掉
  * （run 失败已由 workflow-store 的状态呈现），避免 unhandledrejection。
  */
-function startWithReceipt(definition: WorkflowDefinition): Promise<string> {
+function startWithReceipt(definition: WorkflowDefinition, context?: ToolExecutionContext): Promise<string> {
+  checkStartup(context)
   return new Promise<string>((resolve, reject) => {
-    useWorkflowStore.getState().startWorkflow(definition, false, { onStarted: resolve }).catch(reject)
+    useWorkflowStore.getState().startWorkflow(definition, false, {
+      onStarted: resolve,
+      signal: context?.signal,
+      operationId: context?.operationId,
+      scope: context?.scope,
+      beforeStart: () => checkStartup(context),
+    }).catch(reject)
   })
 }
 
@@ -76,24 +99,28 @@ function startWithReceipt(definition: WorkflowDefinition): Promise<string> {
 export async function startChapterWorkflow(
   workflow: 'generate_draft' | 'review' | 'refine' | 'finalize',
   chapterNumber: number,
+  context?: ToolExecutionContext,
 ): Promise<{ runId: string; displayName: string; chapterTag: string }> {
+  context = captureContext(context)
   const displayName = getWorkflowDisplayName(workflow)
   const chapterTag = t('tool.chapterTag').replace('{n}', String(chapterNumber))
   let definition: WorkflowDefinition | null | undefined
   try {
     switch (workflow) {
-      case 'generate_draft': definition = await buildDraftWorkflow(chapterNumber); break
-      case 'review': definition = await buildReviewWorkflow(chapterNumber); break
-      case 'refine': definition = await buildRefineWorkflow(chapterNumber); break
-      case 'finalize': definition = await buildFinalizeWorkflow(chapterNumber); break
+      case 'generate_draft': definition = await buildDraftWorkflow(chapterNumber, context); break
+      case 'review': definition = await buildReviewWorkflow(chapterNumber, context); break
+      case 'refine': definition = await buildRefineWorkflow(chapterNumber, context); break
+      case 'finalize': definition = await buildFinalizeWorkflow(chapterNumber, context); break
     }
   } catch (e) {
     // P0-3 语义归类：WorkflowStartError 透传（ERR_NO_BLUEPRINT 由 buildDraftWorkflow 内 throw）；
     // guard 失败与其他异常 → ERR_GUARD
+    checkStartup(context)
     throw e instanceof WorkflowStartError
       ? e
       : new WorkflowStartError('ERR_GUARD', e instanceof Error ? e.message : String(e))
   }
+  checkStartup(context)
   // 仅 review/refine/finalize 可达（generate_draft 从不返回 null——蓝图缺失已在 buildDraftWorkflow 内 throw ERR_NO_BLUEPRINT）
   if (!definition) {
     // 评审修复（I1）：按 workflow 参数化 ERR_NO_DRAFT 文案——意图层（agent-store handleWritingIntent）
@@ -106,35 +133,42 @@ export async function startChapterWorkflow(
         : t('tool.wfNoReviewDraft')
     throw new WorkflowStartError('ERR_NO_DRAFT', noDraftMsg.replace('{chapter}', String(chapterNumber)))
   }
-  const runId = await startWithReceipt(definition)
+  const runId = await startWithReceipt(definition, context)
   return { runId, displayName, chapterTag }
 }
 
 // ===== 蓝图/架构工作流入口 =====
 
 /** 启动蓝图（目录）工作流——guard 失败 throw ERR_GUARD */
-export async function startBlueprintWorkflow(): Promise<{ runId: string; displayName: string }> {
+export async function startBlueprintWorkflow(context?: ToolExecutionContext): Promise<{ runId: string; displayName: string }> {
+  context = captureContext(context)
   const displayName = getWorkflowDisplayName('generate_blueprint')
   const { guardDirectoryGeneration } = await import('./workflow-guards')
+  checkStartup(context)
   const guard = await guardDirectoryGeneration()
+  checkStartup(context)
   if (!guard.ok) {
     throw new WorkflowStartError('ERR_GUARD', guard.message || t('error.prereqNotMet'))
   }
   const { createDirectoryWorkflow } = await import('./directory-workflow')
-  const runId = await startWithReceipt(createDirectoryWorkflow({ mode: 'full' }))
+  checkStartup(context)
+  const runId = await startWithReceipt(createDirectoryWorkflow({ mode: 'full' }), context)
   return { runId, displayName }
 }
 
 /** 启动架构生成工作流——guard 失败 throw ERR_GUARD */
-export async function startArchitectureWorkflow(): Promise<{ runId: string; displayName: string }> {
+export async function startArchitectureWorkflow(context?: ToolExecutionContext): Promise<{ runId: string; displayName: string }> {
+  context = captureContext(context)
   const displayName = getWorkflowDisplayName('generate_architecture')
   const { guardArchitectureGeneration } = await import('./workflow-guards')
+  checkStartup(context)
   const guard = guardArchitectureGeneration()
   if (!guard.ok) {
     throw new WorkflowStartError('ERR_GUARD', guard.message || t('error.prereqNotMet'))
   }
   const { createArchitectureWorkflow } = await import('./architecture-workflow')
-  const runId = await startWithReceipt(createArchitectureWorkflow())
+  checkStartup(context)
+  const runId = await startWithReceipt(createArchitectureWorkflow(), context)
   return { runId, displayName }
 }
 
@@ -150,7 +184,8 @@ export async function startBookPipelineWorkflow(params: {
   chapterEnd: number
   autoReview?: boolean
   reuseExistingDrafts?: boolean
-}): Promise<{ runId: string; displayName: string; chapterTag: string }> {
+}, context?: ToolExecutionContext): Promise<{ runId: string; displayName: string; chapterTag: string }> {
+  context = captureContext(context)
   const displayName = getWorkflowDisplayName('generate_book')
   const { chapterStart, chapterEnd } = params
 
@@ -161,7 +196,7 @@ export async function startBookPipelineWorkflow(params: {
     throw new WorkflowStartError('ERR_GUARD', t('tool.wfRangeTooLarge').replace('{max}', '100'))
   }
 
-  const { useProjectStore } = await import('../../stores/project-store')
+  checkStartup(context)
   const project = useProjectStore.getState().currentProject
   if (!project) throw new WorkflowStartError('ERR_GUARD', t('error.noProject'))
 
@@ -174,13 +209,16 @@ export async function startBookPipelineWorkflow(params: {
 
   // 复用单章 guard：蓝图存在、角色卡存在、若 start>1 则前一章已定稿且后处理通过
   const { guardChapterWriting } = await import('./workflow-guards')
+  checkStartup(context)
   const guard = await guardChapterWriting(chapterStart)
+  checkStartup(context)
   if (!guard.ok) {
     throw new WorkflowStartError('ERR_GUARD', guard.message || t('error.prereqNotMet'))
   }
 
   // 范围内每一章都必须有蓝图，否则流水线跑到中间才失败，浪费前面章节的 token
   const blueprints = await ipc.invoke('db:blueprint-get-all') as Array<{ chapterNumber: number }> | null
+  checkStartup(context)
   const existing = new Set((blueprints ?? []).map(b => Number(b.chapterNumber)))
   for (let n = chapterStart; n <= chapterEnd; n++) {
     if (!existing.has(n)) {
@@ -189,12 +227,13 @@ export async function startBookPipelineWorkflow(params: {
   }
 
   const { createBookPipelineWorkflow } = await import('./book-pipeline-workflow')
+  checkStartup(context)
   const runId = await startWithReceipt(createBookPipelineWorkflow({
     chapterStart,
     chapterEnd,
     autoReview: params.autoReview,
     reuseExistingDrafts: params.reuseExistingDrafts,
-  }))
+  }), context)
   return {
     runId,
     displayName,
@@ -209,9 +248,10 @@ export async function startBookPipelineWorkflow(params: {
  * idea = Agent 从用户意图提取的「创作脑洞」；规模参数读当前项目配置。
  * onGenerated 复用线③ 第 1 条的快照 + 应用 + 撤销出口（与 NovelConfigEditor 同款）。
  */
-export async function startConfigGenerationWorkflow(idea: string): Promise<{ runId: string; displayName: string }> {
+export async function startConfigGenerationWorkflow(idea: string, context?: ToolExecutionContext): Promise<{ runId: string; displayName: string }> {
+  context = captureContext(context)
   const displayName = getWorkflowDisplayName('config_generation')
-  const { useProjectStore } = await import('../../stores/project-store')
+  checkStartup(context)
   const project = useProjectStore.getState().currentProject
   if (!project) {
     throw new WorkflowStartError('ERR_GUARD', t('error.noProject'))
@@ -219,11 +259,13 @@ export async function startConfigGenerationWorkflow(idea: string): Promise<{ run
   const totalChapters = project.novelConfig.totalChapters || 100
   const wordsPerChapter = project.novelConfig.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER
   const { createConfigGenerationWorkflow } = await import('./architecture-workflow')
+  checkStartup(context)
   const runId = await startWithReceipt(createConfigGenerationWorkflow({
     idea,
     totalChapters,
     wordsPerChapter,
     onGenerated: (parsed) => {
+      if (useProjectStore.getState().currentProject?.path !== project.path) return
       const store = useProjectStore.getState()
       store.snapshotNovelConfig()
       store.updateNovelConfig(parsed)
@@ -238,7 +280,7 @@ export async function startConfigGenerationWorkflow(idea: string): Promise<{ run
         }],
       })
     },
-  }))
+  }), context)
   return { runId, displayName }
 }
 
@@ -315,15 +357,18 @@ async function getLatestReview(chapterNumber: number): Promise<string | null> {
 }
 
 /** 构建写稿工作流 */
-async function buildDraftWorkflow(chapterNumber: number) {
+async function buildDraftWorkflow(chapterNumber: number, context?: ToolExecutionContext) {
   const { guardChapterWriting } = await import('./workflow-guards')
+  checkStartup(context)
   const guard = await guardChapterWriting(chapterNumber)
+  checkStartup(context)
   if (!guard.ok) {
     // guard 失败直接抛出，由 startChapterWorkflow 的 catch 统一转 ERR_GUARD
     throw new Error(guard.message || t('error.prereqNotMet'))
   }
 
   const chapterInfo = await getChapterInfoFromBlueprint(chapterNumber)
+  checkStartup(context)
   if (!chapterInfo) {
     // P0-3：蓝图缺失单独归类（ERR_NO_BLUEPRINT），避免被 catch 误归为 ERR_GUARD
     throw new WorkflowStartError(
@@ -337,8 +382,9 @@ async function buildDraftWorkflow(chapterNumber: number) {
 }
 
 /** 构建审稿工作流 */
-async function buildReviewWorkflow(chapterNumber: number) {
+async function buildReviewWorkflow(chapterNumber: number, context?: ToolExecutionContext) {
   const draft = await getLatestDraft(chapterNumber)
+  checkStartup(context)
   if (!draft) return null
 
   const { createReviewOnlyWorkflow } = await import('./chapter-workflow')
@@ -351,11 +397,13 @@ async function buildReviewWorkflow(chapterNumber: number) {
 }
 
 /** 构建修稿工作流 */
-async function buildRefineWorkflow(chapterNumber: number) {
+async function buildRefineWorkflow(chapterNumber: number, context?: ToolExecutionContext) {
   const draft = await getLatestDraft(chapterNumber)
+  checkStartup(context)
   if (!draft) return null
 
   const reviewReport = await getLatestReview(chapterNumber)
+  checkStartup(context)
 
   if (reviewReport) {
     const { createRefineFromReviewWorkflow } = await import('./chapter-workflow')
@@ -379,8 +427,9 @@ async function buildRefineWorkflow(chapterNumber: number) {
 }
 
 /** 构建定稿工作流 */
-async function buildFinalizeWorkflow(chapterNumber: number) {
+async function buildFinalizeWorkflow(chapterNumber: number, context?: ToolExecutionContext) {
   const draft = await getLatestDraft(chapterNumber)
+  checkStartup(context)
   if (!draft) return null
 
   const { createFinalizeWorkflow } = await import('./chapter-workflow')

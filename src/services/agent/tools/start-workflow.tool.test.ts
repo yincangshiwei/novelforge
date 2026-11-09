@@ -17,6 +17,28 @@ vi.mock('../../workflows/workflow-starter', async (importOriginal) => {
 
 const mockStartChapter = vi.mocked(startChapterWorkflow)
 
+describe('start_workflow 取消上下文', () => {
+  it('预取消不启动；区间在首个启动回执后取消不得启动后续章节', async () => {
+    vi.clearAllMocks()
+    const controller = new AbortController()
+    const context = { signal: controller.signal, turnId: 't', callId: 'wf-cancel', step: 1, operationId: 'wf-cancel' }
+    controller.abort()
+    await expect(startWorkflowTool.execute({ workflow: 'review', chapter_number: 1 }, context)).rejects.toThrow('工作流未启动')
+    expect(mockStartChapter).not.toHaveBeenCalled()
+    const next = new AbortController()
+    context.signal = next.signal
+    mockStartChapter.mockImplementationOnce(async () => {
+      next.abort()
+      return { runId: 'run-cancel', displayName: '审稿', chapterTag: '第1章' }
+    })
+    const result = await startWorkflowTool.execute({ workflow: 'review', chapter_number: 1, chapter_end: 3 }, context)
+    expect(mockStartChapter).toHaveBeenCalledTimes(1)
+    expect(mockStartChapter).toHaveBeenCalledWith('review', 1, { ...context, operationId: 'wf-cancel:chapter:1' })
+    expect(result).toMatchObject({ success: false, executionState: 'committed' })
+    expect(result.artifacts).toHaveLength(1)
+  })
+})
+
 describe('start_workflow 错误语义映射', () => {
   beforeEach(() => {
     vi.clearAllMocks()

@@ -3,7 +3,7 @@
  */
 import { t } from '../../../shared/locale'
 import { buildAgentTool } from '../tool-registry'
-import { ipc } from '../../ipc-client'
+import { createToolIpc } from '../tool-ipc'
 import { useProjectStore } from '../../../stores/project-store'
 
 
@@ -21,7 +21,9 @@ export const readArchitectureTool = buildAgentTool({
     },
   },
   requiresConfirmation: false,
-  execute: async (args) => {
+  execute: async (args, context) => {
+    const toolIpc = createToolIpc(context)
+    if (context?.signal.aborted) return { success: false, executionState: 'not_committed', content: '', error: '操作已取消' }
     const project = useProjectStore.getState().currentProject
     if (!project) {
       return { success: false, content: '', error: t('error.noProject') }
@@ -30,7 +32,7 @@ export const readArchitectureTool = buildAgentTool({
     const fileName = args.file_name as string | undefined
 
     try {
-      const core = await ipc.invoke('db:project-core-get')
+      const core = await toolIpc.invoke('db:project-core-get')
       if (!core) {
         return { success: false, content: '', error: t('error.archNotInitialized') }
       }

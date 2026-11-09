@@ -10,6 +10,7 @@ import { fetchWithTimeout } from '../net/fetch-with-timeout'
 import { createStreamAdapter } from './stream-adapter'
 import type { InternalStreamEvent } from '../../src/shared/llm-stream-events'
 import type { LLMUsage } from './provider.interface'
+import { toOpenAIMessages, toolsForOpenAI, normalizeFinishReason, validateToolCalls, type LLMChatMessage, type LLMToolCall, type LLMFinishReason } from '../../src/shared/llm-tool-protocol'
 
 /** 带 HTTP 状态码的错误对象，用于重试判断 */
 class HttpError extends Error {
@@ -22,13 +23,16 @@ class HttpError extends Error {
 }
 
 export class OpenAIProvider implements ILLMProvider {
-  async generate(model: ResolvedModelProfile, messages: Array<{ role: string; content: string }>, opts: LLMGenerateOptions): Promise<LLMResponse> {
+  async generate(model: ResolvedModelProfile, messages: LLMChatMessage[], opts: LLMGenerateOptions): Promise<LLMResponse> {
+    if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
     return withRetry(async () => {
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       const url = buildOpenAIUrl(model.baseUrl, 'chat')
 
       const body: Record<string, unknown> = {
         model: model.modelName,
-        messages,
+        messages: toOpenAIMessages(messages),
+        ...(opts.tools?.length ? { tools: toolsForOpenAI(opts.tools), tool_choice: opts.toolChoice ?? 'auto' } : {}),
         max_tokens: opts.maxTokens ?? model.maxTokens,
         stream: false,
       }
@@ -49,10 +53,16 @@ export class OpenAIProvider implements ILLMProvider {
           'Authorization': `Bearer ${model.apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: opts.signal,
+      }).catch(error => {
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+        throw error
       })
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
 
       if (!res.ok) {
         const text = await res.text().catch(() => '')
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         // text 为服务端原始响应（可能含 $）→ 箭头函数 replacer 防 $& 语义
         const errorMsg = t('error.apiCallFailed').replace('{status}', String(res.status)).replace('{err}', () => text)
         // 抛出 HttpError 供 withRetry 判断是否可重试
@@ -64,7 +74,7 @@ export class OpenAIProvider implements ILLMProvider {
       }
 
       const data = await res.json() as {
-        choices: Array<{ message: { content: string; reasoning_content?: string } }>
+        choices: Array<{ finish_reason?: string; message: { content: string; reasoning_content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>
         usage?: {
           prompt_tokens: number; completion_tokens: number; total_tokens: number
           // OpenAI: prompt_tokens_details.cached_tokens / DeepSeek: prompt_cache_hit_tokens
@@ -73,12 +83,19 @@ export class OpenAIProvider implements ILLMProvider {
         }
       }
 
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       let finalContent = data.choices?.[0]?.message?.content ?? ''
       finalContent = finalContent.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim()
 
       return {
         success: true,
         content: finalContent,
+        step: {
+          text: finalContent,
+          toolCalls: validateToolCalls((data.choices?.[0]?.message?.tool_calls ?? []).map(c => ({ id: c.id, name: c.function.name, arguments: JSON.parse(c.function.arguments) }))),
+          finishReason: normalizeFinishReason(data.choices?.[0]?.finish_reason),
+          terminalSeen: Boolean(data.choices?.[0]?.finish_reason),
+        },
         usage: data.usage ? {
           promptTokens: data.usage.prompt_tokens,
           completionTokens: data.usage.completion_tokens,
@@ -86,7 +103,8 @@ export class OpenAIProvider implements ILLMProvider {
           cachedTokens: data.usage.prompt_cache_hit_tokens ?? data.usage.prompt_tokens_details?.cached_tokens ?? 0,
         } : undefined,
       }
-    }).catch((error) => {
+    }, { signal: opts.signal }).catch((error) => {
+      if (opts.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw new DOMException('Operation cancelled', 'AbortError')
       // withRetry 耗尽重试后返回友好的错误
       if (error instanceof HttpError) {
         let errorMsg = error.message
@@ -103,7 +121,7 @@ export class OpenAIProvider implements ILLMProvider {
     })
   }
 
-  async generateStream(model: ResolvedModelProfile, messages: Array<{ role: string; content: string }>, opts: LLMStreamOptions): Promise<void> {
+  async generateStream(model: ResolvedModelProfile, messages: LLMChatMessage[], opts: LLMStreamOptions): Promise<void> {
     // 已输出内容标记：中途断流（网络错误）不得重试——重试会重复推送已输出前缀
     let emittedAny = false
     await withStreamRetry(async () => {
@@ -111,7 +129,8 @@ export class OpenAIProvider implements ILLMProvider {
 
       const body: Record<string, unknown> = {
         model: model.modelName,
-        messages,
+        messages: toOpenAIMessages(messages),
+        ...(opts.tools?.length ? { tools: toolsForOpenAI(opts.tools), tool_choice: opts.toolChoice ?? 'auto' } : {}),
         max_tokens: opts.maxTokens ?? model.maxTokens,
         stream: true,
       }
@@ -133,10 +152,15 @@ export class OpenAIProvider implements ILLMProvider {
         },
         body: JSON.stringify(body),
         signal: opts.signal,
+      }).catch(error => {
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+        throw error
       })
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
 
       if (!res.ok) {
         const text = await res.text()
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         // text 为服务端原始响应（可能含 $）→ 箭头函数 replacer 防 $& 语义
         const errorMsg = t('error.apiCallFailed').replace('{status}', String(res.status)).replace('{err}', () => text)
         // 可重试的 HTTP 状态码 → 抛出以便 withStreamRetry 处理
@@ -158,6 +182,8 @@ export class OpenAIProvider implements ILLMProvider {
       let fullText = ''
       let isThinking = false
       let lastUsage: LLMUsage | undefined
+      let finishReason: LLMFinishReason = 'unknown'
+      const toolCalls: LLMToolCall[] = []
       const adapter = createStreamAdapter('openai', model.modelName)
       if (!adapter) {
         opts.onError(t('error.streamReadFailed'))
@@ -171,9 +197,11 @@ export class OpenAIProvider implements ILLMProvider {
             return false
           }
           if (event.type === 'finish') {
+            finishReason = event.reason
             if (event.usage) lastUsage = event.usage
             continue
           }
+          if (event.type === 'tool_call_delta') emittedAny = true
           if (event.type === 'reasoning_delta') {
             let emit = ''
             if (!isThinking) {
@@ -199,10 +227,8 @@ export class OpenAIProvider implements ILLMProvider {
             continue
           }
           if (event.type === 'tool_call_complete') {
-            const xml = `<tool_call>${JSON.stringify({ name: event.name, arguments: event.args })}</tool_call>`
-            fullText += xml
+            toolCalls.push({ id: event.id, name: event.name, arguments: event.args as Record<string, unknown> })
             emittedAny = true
-            opts.onChunk(xml)
           }
         }
         return true
@@ -211,6 +237,7 @@ export class OpenAIProvider implements ILLMProvider {
       let reading = true
       while (reading) {
         const { done, value } = await reader.read()
+        if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         if (done) { reading = false; break }
         if (!consumeEvents(adapter.push(decoder.decode(value, { stream: true })))) return
       }
@@ -223,8 +250,13 @@ export class OpenAIProvider implements ILLMProvider {
       }
 
       const cleanText = fullText.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim()
-      opts.onDone(cleanText, lastUsage)
-    }, { canRetry: () => !emittedAny }).catch((error) => {
+      if (!['stop', 'tool_use'].includes(finishReason)) {
+        opts.onError(`模型流未正常结束：${finishReason}`)
+        return
+      }
+      if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
+      opts.onDone(cleanText, lastUsage, { text: cleanText, toolCalls: validateToolCalls(toolCalls), finishReason, terminalSeen: true })
+    }, { signal: opts.signal, canRetry: () => !emittedAny }).catch((error) => {
       // withStreamRetry 重试耗尽后的最终错误处理
       if ((error as Error).name === 'AbortError') {
         opts.onError(t('error.generationCancelled'))

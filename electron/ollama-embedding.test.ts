@@ -372,7 +372,11 @@ describe('pullModel 长超时（300s，非默认 10s）', () => {
   })
 
   it('挂起 fetch：10s 未 reject，推进到 300s 才超时返回 {success:false}', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})))
+    let received: AbortSignal | null | undefined
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => {
+      received = init.signal
+      return new Promise<Response>(() => {})
+    }))
 
     let settled = false
     const pending = pullModel(BASE, 'bge-m3').then((r) => { settled = true; return r })
@@ -382,12 +386,15 @@ describe('pullModel 长超时（300s，非默认 10s）', () => {
     expect(settled).toBe(false)
 
     // 推进到 300s 超时点 → abort + 立即返回失败（供 UI 展示/重试）
-    await vi.advanceTimersByTimeAsync(300_000 - 10_000)
+    await vi.advanceTimersByTimeAsync(300_000 - 10_001)
     const result = await pending
 
     expect(settled).toBe(true)
     expect(result.success).toBe(false)
-    expect(String(result.error)).toMatch(/abort/i)
+    expect(String(result.error)).toMatch(/timed out/i)
+    expect(received?.aborted).toBe(true)
+    expect(received?.reason).toMatchObject({ name: 'TimeoutError' })
+    expect(vi.getTimerCount()).toBe(0)
   })
 })
 
@@ -513,7 +520,7 @@ describe('embedLocal 冷启动超时（真机：模型加载 9.53s > 默认 10s�
     expect(settled).toEqual([])
   })
 
-  it('到 120s 本地档超时才中断（AbortError，供 T3 降级链捕获）', async () => {
+  it('到 120s 本地档超时才中断（TimeoutError，供 T3 降级链捕获）', async () => {
     vi.stubGlobal('fetch', hangingFetch())
 
     const settled = trackSettle()
@@ -521,7 +528,7 @@ describe('embedLocal 冷启动超时（真机：模型加载 9.53s > 默认 10s�
     expect(settled).toEqual([])
 
     await vi.advanceTimersByTimeAsync(120_000 - 10_001)
-    expect(settled).toEqual(['AbortError'])
+    expect(settled).toEqual(['TimeoutError'])
   })
 
   it('请求体带 keep_alive（避免闲置 5 分钟后每次重付 9.53s 加载）', async () => {
@@ -532,5 +539,105 @@ describe('embedLocal 冷启动超时（真机：模型加载 9.53s > 默认 10s�
 
     const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
     expect(JSON.parse(String(init.body))).toMatchObject({ keep_alive: '30m' })
+  })
+})
+
+describe('Ollama 完整消费超时', () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
+  it('embed 收到 headers 后 JSON 挂起，120 秒总时限仍抛 TimeoutError', async () => {
+    vi.useFakeTimers()
+    let received: AbortSignal | null | undefined
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      received = init.signal
+      return new Response(new ReadableStream())
+    }))
+    const pending = embedLocal(['synthetic'], BASE, 'synthetic').catch(error => error)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(await pending).toMatchObject({ name: 'TimeoutError' })
+    expect(received?.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+  it('pull 首个进度后挂起，300 秒总时限取消 reader 不再回调', async () => {
+    vi.useFakeTimers()
+    const cancel = vi.fn()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"status":"downloading"}\n')) }, cancel,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream)))
+    const progress = vi.fn()
+    const pending = pullModel(BASE, 'synthetic', progress)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(progress).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(300_000)
+    expect(await pending).toMatchObject({ success: false })
+    await Promise.resolve()
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(progress).toHaveBeenCalledOnce()
+    expect(stream.locked).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+describe('Ollama 显式取消', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('detect/embed/pull 预取消均抛原始原因且不发请求', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+    controller.abort()
+    await expect(detectOllama(BASE, controller.signal)).rejects.toBe(controller.signal.reason)
+    await expect(embedLocal(['a'], BASE, 'bge-m3', controller.signal)).rejects.toBe(controller.signal.reason)
+    await expect(pullModel(BASE, 'bge-m3', undefined, controller.signal)).rejects.toBe(controller.signal.reason)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['detect', 'embed', 'pull'] as const)('%s 挂起请求取消不包装异常', async kind => {
+    let started!: () => void
+    const ready = new Promise<void>(resolve => { started = resolve })
+    vi.stubGlobal('fetch', vi.fn(() => {
+      started()
+      return new Promise<Response>(() => {})
+    }))
+    const controller = new AbortController()
+    const pending = (kind === 'detect' ? detectOllama(BASE, controller.signal)
+      : kind === 'embed' ? embedLocal(['a'], BASE, 'bge-m3', controller.signal)
+        : pullModel(BASE, 'bge-m3', undefined, controller.signal)).catch(error => error)
+    await ready
+    controller.abort()
+    expect(await pending).toBe(controller.signal.reason)
+  })
+
+  it.each(['detect', 'embed'] as const)('%s 已收 headers 后取消挂起 JSON 读体', async kind => {
+    let reading!: () => void
+    const ready = new Promise<void>(resolve => { reading = resolve })
+    const body = new ReadableStream<Uint8Array>({ pull() { reading() } }, { highWaterMark: 0 })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body)))
+    const controller = new AbortController()
+    const pending = (kind === 'detect' ? detectOllama(BASE, controller.signal)
+      : embedLocal(['a'], BASE, 'bge-m3', controller.signal)).catch(error => error)
+    await ready
+    controller.abort()
+    expect(await pending).toBe(controller.signal.reason)
+  })
+
+  it('pull NDJSON 流等待取消关闭 reader，不继续进度回调', async () => {
+    let progress!: () => void
+    const ready = new Promise<void>(resolve => { progress = resolve })
+    const cancel = vi.fn()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"status":"downloading"}\n')) },
+      cancel,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream)))
+    const controller = new AbortController()
+    const onProgress = vi.fn(() => progress())
+    const pending = pullModel(BASE, 'bge-m3', onProgress, controller.signal).catch(error => error)
+    await ready
+    controller.abort()
+    expect(await pending).toBe(controller.signal.reason)
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(onProgress).toHaveBeenCalledTimes(1)
+    expect(stream.locked).toBe(false)
   })
 })

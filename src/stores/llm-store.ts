@@ -19,7 +19,7 @@ import { ModelRouter, type CallPurpose, type ModelRouteConfig, type ModelTier, D
 /** 流式生成的回调 */
 interface StreamCallbacks {
   onChunk?: (chunk: string) => void
-  onDone?: (fullText: string, usage?: TokenUsage) => void
+  onDone?: (fullText: string, usage?: TokenUsage, step?: import('../shared/llm-tool-protocol').LLMStepResult) => void
   onError?: (error: string) => void
 }
 
@@ -129,16 +129,16 @@ interface LLMState {
   setDefaultEmbeddingModel: (modelId: string) => void
   /** 非流式生成 */
   generate: (
-    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    messages: import('../shared/llm-tool-protocol').LLMChatMessage[],
     modelId?: string,
-    options?: { responseFormat?: { type: string }; thinking?: boolean; priority?: number; temperature?: number }
+    options?: { responseFormat?: { type: string }; thinking?: boolean; priority?: number; temperature?: number; tools?: import('../shared/llm-tool-protocol').LLMToolDefinition[]; toolChoice?: import('../shared/llm-tool-protocol').LLMToolChoice; requestId?: string; signal?: AbortSignal }
   ) => Promise<LLMResponse>
   /** 流式生成 */
   generateStream: (
-    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    messages: import('../shared/llm-tool-protocol').LLMChatMessage[],
     callbacks: StreamCallbacks,
     modelId?: string,
-    options?: { responseFormat?: { type: string }; thinking?: boolean; priority?: number; temperature?: number }
+    options?: { responseFormat?: { type: string }; thinking?: boolean; priority?: number; temperature?: number; tools?: import('../shared/llm-tool-protocol').LLMToolDefinition[]; toolChoice?: import('../shared/llm-tool-protocol').LLMToolChoice }
   ) => Promise<string>
   /** 取消生成 */
   cancelGeneration: (requestId: string) => Promise<void>
@@ -396,13 +396,45 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
   generate: async (messages, modelId, options) => {
     const mid = modelId ?? get().defaultModelId
     if (!mid) return { success: false, content: '', error: t('error.noDefaultModel') }
-    return ipc.invoke('llm:generate', {
-      modelId: mid,
-      messages,
-      temperature: resolveRequestTemperature(options),
-      responseFormat: options?.responseFormat as { type: 'json_object' | 'text' } | undefined,
-      thinking: options?.thinking,
-      priority: options?.priority ?? 10,
+    const signal = options?.signal
+    const cancelled = (): LLMResponse => ({ success: false, content: '', error: t('error.requestCancelled') })
+    if (signal?.aborted) return cancelled()
+    const requestId = options?.requestId ?? crypto.randomUUID()
+    return new Promise<LLMResponse>((resolve, reject) => {
+      let settled = false
+      let sent = false
+      const cleanup = () => signal?.removeEventListener('abort', onAbort)
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        if (sent) void ipc.invoke('llm:cancel', requestId).catch(() => {})
+        resolve(cancelled())
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) { onAbort(); return }
+      sent = true
+      ipc.invoke('llm:generate', {
+        requestId,
+        modelId: mid,
+        messages,
+        temperature: resolveRequestTemperature(options),
+        responseFormat: options?.responseFormat as { type: 'json_object' | 'text' } | undefined,
+        thinking: options?.thinking,
+        tools: options?.tools,
+        toolChoice: options?.toolChoice,
+        priority: options?.priority ?? 10,
+      }).then((result) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve(result)
+      }, (error) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(error)
+      })
     })
   },
 
@@ -424,7 +456,7 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
 
     const unsubDone = ipc.on('llm:stream-done', (data) => {
       if (data.requestId === requestId) {
-        callbacks.onDone?.(data.fullText, data.usage)
+        callbacks.onDone?.(data.fullText, data.usage, data.step)
         cleanup()
       }
     })
@@ -451,15 +483,25 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
     set({ activeRequests: reqs })
 
     // 发起流式请求
-    await ipc.invoke('llm:generate-stream', requestId, {
+    const started = await ipc.invoke('llm:generate-stream', requestId, {
       modelId: mid,
       messages,
       stream: true,
       temperature: resolveRequestTemperature(options),
       responseFormat: options?.responseFormat as { type: 'json_object' | 'text' } | undefined,
       thinking: options?.thinking,
+      tools: options?.tools,
+      toolChoice: options?.toolChoice,
       priority: options?.priority ?? 10,
+    }).catch(error => {
+      cleanup()
+      callbacks.onError?.(String(error))
+      throw error
     })
+    if (!started.started) {
+      cleanup()
+      callbacks.onError?.('模型流式请求未启动')
+    }
 
     return requestId
   },

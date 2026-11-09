@@ -28,6 +28,7 @@ export const EN_US_ROLE: Partial<Record<string, string>> = {
   'generate_chapter_notes': 'You are a professional web novel structure analyst.',
   'update_character_cards': 'You are a rigorous novel character archive manager, skilled at tracking multi-dimensional character state changes.',
   'extract_initial_characters': 'You are a professional novel data structuring expert.',
+  'extract_planned_characters': 'You are a rigorous character-planning archivist. Record only facts explicitly supported by the plans.',
   'extract_from_finalized': 'You are a rigorous novel character archive expert, skilled at reconstructing character settings from textual details.',
   'extract_from_finalized_batch': 'You are a rigorous novel character archive expert, skilled at reconstructing character settings from textual details.',
 }
@@ -781,6 +782,13 @@ Note: updatedAtChapter is always {{chapter_number}}. Output only existing charac
 ]
 
 If there are no extractable characters in the map, return an empty array [].`,
+
+  'extract_planned_characters': `Novel genre: {{genre}}
+Planning data: {{character_dynamics}}
+Extract only new named characters from blueprints.characters who actually perform actions described in keyEvents or purpose. Exclude characters in existingNames and their aliases, unnamed bystanders, groups, generic labels, and people who are merely mentioned. Do not invent names, appearance, abilities, or backgrounds; leave unspecified fields empty.
+Set role to protagonist/antagonist/supporting/minor. Assess tier independently: 1 = sustained influence on the main plot with an ongoing character arc; 2 = decisive influence on a phase or subplot; 3 = local involvement. A new appearance does not make a character major; use tier 3 when evidence is insufficient.
+notes must state the concrete plot function, evidence for the tier, and planned chapters or phases of participation. Do not generate currentState or actual appearance statistics: future plans are not events that have already happened.
+Return only a JSON array. Each item must contain name, role, tier, appearance, personality, background, abilities, motivation, relationships, arc, notes, tags. Return [] if there are no new characters.`,
 
   'extract_from_finalized': `Extract the static archive information of the character {{character_name}} from the following finalized chapter excerpts.
 

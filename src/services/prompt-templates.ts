@@ -213,6 +213,7 @@ export const PROMPT_VAR_KEYS: Record<string, TextKey> = {
   '章节标题': 'prompt.var.chapter_name',
   '现有角色卡 JSON 数组（包含 name/role 等基础信息）': 'prompt.var.cards_json',
   '角色图谱纯文本': 'prompt.var.char_map_text',
+  '已有姓名与章节蓝图 JSON': 'prompt.var.planned_characters_json',
   '角色名': 'prompt.var.character_name',
   '该角色出现的章节相关段落(带章节号)': 'prompt.var.chapters_segments',
   '多角色及其相关章节段落(带章节号)': 'prompt.var.characters_segments',

@@ -11,6 +11,9 @@
 import { buildAgentTool } from '../tool-registry'
 import { t } from '../../../shared/locale'
 import { useLayoutStore } from '../../../stores/layout-store'
+import { useProjectStore } from '../../../stores/project-store'
+import { findWorkflowOperation } from '../../../stores/workflow-store'
+import { ToolExecutionInterrupted } from '../tool-execution'
 import {
   startChapterWorkflow,
   startBlueprintWorkflow,
@@ -56,7 +59,31 @@ export const startWorkflowTool = buildAgentTool({
   },
   requiresConfirmation: true,
   isReadOnly: false,
-  execute: async (args) => {
+  reconcile: async (args, context) => {
+    const project = useProjectStore.getState().currentProject
+    if (!project || context.signal.aborted || (context.scope && context.scope !== project.path)) return undefined
+    const workflow = String(args.workflow ?? '')
+    const ranged = ['generate_draft', 'review', 'refine', 'finalize'].includes(workflow) && args.chapter_end != null
+    const start = Number(args.chapter_number)
+    const end = Number(args.chapter_end)
+    if (ranged && (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end - start + 1 > MAX_RANGE_CHAPTERS)) return undefined
+    const operations = ranged ? Array.from({ length: end - start + 1 }, (_, i) => `${context.operationId}:chapter:${start + i}`) : [context.operationId]
+    const runs = operations.map(id => findWorkflowOperation(id, context.scope))
+    if (runs.some(run => !run || run.startupState !== 'started')) return undefined
+    return {
+      success: true,
+      executionState: 'committed',
+      content: '已核验原操作对应工作流启动记录；不重复启动。\n' + runs.map((run, index) => `${ranged ? `第${start + index}章：` : ''}${run!.id}，状态=${run!.status}`).join('\n'),
+      artifacts: runs.map((run, index) => ({ type: 'workflow_started' as const, name: run!.title, metadata: { runId: run!.id, workflow, operationId: run!.operationId, status: run!.status, ...(ranged ? { chapterNumber: start + index } : {}) } })),
+      persistence: { target: `workflow:${workflow}`, verified: true, projectPath: project.path },
+    }
+  },
+  execute: async (args, context) => {
+    const projectPath = useProjectStore.getState().currentProject?.path
+    const assertActive = () => {
+      if (context?.signal.aborted || (context && useProjectStore.getState().currentProject?.path !== projectPath) || (context?.scope && context.scope !== projectPath)) throw new ToolExecutionInterrupted('操作已取消或项目已切换，工作流未启动', false)
+    }
+    assertActive()
     const workflow = args.workflow as string
     // null 归一（2026-10-02 复审 M1）：模型对未用的可选参数常发 null——一律视为未传（否则误报「区间无效」）
     const chapterNumber = args.chapter_number == null ? undefined : (args.chapter_number as number)
@@ -83,9 +110,10 @@ export const startWorkflowTool = buildAgentTool({
           chapterStart: start,
           chapterEnd: end,
           autoReview: args.auto_review !== false,
-        })
+        }, context)
         return {
           success: true,
+          executionState: 'committed',
           content: t('tool.bookPipelineStarted')
             .replace('{name}', result.displayName)
             .replace('{range}', result.chapterTag),
@@ -121,6 +149,7 @@ export const startWorkflowTool = buildAgentTool({
     }
 
     // 打开右侧面板到 AI 输出视图
+    assertActive()
     useLayoutStore.getState().openRightPanel('ai-output')
 
     try {
@@ -135,9 +164,17 @@ export const startWorkflowTool = buildAgentTool({
             const started: { runId: string; displayName: string; chapterTag: string }[] = []
             try {
               for (let n = chapterNumber!; n <= chapterEnd; n++) {
-                started.push(await startChapterWorkflow(workflow as 'generate_draft' | 'review' | 'refine' | 'finalize', n))
+                assertActive()
+                started.push(await startChapterWorkflow(workflow as 'generate_draft' | 'review' | 'refine' | 'finalize', n, context ? { ...context, operationId: `${context.operationId}:chapter:${n}` } : undefined))
               }
             } catch (e) {
+              if (e instanceof ToolExecutionInterrupted && started.length > 0) return {
+                success: false,
+                executionState: 'committed',
+                content: '',
+                error: `区间启动已中断；已启动：${started.map(r => r.chapterTag).join('、')}，不得重复启动。`,
+                artifacts: started.map((r, index) => ({ type: 'workflow_started' as const, name: `${r.displayName} ${r.chapterTag}`, metadata: { runId: r.runId, workflow, chapterNumber: chapterNumber! + index } })),
+              }
               // 部分失败（2026-10-02 评审 I3）：已启动清单并入错误——否则模型会重发整个区间（重复启动/重复花费）
               if (e instanceof WorkflowStartError && started.length > 0) {
                 const startedTags = started.map(r => r.chapterTag).join('、')
@@ -156,25 +193,29 @@ export const startWorkflowTool = buildAgentTool({
           const result = await startChapterWorkflow(
             workflow as 'generate_draft' | 'review' | 'refine' | 'finalize',
             chapterNumber!,
+            context,
           )
           return {
             success: true,
+            executionState: 'committed',
             content: t('tool.workflowStarted').replace('{name}', result.displayName).replace('{chapter}', result.chapterTag),
             artifacts: [{ type: 'workflow_started', name: `${result.displayName} ${result.chapterTag}`, metadata: { runId: result.runId, workflow, chapterNumber } }],
           }
         }
         case 'generate_blueprint': {
-          const result = await startBlueprintWorkflow()
+          const result = await startBlueprintWorkflow(context)
           return {
             success: true,
+            executionState: 'committed',
             content: t('tool.workflowStartedNoChapter').replace('{name}', result.displayName),
             artifacts: [{ type: 'workflow_started', name: result.displayName, metadata: { runId: result.runId, workflow } }],
           }
         }
         case 'generate_architecture': {
-          const result = await startArchitectureWorkflow()
+          const result = await startArchitectureWorkflow(context)
           return {
             success: true,
+            executionState: 'committed',
             content: t('tool.workflowStartedNoChapter').replace('{name}', result.displayName),
             artifacts: [{ type: 'workflow_started', name: result.displayName, metadata: { runId: result.runId, workflow } }],
           }
@@ -184,9 +225,10 @@ export const startWorkflowTool = buildAgentTool({
           if (!idea) {
             return { success: false, content: '', error: t('tool.wfNeedIdea') }
           }
-          const result = await startConfigGenerationWorkflow(idea)
+          const result = await startConfigGenerationWorkflow(idea, context)
           return {
             success: true,
+            executionState: 'committed',
             content: t('tool.workflowStartedNoChapter').replace('{name}', result.displayName),
             artifacts: [{ type: 'workflow_started', name: result.displayName, metadata: { runId: result.runId, workflow } }],
           }

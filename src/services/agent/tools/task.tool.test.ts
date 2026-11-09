@@ -34,6 +34,19 @@ beforeEach(() => {
 })
 
 describe('task 工具（模型侧通道）', () => {
+  it('执行上下文signal传至子任务，预取消不派发', async () => {
+    setConv()
+    const spy = vi.spyOn(useAgentStore.getState(), 'runSubAgentTask').mockResolvedValue({ text: 'R', ok: true })
+    const controller = new AbortController()
+    const context = { signal: controller.signal, turnId: 't', callId: 'c', operationId: 'c', step: 1 }
+    try {
+      await taskTool.execute({ description: '查玉佩' }, context)
+      expect(spy).toHaveBeenCalledWith(expect.objectContaining({ signal: controller.signal }))
+      spy.mockClear(); controller.abort()
+      expect((await taskTool.execute({ description: '查玉佩' }, context)).success).toBe(false)
+      expect(spy).not.toHaveBeenCalled()
+    } finally { spy.mockRestore() }
+  })
   it('只读、免确认（派发本身不打扰用户；子 agent 的写操作各自过审批卡）', () => {
     expect(taskTool.requiresConfirmation).toBe(false)
     expect(taskTool.isReadOnly).toBe(true)
