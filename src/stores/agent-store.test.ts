@@ -138,6 +138,120 @@ beforeEach(() => {
   Object.defineProperty(window, 'velaAPI', { value: { invoke: mockInvoke }, configurable: true })
 })
 
+describe('历史会话同步打开所属项目', () => {
+  beforeEach(() => {
+    useAgentStore.setState({ generating: false, openingConversationId: null, showHistory: true })
+    useProjectStore.setState({ loading: false })
+  })
+
+  const makeTarget = () => {
+    const project = useProjectStore.getState().currentProject!
+    const target: AgentConversation = {
+      id: 'history-target', title: '项目历史', messages: [], modelId: null,
+      createdAt: 1, updatedAt: 1, projectPath: project.path, projectName: project.name,
+    }
+    useAgentStore.setState({ conversations: [target], activeConversationId: 'previous', showHistory: true })
+    return { project, target }
+  }
+
+  it.each(['未选择项目', '其他项目'])('%s时先打开所属项目再激活会话', async scenario => {
+    const { project, target } = makeTarget()
+    useProjectStore.setState({ currentProject: scenario === '未选择项目' ? null : { ...project, path: '/other-project' } })
+    const open = vi.spyOn(useProjectStore.getState(), 'openProject').mockImplementation(async path => {
+      expect(path).toBe(target.projectPath)
+      expect(useAgentStore.getState().activeConversationId).toBe('previous')
+      expect(useAgentStore.getState().showHistory).toBe(true)
+      useProjectStore.setState({ currentProject: project })
+      return true
+    })
+    try {
+      expect(await useAgentStore.getState().openConversation(target.id)).toBe(true)
+      expect(open).toHaveBeenCalledExactlyOnceWith(project.path)
+      expect(useAgentStore.getState().activeConversationId).toBe(target.id)
+      expect(useAgentStore.getState().showHistory).toBe(false)
+      expect(useAgentStore.getState().openingConversationId).toBeNull()
+    } finally { open.mockRestore() }
+  })
+
+  it.each(['同项目', '无所属项目'])('%s直接恢复会话，不重复打开项目', async scenario => {
+    const { target } = makeTarget()
+    if (scenario === '无所属项目') useAgentStore.setState({ conversations: [{ ...target, projectPath: undefined }] })
+    const open = vi.spyOn(useProjectStore.getState(), 'openProject')
+    try {
+      expect(await useAgentStore.getState().openConversation(target.id)).toBe(true)
+      expect(open).not.toHaveBeenCalled()
+      expect(useAgentStore.getState().activeConversationId).toBe(target.id)
+    } finally { open.mockRestore() }
+  })
+
+  it('项目打开失败时保留旧会话与历史面板，允许重试', async () => {
+    const { target } = makeTarget()
+    useProjectStore.setState({ currentProject: null })
+    const open = vi.spyOn(useProjectStore.getState(), 'openProject').mockResolvedValue(false)
+    try {
+      expect(await useAgentStore.getState().openConversation(target.id)).toBe(false)
+      expect(useAgentStore.getState().activeConversationId).toBe('previous')
+      expect(useAgentStore.getState().showHistory).toBe(true)
+      expect(useAgentStore.getState().openingConversationId).toBeNull()
+      await useAgentStore.getState().openConversation(target.id)
+      expect(open).toHaveBeenCalledTimes(2)
+    } finally { open.mockRestore() }
+  })
+
+  it('等待打开时拒绝其他会话点击和发送消息，完成后项目与会话一致', async () => {
+    const { project, target } = makeTarget()
+    useAgentStore.setState({ conversations: [target, { ...target, id: 'second', projectPath: '/second' }] })
+    useProjectStore.setState({ currentProject: null })
+    let resolve!: (value: boolean) => void
+    const open = vi.spyOn(useProjectStore.getState(), 'openProject').mockImplementation(() => new Promise<boolean>(r => { resolve = r }))
+    try {
+      const pending = useAgentStore.getState().openConversation(target.id)
+      expect(useAgentStore.getState().openingConversationId).toBe(target.id)
+      expect(await useAgentStore.getState().openConversation('second')).toBe(false)
+      await useAgentStore.getState().sendMessage('切换期间发送')
+      expect(useAgentStore.getState().conversations.every(c => c.messages.length === 0)).toBe(true)
+      expect(useAgentStore.getState().activeConversationId).toBe('previous')
+      useProjectStore.setState({ currentProject: project })
+      resolve(true)
+      expect(await pending).toBe(true)
+      expect(open).toHaveBeenCalledTimes(1)
+      expect(useAgentStore.getState().activeConversationId).toBe(target.id)
+    } finally { open.mockRestore() }
+  })
+
+  it.each(['会话删除', '项目不匹配'])('打开完成后%s时不激活目标', async scenario => {
+    const { project, target } = makeTarget()
+    useProjectStore.setState({ currentProject: null })
+    const open = vi.spyOn(useProjectStore.getState(), 'openProject').mockImplementation(async () => {
+      if (scenario === '会话删除') {
+        useProjectStore.setState({ currentProject: project })
+        useAgentStore.setState({ conversations: [] })
+      }
+      return true
+    })
+    try {
+      expect(await useAgentStore.getState().openConversation(target.id)).toBe(false)
+      expect(useAgentStore.getState().activeConversationId).toBe('previous')
+    } finally { open.mockRestore() }
+  })
+
+  it.each(['生成中', '项目加载中'])('%s不切换会话', async scenario => {
+    const { target } = makeTarget()
+    useAgentStore.setState({ generating: scenario === '生成中' })
+    useProjectStore.setState({ loading: scenario === '项目加载中' })
+    const open = vi.spyOn(useProjectStore.getState(), 'openProject')
+    try {
+      expect(await useAgentStore.getState().openConversation(target.id)).toBe(false)
+      expect(open).not.toHaveBeenCalled()
+      expect(useAgentStore.getState().activeConversationId).toBe('previous')
+    } finally {
+      open.mockRestore()
+      useAgentStore.setState({ generating: false })
+      useProjectStore.setState({ loading: false })
+    }
+  })
+})
+
 describe('用户消息编辑重发', () => {
   it('回退到用户消息之前，保留原请求和后续，原始输入重新发送一次', async () => {
     const conv = useAgentStore.getState().createConversation({ title: '编辑' })

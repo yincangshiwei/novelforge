@@ -69,7 +69,8 @@ export default function AgentConversation() {
 function EmptyState() {
   // 原子 selector：仅订阅列表与切换 action，不随 generating/showHistory 等无关字段重渲染
   const conversations = useAgentStore(s => s.conversations)
-  const selectConversation = useAgentStore(s => s.selectConversation)
+  const openConversation = useAgentStore(s => s.openConversation)
+  const openingConversationId = useAgentStore(s => s.openingConversationId)
   const { t } = useTranslation()
   // 最近会话条数默认 3，可通过全局配置 recentConversationCount 覆盖（读取失败/非法值静默降级为 3）
   const [recentCount, setRecentCount] = useState(3)
@@ -134,7 +135,8 @@ function EmptyState() {
                   key={conv.id}
                   title={conv.title}
                   updatedAt={conv.updatedAt}
-                  onClick={() => selectConversation(conv.id)}
+                  disabled={openingConversationId !== null}
+                  onClick={() => { void openConversation(conv.id) }}
                   menuOpen={openMenuId === conv.id}
                   onMenuOpenChange={open => setOpenMenuId(cur => (open ? conv.id : cur === conv.id ? null : cur))}
                   onDelete={async () => {
@@ -542,7 +544,7 @@ function AgentToolbar() {
 
 function AgentHistoryPanel() {
   const {
-    conversations, activeConversationId, selectConversation, deleteConversation, setShowHistory,
+    conversations, activeConversationId, openConversation, openingConversationId, deleteConversation, setShowHistory,
     renameConversation, archiveConversation, pinConversation, duplicateConversation,
     createConversation, renameWorkspace, deleteWorkspace,
   } = useAgentStore()
@@ -715,7 +717,8 @@ function AgentHistoryPanel() {
                   isActive={conv.id === activeConversationId}
                   pinned={conv.pinned}
                   archived={conv.archived}
-                  onClick={() => selectConversation(conv.id)}
+                  disabled={openingConversationId !== null}
+                  onClick={() => { void openConversation(conv.id) }}
                   menuOpen={openMenuId === conv.id}
                   onMenuOpenChange={open => setOpenMenuId(cur => (open ? conv.id : cur === conv.id ? null : cur))}
                   onDelete={async () => {
@@ -761,6 +764,7 @@ function RecentConversationItem({
   parentTitle,
   pinned,
   archived,
+  disabled,
   onClick,
   onDelete,
   menuOpen,
@@ -777,6 +781,7 @@ function RecentConversationItem({
   parentTitle?: string
   pinned?: boolean
   archived?: boolean
+  disabled?: boolean
   onClick: () => void
   onDelete: () => void
   /** 「更多」菜单开关：状态由调用方持有 —— 同一列表内互斥（打开 A 行强制关闭 B 行） */
@@ -841,7 +846,8 @@ function RecentConversationItem({
       <button
         type="button"
         onClick={onClick}
-        className="flex items-center gap-x-1 overflow-hidden flex-1 min-w-0 text-left cursor-pointer"
+        disabled={disabled}
+        className="flex items-center gap-x-1 overflow-hidden flex-1 min-w-0 text-left cursor-pointer disabled:cursor-wait disabled:opacity-60"
       >
         {pinned && <Pin size={10} style={{ color: 'var(--color-accent)', flexShrink: 0 }} />}
         <span

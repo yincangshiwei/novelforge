@@ -326,6 +326,34 @@ describe('EmptyState 历史条数配置', () => {
   })
 })
 
+describe('历史会话入口项目同步', () => {
+  it.each([false, true])('showHistory=%s 时点击会话走项目同步入口，并在等待期间禁用', async showHistory => {
+    const conversation: AgentConv = {
+      id: 'project-history', title: '所属项目历史', modelId: null,
+      projectPath: '/history-project', projectName: '历史项目',
+      createdAt: 1, updatedAt: 1,
+      messages: [{ id: 'history-message', role: 'user', content: '历史内容', createdAt: 1 }],
+    }
+    Object.defineProperty(window, 'velaAPI', { value: { invoke: vi.fn(async () => null) }, configurable: true })
+    useProjectStore.setState({ currentProject: null, loading: false })
+    useAgentStore.setState({ conversations: [conversation], activeConversationId: null, showHistory, memoryView: false, openingConversationId: null })
+    const open = vi.spyOn(useAgentStore.getState(), 'openConversation').mockResolvedValue(true)
+    const { container, root } = render(<AgentConversation />)
+    try {
+      const button = container.querySelector<HTMLButtonElement>('.group\\/row > button')!
+      expect(button).toBeTruthy()
+      await act(async () => { button.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+      expect(open).toHaveBeenCalledExactlyOnceWith(conversation.id)
+      act(() => { useAgentStore.setState({ openingConversationId: conversation.id }) })
+      expect(button.disabled).toBe(true)
+    } finally {
+      open.mockRestore()
+      act(() => { root.unmount() })
+      useAgentStore.setState({ openingConversationId: null })
+    }
+  })
+})
+
 describe('AgentHistoryPanel fork 层级', () => {
   beforeEach(() => {
     document.body.innerHTML = ''

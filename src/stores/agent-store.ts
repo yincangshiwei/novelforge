@@ -130,7 +130,7 @@ export interface AgentConversation {
   subSessions?: SubAgentSession[]
   /** B7 失效语义：历史已变动，该摘要与当前历史不符 —— 不注入上下文 */
   rollingSummaryInvalidated?: boolean
-  /** 创建时项目快照（仅展示与恢复提示，P0 不做按快照注入） */
+  /** 所属项目路径：恢复历史会话时打开该项目，上下文仍读取当前项目 */
   projectPath?: string
   projectName?: string
   /** fork 自哪个会话（无此字段为根会话） */
@@ -210,6 +210,8 @@ interface AgentState {
   deleteWorkspace: (projectPath: string) => void
   /** 激活指定会话 */
   selectConversation: (id: string) => void
+  openingConversationId: string | null
+  openConversation: (id: string) => Promise<boolean>
   /** 删除指定会话 */
   deleteConversation: (id: string) => void
   /** 清空所有会话 */
@@ -486,6 +488,7 @@ const pendingSubAgent = { resolve: null as ((allow: boolean) => void) | null }
 export const useAgentStore = create<AgentState>()((set, get) => ({
   conversations: [],
   activeConversationId: null,
+  openingConversationId: null,
   showHistory: false,
   memoryView: false,
   generating: false,
@@ -549,6 +552,31 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     resetPrefixBaseline()   // P0-1：前缀基线同理（跨会话比较 = 面板/日志说谎）
     get().persistCurrent(newConv.id)
     return newConv
+  },
+
+  openConversation: async (id) => {
+    if (preparingClose || isCloseCoordinating() || get().openingConversationId || useProjectStore.getState().loading) return false
+    const conversation = get().conversations.find(c => c.id === id)
+    if (!conversation) return false
+    if (get().generating) {
+      toast.warning(t('workflow.projectBusy'))
+      return false
+    }
+    set({ openingConversationId: id })
+    try {
+      const projectPath = conversation.projectPath
+      if (projectPath && useProjectStore.getState().currentProject?.path !== projectPath) {
+        const opened = await useProjectStore.getState().openProject(projectPath)
+        if (!opened) return false
+      }
+      const target = get().conversations.find(c => c.id === id)
+      if (!target || target.projectPath !== projectPath || preparingClose || isCloseCoordinating() || get().generating) return false
+      if (projectPath && useProjectStore.getState().currentProject?.path !== projectPath) return false
+      get().selectConversation(id)
+      return true
+    } finally {
+      set({ openingConversationId: null })
+    }
   },
 
   selectConversation: (id) => {
@@ -621,7 +649,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
 
   sendMessage: async (content) => {
     if (preparingClose || isCloseCoordinating() || !content.trim() || get().generating) return
-    if (useProjectStore.getState().loading) return
+    if (get().openingConversationId || useProjectStore.getState().loading) return
     const originalContent = content
 
     // 确保 Tool 已初始化
