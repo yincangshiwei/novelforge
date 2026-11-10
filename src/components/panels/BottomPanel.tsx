@@ -196,7 +196,7 @@ function TaskRunView() {
  * 现行为主按钮（键盘可达），点击就地展开该次运行的步骤详情（复用 WorkflowStepItem）。
  */
 function HistoryRunItem({ run }: { run: WorkflowRun }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(run.status === 'failed' && !run.cancellationRequestedAt)
   return (
     <div>
       <button
@@ -395,7 +395,7 @@ function WorkflowStepItem({
   index: number
 }) {
   const { t } = useTranslation()
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(step.status === 'failed')
   const hasDetail = !!step.error || step.logs.length > 0
 
   /** 步骤标题行内容（有详情时整行 = 按钮；无详情 = 纯状态行，见下方渲染分支） */

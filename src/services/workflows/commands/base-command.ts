@@ -10,6 +10,7 @@ import { robustParseJSON, stripThinkingTags } from '../workflow-utils'
 import { retrieveContextForQuery, DEFAULT_RAG_CONFIG } from '../../agent/rag-context-provider'
 import { structureForCache, calculateCost, type CacheScope } from '../../llm/prompt-cache'
 import { renderLog } from '../../render-logger'
+import { errorDetails, redactErrorText } from '../../../shared/error-diagnostics'
 
 export interface CommandExecuteParams {
   step: Partial<WorkflowStep> & { [extra: string]: unknown }
@@ -83,6 +84,9 @@ export abstract class BaseWorkflowCommand<TResult = string> {
     if (!modelId) throw new Error(t('error.noDefaultModel'))
     const model = llmStore.models.find(m => m.id === modelId)
     const startTime = Date.now()
+    const requestId = crypto.randomUUID()
+    const trace = { runId: context?.runId, stepId: context?.stepId, purpose: options?.purpose ?? 'default' }
+    const correlation = `requestId=${requestId} runId=${trace.runId ?? '-'} stepId=${trace.stepId ?? '-'} modelId=${modelId} purpose=${trace.purpose}`
 
     // 温度：显式 > JSON 模式 0.3 > 结构化 purpose 表 > undefined（交给 llm-store 注入全局档位）
     const temperature = options?.temperature
@@ -92,7 +96,7 @@ export abstract class BaseWorkflowCommand<TResult = string> {
       ?? BaseWorkflowCommand.STRUCTURED_TEMPERATURE[options?.purpose ?? 'default']
 
     // LLM 提取日志流：发起调用（debug 级，开发环境全量可见）
-    renderLog('debug', 'LLM', t('log.render.llmCallStart')
+    renderLog('info', 'LLM', `[Start] ${correlation}\n` + t('log.render.llmCallStart')
       .replace('{model}', () => model?.name ?? modelId)
       .replace('{promptChars}', String(prompt.length))
       .replace('{systemChars}', String(systemPrompt.length))
@@ -144,16 +148,16 @@ export abstract class BaseWorkflowCommand<TResult = string> {
         ipc.invoke('db:log-llm-call', {
           model_id: modelId,
           model_name: model?.name ?? model?.modelName ?? '',
-          purpose: 'workflow',
+          purpose: options?.purpose ?? 'workflow',
           prompt_tokens: usage?.promptTokens ?? 0,
           completion_tokens: usage?.completionTokens ?? 0,
           total_tokens: usage?.totalTokens ?? 0,
           cached_tokens: usage?.cachedTokens ?? 0,
           duration_ms: duration,
           success: success ? 1 : 0,
-          error_message: errorMessage ?? '',
+          error_message: redactErrorText(errorMessage ?? ''),
           cost,
-        }).catch(() => { /* 日志失败不影响主流程 */ })
+        }).catch(error => { renderLog('warn', 'LLM', `模型调用记录保存失败：${errorDetails(error)}`) })
 
         // LLM 提取日志流：结果与失败原因落盘（info/error 级在公测/正式版也保留）
         if (success && usage) {
@@ -170,7 +174,11 @@ export abstract class BaseWorkflowCommand<TResult = string> {
         } else {
           renderLog('error', 'LLM', t('log.render.llmCallFailed')
             .replace('{ms}', String(duration))
-            .replace('{error}', () => errorMessage ?? t('log.render.unknownError')))
+            .replace('{error}', () => redactErrorText(errorMessage ?? t('log.render.unknownError')))
+            + `\n${correlation} outputChars=${fullContent.length}`)
+        }
+        if (success) {
+          renderLog('info', 'LLM', `[Done] ${correlation} elapsedMs=${duration} outputChars=${fullContent.length}`)
         }
       }
 
@@ -232,8 +240,8 @@ export abstract class BaseWorkflowCommand<TResult = string> {
             reject(new Error(err || t('log.render.llmStreamFailed')))
           }
         },
-        undefined,
-        { ...options, temperature }
+        modelId,
+        { ...options, temperature, requestId, trace }
       ).then(reqId => {
         streamRequestId = reqId
         if (isCancelled() && !settled) {

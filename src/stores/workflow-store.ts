@@ -1,4 +1,6 @@
 import { create } from 'zustand'
+import { errorMessage, errorDetails } from '../shared/error-diagnostics'
+import { useLayoutStore } from './layout-store'
 import { getCurrentLocale, t } from '../shared/locale'
 import { randomUUID } from '../utils/id'
 import { useProjectStore } from './project-store'
@@ -113,6 +115,7 @@ export interface WorkflowStep {
   progress?: number
   result?: string
   error?: string
+  errorDetail?: string
   startedAt?: string
   completedAt?: string
   logs: string[]
@@ -172,6 +175,8 @@ export type StepExecutor = (
 
 /** 工作流上下文（共享数据） */
 export interface WorkflowContext {
+  runId?: string
+  stepId?: string
   /** 步骤间传递的数据 */
   data: Record<string, unknown>
   /** 是否已取消 */
@@ -1054,9 +1059,11 @@ async function executeRunBody(
     }
 
     const stepDef = definition.steps[i]
+    context.runId = run.id
+    context.stepId = run.steps[i].id
 
     // 标记当前步骤为运行中
-    updateStepById(set, run.id, i, { status: 'running', progress: 0, error: undefined, completedAt: undefined, startedAt: new Date().toISOString() })
+    updateStepById(set, run.id, i, { status: 'running', progress: 0, error: undefined, errorDetail: undefined, completedAt: undefined, startedAt: new Date().toISOString() })
     updateRunById(set, run.id, { currentStepIndex: i })
     get().addLog('info', `[${definition.title}] ${stepDef.name}`)
 
@@ -1108,10 +1115,12 @@ async function executeRunBody(
     } catch (error) {
       flushAppendTextNow(`${run.id}:${i}`)
       if (context.cancelled) break
-      const errorMsg = error instanceof Error ? error.message : String(error)
+      const errorMsg = errorMessage(error)
+      const diagnostic = `runId=${run.id} stepId=${run.steps[i].id} workflow=${definition.type}\n${errorDetails(error)}`
       updateStepById(set, run.id, i, {
         status: 'failed',
         error: errorMsg,
+        errorDetail: diagnostic,
         completedAt: new Date().toISOString(),
       })
       updateRunById(set, run.id, { status: 'failed', completedAt: new Date().toISOString() })
@@ -1120,7 +1129,22 @@ async function executeRunBody(
       import('../shared/event-bus').then(m => {
         m.globalEventBus.emit('WORKFLOW_COMPLETE', { type: definition.type, runId: run.id, status: 'failed' })
       }).catch(() => {})
-      get().addLog('error', `[${definition.title}] ${stepDef.name} — FAIL: ${errorMsg}`)
+      get().addLog('error', `[${definition.title}] ${stepDef.name} — FAIL: ${errorMsg}\n${diagnostic}`)
+      if (!get().activeRuns.find(r => r.id === run.id)?.pauseRequested) {
+        try {
+          toast.show({
+            type: 'error', duration: 0,
+            message: t('workflow.failedNotice').replace('{title}', () => definition.title)
+              .replace('{step}', () => stepDef.name).replace('{error}', () => errorMsg.split('\n')[0]),
+            actions: [{ label: t('workflow.viewFailure'), onClick: () => {
+              get().selectRun(run.id)
+              useLayoutStore.getState().openRightPanel('ai-output')
+            } }],
+          })
+        } catch (notificationError) {
+          renderLog('warn', 'Workflow', `失败通知异常：${errorDetails(notificationError)}`)
+        }
+      }
       break
     }
   }
@@ -1191,7 +1215,7 @@ async function executeRunBody(
   clearAppendBuffers(run.id)
   try {
     await saveCheckpoint(get(), true)
-    if (!get().history.find(r => r.id === run.id)?.cancellationRequestedAt) deleteRunOutput(run.id)
+    if (get().history.find(r => r.id === run.id)?.status === 'completed') deleteRunOutput(run.id)
   } catch {
     get().addLog('error', '工作流执行记录保存失败，恢复输出已保留，请重试保存后再退出。')
   }

@@ -19,6 +19,7 @@ import { LLMFactory } from '../llm/llm-factory'
 import { llmConcurrencyController } from '../utils/concurrency-controller'
 import { safeErrorMessage } from '../utils/error-utils'
 import { logger } from '../utils/logger'
+import { errorDetails, redactErrorText } from '../../src/shared/error-diagnostics'
 import { guardedHandle } from '../security/ipc-guard'
 import { refreshOutboundProxy } from '../net/proxy-fetch'
 
@@ -280,6 +281,9 @@ export function registerLLMController() {
   guardedHandle('llm:generate', async (_event, request: LLMRequest) => {
     const abortController = new AbortController()
     const requestId = request.requestId
+    const startedAt = Date.now()
+    const correlation = `requestId=${requestId ?? '-'} modelId=${request.modelId} runId=${request.trace?.runId ?? '-'} stepId=${request.trace?.stepId ?? '-'}`
+    logger.info('LLM:Request', `[Queued:Generate] ${correlation}`)
     const cancelled = () => ({ success: false, content: '', error: t('error.requestCancelled') })
     if (requestId) {
       if (consumeCancellation(requestId)) return cancelled()
@@ -294,7 +298,9 @@ export function registerLLMController() {
         if (!model) return { success: false, content: '', error: t('error.modelConfigNotFound') }
 
         const provider = LLMFactory.getProvider(model)
+        logger.info('LLM:Request', `[Start:Generate] ${correlation} protocol=${model.protocol}`)
         const result = await provider.generate(model, request.messages, {
+          requestId,
           temperature: request.temperature ?? DEFAULT_REQUEST_TEMPERATURE,
           maxTokens: resolveMaxTokens(request.maxTokens, model),
           responseFormat: request.responseFormat,
@@ -303,17 +309,22 @@ export function registerLLMController() {
           toolChoice: request.toolChoice,
           signal: abortController.signal,
         })
+        if (!abortController.signal.aborted) {
+          const summary = `${correlation} elapsedMs=${Date.now() - startedAt} outputChars=${result.content.length}`
+          if (result.success) logger.info('LLM:Request', `[Done:Generate] ${summary}`)
+          else logger.error('LLM:Request', `[Failed:Generate] ${summary}\n${result.error ?? '未提供原因'}`)
+        }
         return abortController.signal.aborted ? cancelled() : result
       },
       // timeoutMs: 0 —— 与流式一致：长输出（预设 maxTokens 高达 131072）可超 120s；
       // Promise.race 超时不取消底层 fn，超时后请求仍会真实调用 API 继续扣费（历史事故：
       // 超时报错 + 底层继续执行 + 槽位提前释放 → 并发上限失效 + 双倍计费）
       { priority: request.priority ?? 10, timeoutMs: 0, signal: abortController.signal },
-    ).catch((error) => abortController.signal.aborted ? cancelled() : ({
-      success: false,
-      content: '',
-      error: error instanceof Error ? error.message : safeErrorMessage(error),
-    })).finally(() => {
+    ).catch((error) => {
+      if (abortController.signal.aborted) return cancelled()
+      logger.error('LLM:Request', `[Failed:Generate] ${correlation} elapsedMs=${Date.now() - startedAt}\n${errorDetails(error)}`)
+      return { success: false, content: '', error: safeErrorMessage(error) }
+    }).finally(() => {
       if (requestId && activeStreams.get(requestId) === abortController) activeStreams.delete(requestId)
     })
   })
@@ -322,17 +333,34 @@ export function registerLLMController() {
     if (consumeCancellation(requestId) || activeStreams.has(requestId)) return { requestId, started: false }
     applyProxyConfig()
     const model = getModelConfig(request.modelId)
-    if (!model) return { requestId, started: false }
+    if (!model) {
+      logger.error('LLM:Request', `[NotStarted] requestId=${requestId} modelId=${request.modelId} reason=model_config_not_found`)
+      return { requestId, started: false }
+    }
 
     const abortController = new AbortController()
     activeStreams.set(requestId, abortController)
     const win = BrowserWindow.fromWebContents(event.sender)
 
     const provider = LLMFactory.getProvider(model)
+    const startedAt = Date.now()
+    let outputChars = 0
+    let firstChunkAt: number | undefined
+    const correlation = redactErrorText(`requestId=${requestId} modelId=${request.modelId} protocol=${model.protocol} runId=${request.trace?.runId ?? '-'} stepId=${request.trace?.stepId ?? '-'} purpose=${request.trace?.purpose ?? '-'}`)
+    logger.info('LLM:Request', `[Queued] ${correlation} maxTokens=${resolveMaxTokens(request.maxTokens, model)} messages=${request.messages.length}`)
     let terminalSent = false
-    const sendError = (error: string) => {
+    const heartbeat = setInterval(() => {
+      logger.info('LLM:Request', `[Progress] ${correlation} elapsedMs=${Date.now() - startedAt} outputChars=${outputChars} firstChunkSeen=${firstChunkAt !== undefined}`)
+    }, 60000)
+    heartbeat.unref?.()
+    const sendError = (error: string, detail?: unknown) => {
       if (terminalSent) return
       terminalSent = true
+      clearInterval(heartbeat)
+      error = redactErrorText(error)
+      const summary = `${abortController.signal.aborted ? '[Cancelled]' : '[Failed]'} ${correlation} elapsedMs=${Date.now() - startedAt} outputChars=${outputChars}\n${error}\n${detail === undefined ? '' : errorDetails(detail)}`
+      if (abortController.signal.aborted) logger.info('LLM:Request', summary)
+      else logger.error('LLM:Request', summary)
       win?.webContents.send('llm:stream-error', { requestId, error })
     }
 
@@ -365,7 +393,9 @@ export function registerLLMController() {
             onAbort()
             return
           }
+          logger.info('LLM:Request', `[Start] ${correlation} queueMs=${Date.now() - startedAt}`)
           provider.generateStream(model, request.messages, {
+            requestId,
             temperature: request.temperature ?? DEFAULT_REQUEST_TEMPERATURE,
             maxTokens: resolveMaxTokens(request.maxTokens, model),
             responseFormat: request.responseFormat,
@@ -375,6 +405,11 @@ export function registerLLMController() {
             signal: abortController.signal,
             onChunk: (chunk: string) => {
               if (!terminalSent && !abortController.signal.aborted) {
+                outputChars += chunk.length
+                if (firstChunkAt === undefined) {
+                  firstChunkAt = Date.now()
+                  logger.info('LLM:Request', `[FirstChunk] ${correlation} elapsedMs=${firstChunkAt - startedAt}`)
+                }
                 win?.webContents.send('llm:stream-chunk', { requestId, chunk })
               }
             },
@@ -386,6 +421,8 @@ export function registerLLMController() {
               }
               // usage 含真实缓存命中 token（provider 已解析），透传给渲染进程供费用统计
               terminalSent = true
+              clearInterval(heartbeat)
+              logger.info('LLM:Request', `[Done] ${correlation} elapsedMs=${Date.now() - startedAt} outputChars=${fullText.length} finishReason=${step?.finishReason ?? '-'} totalTokens=${usage?.totalTokens ?? '-'}`)
               win?.webContents.send('llm:stream-done', { requestId, fullText, usage, step })
               cleanup()
               resolve()
@@ -398,7 +435,7 @@ export function registerLLMController() {
             },
           }).catch(error => {
             if (terminalSent) return
-            sendError(safeErrorMessage(error))
+            sendError(safeErrorMessage(error), error)
             cleanup()
             reject(error)
           })
@@ -406,7 +443,7 @@ export function registerLLMController() {
       },
       { priority: request.priority ?? 10, timeoutMs: 0, signal: abortController.signal },
     ).catch((error) => {
-      sendError(abortController.signal.aborted ? t('error.requestCancelled') : safeErrorMessage(error))
+      sendError(abortController.signal.aborted ? t('error.requestCancelled') : safeErrorMessage(error), error)
       if (activeStreams.get(requestId) === abortController) activeStreams.delete(requestId)
     })
 

@@ -37,18 +37,28 @@ export class OpenAICompatibleStreamAdapter implements InternalStreamAdapter {
   private usage: LLMUsage | undefined
   private readonly tools = new Map<number, ToolBuffer>()
   private warnedUnknownShape = false
+  private doneSeen = false
+  private finishReasonSeen = false
+  private malformedEvents = 0
+  private eventCount = 0
+
+  getDiagnostics() {
+    return { doneSeen: this.doneSeen, finishReasonSeen: this.finishReasonSeen, malformedEvents: this.malformedEvents, events: this.eventCount }
+  }
 
   constructor(private readonly modelName: string) {
     this.parser = createParser({
       onEvent: (event) => {
         const data = event.data.trim()
         if (!data) return
+        this.eventCount++
         if (data === '[DONE]') {
+          this.doneSeen = true
           this.completeToolsAndFinish()
           return
         }
         let parsed: Record<string, unknown>
-        try { parsed = JSON.parse(data) as Record<string, unknown> } catch { return }
+        try { parsed = JSON.parse(data) as Record<string, unknown> } catch { this.malformedEvents++; return }
         this.handlePayload(parsed)
       },
     })
@@ -106,6 +116,7 @@ export class OpenAICompatibleStreamAdapter implements InternalStreamAdapter {
 
     const finish = choice.finish_reason
     if (typeof finish === 'string') {
+      this.finishReasonSeen = true
       this.finishReason = finish === 'length' ? 'length'
         : ['tool_calls', 'tool_use'].includes(finish) ? 'tool_use' : finish === 'stop' ? 'stop' : 'error'
     }

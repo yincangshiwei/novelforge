@@ -12,6 +12,7 @@ import type {
   EventChannel,
 } from '../shared/ipc-channels'
 import { t } from '../shared/locale'
+import { errorDetails } from '../shared/error-diagnostics'
 
 /** 从 preload 暴露的 velaAPI */
 interface VelaAPI {
@@ -68,13 +69,19 @@ export const ipc = {
     channel: C,
     ...args: AllInvokeChannels[C]['args']
   ): Promise<AllInvokeChannels[C]['return']> => {
-    // 仅在开发模式下记录详细 IPC 日志，避免生产环境日志噪音和敏感数据泄露
-    if (process.env.NODE_ENV === 'development') {
-      performance.mark(`ipc:${channel}:start`)
-    }
-
     // 超时计时器在 settle 后清理，避免 dangling timer（超时本身不取消主进程请求——副作用型调用方需自行防重）
     let timer: ReturnType<typeof setTimeout> | undefined
+    const startedAt = Date.now()
+    const reportFailure = (error: unknown) => {
+      if (channel === 'log:write') return
+      const detail = `channel=${channel} elapsedMs=${Date.now() - startedAt}\n${errorDetails(error)}`
+      console.error(`[IPC] ${detail}`)
+      try {
+        void getAPI().invoke('log:write', 'error', 'IPC', detail).catch(logError => {
+          console.error(`[IPC] 错误日志传递失败：${errorDetails(logError)}`)
+        })
+      } catch (logError) { console.error(`[IPC] 错误日志传递失败：${errorDetails(logError)}`) }
+    }
     let result: AllInvokeChannels[C]['return']
     try {
       result = await Promise.race([
@@ -83,14 +90,16 @@ export const ipc = {
           timer = setTimeout(() => reject(new IPCTimeoutError(channel, IPC_TIMEOUT_MS)), IPC_TIMEOUT_MS)
         }),
       ])
+      if (result && typeof result === 'object' && 'success' in result && result.success === false) reportFailure('error' in result ? result.error : 'IPC返回失败，未提供原因')
+    } catch (error) {
+      reportFailure(error)
+      throw error
     } finally {
       if (timer) clearTimeout(timer)
     }
 
     if (process.env.NODE_ENV === 'development') {
-      performance.mark(`ipc:${channel}:end`)
-      const measure = performance.measure(`ipc:${channel}`, `ipc:${channel}:start`, `ipc:${channel}:end`)
-      console.debug(`[ipc-client] ${channel} — ${measure.duration.toFixed(1)}ms`)
+      console.debug(`[ipc-client] ${channel} — ${Date.now() - startedAt}ms`)
     }
     return result
   },

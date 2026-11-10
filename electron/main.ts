@@ -316,15 +316,24 @@ app.on('activate', () => {
 })
 
 // 应用即将退出时清理
+let logsDrained = false
+let logsDraining = false
 app.on('before-quit', (e) => {
   if (win && !win.isDestroyed()) {
     e.preventDefault()
     win.close()
     return
   }
+  if (logsDrained) return
+  e.preventDefault()
+  if (logsDraining) return
+  logsDraining = true
   closeProjectDatabase()
   logger.info('Main', t('log.main.appQuitting'))
-  logger.close()
+  void logger.flushAndClose().finally(() => {
+    logsDrained = true
+    app.quit()
+  })
 })
 
 app.whenReady().then(async () => {

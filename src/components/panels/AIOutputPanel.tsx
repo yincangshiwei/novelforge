@@ -454,6 +454,19 @@ function StepOutputBlock({ step, index, total, isActiveRun, isCurrentStep, recov
         )}
       </div>
 
+      {isFailed && step.error && (
+        <div role="alert" className="mx-2 my-2 rounded-md border border-[var(--color-error)] p-3 text-xs break-words" style={{ color: 'var(--color-error)' }}>
+          <div className="whitespace-pre-wrap select-text">{step.error}</div>
+          {rawText && <p className="mt-2">{t('workflow.partialOutput')}</p>}
+          {step.errorDetail && (
+            <details className="mt-2">
+              <summary className="cursor-pointer">{t('workflow.errorDetails')}</summary>
+              <pre className="mt-2 whitespace-pre-wrap select-text font-mono text-micro">{step.errorDetail}</pre>
+            </details>
+          )}
+        </div>
+      )}
+
       {/* 展开的对应输出数据 */}
       {expanded && rawText && (
         <div className="pl-[4px] pr-1 pt-1 pb-3 text-xs w-full max-w-full break-words">

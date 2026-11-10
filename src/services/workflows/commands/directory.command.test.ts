@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { WorkflowContext } from '../../../stores/workflow-store'
 
-const h = vi.hoisted(() => ({ callLLM: vi.fn(), save: vi.fn(), parse: vi.fn(), invoke: vi.fn() }))
+const h = vi.hoisted(() => ({ callLLM: vi.fn(), save: vi.fn(), parse: vi.fn(), invoke: vi.fn(), n: vi.fn(), m: vi.fn(), totalChapters: 3 }))
 vi.mock('../../ipc-client', () => ({ ipc: { invoke: h.invoke } }))
 vi.mock('./base-command', () => ({ BaseWorkflowCommand: class { callLLM = h.callLLM } }))
 vi.mock('../../../stores/project-store', () => ({ useProjectStore: { getState: () => ({
-  currentProject: { path: '/novel', novelConfig: { totalChapters: 3 } }, refreshFileTree: vi.fn(),
+  currentProject: { path: '/novel', novelConfig: { totalChapters: h.totalChapters } }, refreshFileTree: vi.fn(),
 }) } }))
-vi.mock('../../../stores/llm-store', () => ({ useLLMStore: { getState: () => ({ models: [] }) } }))
+vi.mock('../../../stores/llm-store', () => ({ useLLMStore: { getState: () => ({ models: [], getModelForPurpose: () => 'blueprint' }) } }))
 vi.mock('../../prompt-templates', () => ({ getPromptTemplate: () => ({ systemRole: 'author' }) }))
 vi.mock('../../prompts/prompt-builder', () => ({ DirectoryPromptBuilder: class {
   withNovelArchitecture() { return this }
@@ -18,8 +18,8 @@ vi.mock('../../prompts/prompt-builder', () => ({ DirectoryPromptBuilder: class {
   withChapterRange() { return this }
   withExistingChapters() { return this }
   withChapterList() { return this }
-  withN() { return this }
-  withM() { return this }
+  withN(value: number) { h.n(value); return this }
+  withM(value: number) { h.m(value); return this }
   build() { return 'prompt' }
 } }))
 vi.mock('../directory-workflow', () => ({ parseTextBlueprints: h.parse, parseTextBlueprintsFromParsed: h.parse, saveAllBlueprints: h.save }))
@@ -28,6 +28,20 @@ import { GenerateDirectoryCommand } from './directory.command'
 const callbacks = { log: vi.fn(), setProgress: vi.fn(), appendText: vi.fn() }
 
 describe('蓝图取消与已保存批次恢复', () => {
+  it('长篇首批提示词明确限定范围，流失败保留章节与原始原因', async () => {
+    h.totalChapters = 1632
+    h.n.mockClear()
+    h.m.mockClear()
+    h.save.mockReset()
+    h.callLLM.mockReset().mockRejectedValueOnce(new Error('stream unknown'))
+    try {
+      const context: WorkflowContext = { data: { architecture: 'world' }, cancelled: false }
+      await expect(new GenerateDirectoryCommand({ mode: 'full' }).execute({ step: {}, context, callbacks })).rejects.toThrow('stream unknown')
+      expect(h.n).toHaveBeenCalledWith(1)
+      expect(h.m).toHaveBeenCalledWith(12)
+      expect(h.save).not.toHaveBeenCalled()
+    } finally { h.totalChapters = 3 }
+  })
   it('旧任务断点丢失仍可读取数据库继续，仅补缺章', async () => {
     h.save.mockReset()
     h.callLLM.mockReset().mockResolvedValue('next')

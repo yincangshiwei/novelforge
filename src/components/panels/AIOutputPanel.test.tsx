@@ -5,7 +5,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 const h = vi.hoisted(() => ({ continueDirectory: vi.fn(async () => {}), restartWorkflow: vi.fn(async () => {}), close: vi.fn() }))
 vi.mock('../../stores/workflow-store', () => {
-  const run = { id: 'old', type: 'directory', title: '蓝图', status: 'failed', steps: [], currentStepIndex: 0 }
+  const run = { id: 'old', type: 'directory', title: '蓝图', status: 'failed', steps: [{ id: 'failed-step', name: '生成蓝图', status: 'failed', error: '模型连接异常结束', errorDetail: 'runId=old requestId=req-1', logs: [] }], currentStepIndex: 0 }
   const state = { activeRuns: [], history: [run], getActiveStreamingRun: () => null, selectedRunId: 'old', selectRun: vi.fn(), waitingRuns: {}, confirmContinue: vi.fn(), cancelWorkflow: vi.fn(), ...h }
   const store = Object.assign((selector: (s: typeof state) => unknown) => selector(state), { getState: () => state })
   return { useWorkflowStore: store }
@@ -25,6 +25,12 @@ function render() {
   cleanup = () => act(() => root.unmount())
   return container
 }
+it('无生成正文时错误原因和诊断仍直接可见', () => {
+  render()
+  const alert = document.querySelector('[role="alert"]')!
+  expect(alert.textContent).toContain('模型连接异常结束')
+  expect(alert.querySelector('details')?.textContent).toContain('requestId=req-1')
+})
 it('已终止蓝图显示纯图标继续生成，操作不是从头重生成', async () => {
   render()
   const button = document.querySelector('[aria-label="workflow.continueBlueprint"]') as HTMLButtonElement

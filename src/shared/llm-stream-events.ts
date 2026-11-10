@@ -18,4 +18,5 @@ export type InternalStreamEvent =
 export interface InternalStreamAdapter {
   push(chunk: string): InternalStreamEvent[]
   flush(): InternalStreamEvent[]
+  getDiagnostics?(): { doneSeen: boolean; finishReasonSeen: boolean; malformedEvents: number; events: number }
 }

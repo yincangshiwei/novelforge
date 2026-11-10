@@ -4,6 +4,8 @@ import { readListingJson, toCandidates } from './model-listing'
 import { withRetry, withStreamRetry } from './retry-handler'
 import { buildOpenAIUrl } from './url-utils'
 import { safeErrorMessage } from '../utils/error-utils'
+import { logger } from '../utils/logger'
+import { errorDetails } from '../../src/shared/error-diagnostics'
 import { t } from '../../src/shared/locale'
 import { proxyFetch } from '../net/proxy-fetch'
 import { fetchWithTimeout } from '../net/fetch-with-timeout'
@@ -179,6 +181,9 @@ export class OpenAIProvider implements ILLMProvider {
       }
 
       const decoder = new TextDecoder()
+      const streamStartedAt = Date.now()
+      let receivedBytes = 0
+      let receivedChunks = 0
       let fullText = ''
       let isThinking = false
       let lastUsage: LLMUsage | undefined
@@ -239,8 +244,11 @@ export class OpenAIProvider implements ILLMProvider {
         const { done, value } = await reader.read()
         if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
         if (done) { reading = false; break }
+        receivedBytes += value.byteLength
+        receivedChunks++
         if (!consumeEvents(adapter.push(decoder.decode(value, { stream: true })))) return
       }
+      if (!consumeEvents(adapter.push(decoder.decode()))) return
       if (!consumeEvents(adapter.flush())) return
 
       if (isThinking) {
@@ -251,13 +259,21 @@ export class OpenAIProvider implements ILLMProvider {
 
       const cleanText = fullText.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim()
       if (!['stop', 'tool_use'].includes(finishReason)) {
-        opts.onError(`模型流未正常结束：${finishReason}`)
+        const message = finishReason === 'unknown' ? t('error.streamMissingFinish')
+          : finishReason === 'length' ? t('error.streamLength')
+            : t('error.streamAbnormal').replace('{reason}', finishReason)
+        const diagnostics = `requestId=${opts.requestId ?? '-'} protocol=openai model=${model.modelName} finishReason=${finishReason} elapsedMs=${Date.now() - streamStartedAt} receivedBytes=${receivedBytes} chunks=${receivedChunks} outputChars=${fullText.length} maxTokens=${opts.maxTokens} adapter=${JSON.stringify(adapter.getDiagnostics?.())}`
+        logger.error('LLM:Stream', `${message}\n${diagnostics}`)
+        opts.onError(`${message}\n${diagnostics}`)
         return
       }
       if (opts.signal?.aborted) throw new DOMException('Operation cancelled', 'AbortError')
       opts.onDone(cleanText, lastUsage, { text: cleanText, toolCalls: validateToolCalls(toolCalls), finishReason, terminalSeen: true })
     }, { signal: opts.signal, canRetry: () => !emittedAny }).catch((error) => {
       // withStreamRetry 重试耗尽后的最终错误处理
+      if (!opts.signal.aborted && (error as Error).name !== 'AbortError') {
+        logger.error('LLM:Stream', `requestId=${opts.requestId ?? '-'} protocol=openai model=${model.modelName} emittedAny=${emittedAny}\n${errorDetails(error)}`)
+      }
       if ((error as Error).name === 'AbortError') {
         opts.onError(t('error.generationCancelled'))
       } else if (error instanceof HttpError) {

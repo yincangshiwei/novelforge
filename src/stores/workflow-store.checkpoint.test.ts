@@ -137,7 +137,12 @@ describe('工作流历史结果持久化', () => {
         throw new Error('失败')
       } }],
     })
-    expect(useWorkflowStore.getState().history[0].steps[0].result).toBe('失败前尾文')
+    const failedRun = useWorkflowStore.getState().history[0]
+    expect(failedRun.steps[0].result).toBe('失败前尾文')
+    expect(failedRun.steps[0].errorDetail).toContain(`runId=${failedRun.id}`)
+    expect(failedRun.steps[0].errorDetail).toContain('Error: 失败')
+    expect(h.invoke.mock.calls.some(call => call[0] === 'fs:workflow-output-delete-run' && call[1] === failedRun.id)).toBe(false)
+    expect(JSON.parse(h.dbMap.get('cp')!).history[0].steps[0].errorDetail).toContain(`runId=${failedRun.id}`)
   })
   it('已取消历史 run 的晚到执行入口不启动也不改回运行', async () => {
     const run = makeRun('late-entry', { status: 'failed', cancellationRequestedAt: '2026-11-09T00:00:00Z' })

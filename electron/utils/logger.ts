@@ -17,6 +17,7 @@ import os from 'node:os'
 import { VELA_HOME, readJsonFile, GLOBAL_CONFIG_PATH, DEFAULT_GLOBAL_CONFIG } from './config-utils'
 import type { GlobalConfig } from '../../src/shared/ipc-channels'
 import { t } from '../../src/shared/locale'
+import { errorDetails, redactErrorText } from '../../src/shared/error-diagnostics'
 
 // ===== 常量 =====
 
@@ -135,6 +136,22 @@ export function shouldUseColors(): boolean {
 let currentLogPath: string | null = null
 /** 文件写入流 */
 let logStream: fs.WriteStream | null = null
+const openStreams = new Set<fs.WriteStream>()
+let fallbackWrites = 0
+let lastWriteError: string | undefined
+let closing = false
+
+function fallbackLog(line: string, error: unknown): void {
+    fallbackWrites++
+    lastWriteError = errorDetails(error)
+    console.error(`[Logger] 文件写入失败：${lastWriteError}\n${line}`)
+    try {
+        const fallbackPath = path.join(os.tmpdir(), `novelforge-emergency-${process.pid}.log`)
+        fs.appendFileSync(fallbackPath, `[Logger fallback] ${lastWriteError}\n${line}\n`, 'utf8')
+    } catch (fallbackError) {
+        console.error(`[Logger] 应急日志也无法写入：${errorDetails(fallbackError)}`)
+    }
+}
 
 /** 获取指定环境今天的日志文件路径（Dev 环境带 -dev 前缀，与 Release 文件区分） */
 export function getLogPathFor(env: LogEnvironment): string {
@@ -154,13 +171,11 @@ function ensureLogStream(): fs.WriteStream {
     const todayPath = getTodayLogPath()
 
     // 日期变更 → 切换文件
-    if (todayPath !== currentLogPath) {
+    if (todayPath !== currentLogPath || !logStream || logStream.destroyed) {
         if (logStream) {
             logStream.end()
             logStream = null
         }
-        currentLogPath = todayPath
-
         // 确保目录存在
         if (!fs.existsSync(LOG_DIRS[environment])) {
             fs.mkdirSync(LOG_DIRS[environment], { recursive: true })
@@ -169,7 +184,19 @@ function ensureLogStream(): fs.WriteStream {
         // 清理过期日志（双约束：数量 + 时间窗，配置来自设置页）
         cleanupOldLogs(getRetentionConfig().files, getRetentionConfig().days)
 
-        logStream = fs.createWriteStream(todayPath, { flags: 'a' })
+        const stream = fs.createWriteStream(todayPath, { flags: 'a' })
+        stream.on('error', error => {
+            lastWriteError = errorDetails(error)
+            console.error(`[Logger] 日志流故障 path=${todayPath}\n${lastWriteError}`)
+            if (logStream === stream) {
+                logStream = null
+                currentLogPath = null
+            }
+        })
+        openStreams.add(stream)
+        stream.on('close', () => openStreams.delete(stream))
+        logStream = stream
+        currentLogPath = todayPath
     }
 
     return logStream!
@@ -226,18 +253,30 @@ function outputToTerminal(level: LogLevel, message: string): void {
 }
 
 /** 写入日志（内部函数） */
-function write(level: LogLevel, source: string, message: string): void {
-    if (level < minLevel) return
+function write(level: LogLevel, source: string, message: string): Promise<boolean> {
+    if (level < minLevel) return Promise.resolve(true)
 
+    message = redactErrorText(message)
+    source = redactErrorText(source).replace(/[\r\n]/g, ' ')
     outputToTerminal(level, message)
-
-    // 文件写入（UTF-8，与读取端编码一致）
+    const line = formatMessage(level, source, message)
     try {
+        if (closing) throw new Error('日志系统正在关闭')
         const stream = ensureLogStream()
-        stream.write(formatMessage(level, source, message) + '\n')
-    } catch {
-        // 文件写入失败时回退到 console
-        console.warn('[Logger] 文件写入失败，仅输出到终端')
+        return new Promise(resolve => {
+            try {
+                stream.write(line + '\n', error => {
+                    if (error) fallbackLog(line, error)
+                    resolve(!error)
+                })
+            } catch (error) {
+                fallbackLog(line, error)
+                resolve(false)
+            }
+        })
+    } catch (error) {
+        fallbackLog(line, error)
+        return Promise.resolve(false)
     }
 }
 
@@ -265,6 +304,7 @@ export function initLogger(env: LogEnvironment, version: string): void {
 // ===== 公共 API =====
 
 export const logger = {
+    record: (level: LogLevel, source: string, message: string): Promise<boolean> => write(level, source, message),
     /** 动态设置日志等级 */
     setLevel(level: LogLevel): void {
         minLevel = level
@@ -283,9 +323,7 @@ export const logger = {
     },
 
     error(source: string, message: string | Error): void {
-        const msg = message instanceof Error
-            ? `${message.message}\n${message.stack ?? '(无堆栈)'}`
-            : message
+        const msg = message instanceof Error ? errorDetails(message) : message
         write(LogLevel.ERROR, source, msg)
     },
 
@@ -302,6 +340,36 @@ export const logger = {
     /** 获取当前日志环境 */
     getEnvironment(): LogEnvironment {
         return environment
+    },
+
+    getWriteStatus() {
+        return { fallbackWrites, lastWriteError, emergencyPath: path.join(os.tmpdir(), `novelforge-emergency-${process.pid}.log`) }
+    },
+
+    async flushAndClose(timeoutMs = 3000): Promise<boolean> {
+        closing = true
+        const streams = [...openStreams]
+        const results = await Promise.all(streams.map(stream => new Promise<boolean>(resolve => {
+            if (stream.writableFinished || stream.destroyed) { resolve(!stream.errored); return }
+            const finish = (ok: boolean) => {
+                clearTimeout(timer)
+                stream.off('finish', onFinish)
+                stream.off('error', onError)
+                resolve(ok)
+            }
+            const onFinish = () => finish(true)
+            const onError = () => finish(false)
+            const timer = setTimeout(() => {
+                fallbackLog('日志关闭等待超时，尾部日志可能未完整写入', new Error(`timeoutMs=${timeoutMs}`))
+                finish(false)
+            }, timeoutMs)
+            stream.once('finish', onFinish)
+            stream.once('error', onError)
+            if (!stream.writableEnded) stream.end()
+        })))
+        logStream = null
+        currentLogPath = null
+        return results.every(Boolean)
     },
 
     /** 关闭日志流（应用退出时调用） */

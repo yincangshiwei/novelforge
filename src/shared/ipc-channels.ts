@@ -597,6 +597,7 @@ export interface FileNode {
 }
 
 export interface LLMRequest {
+  trace?: { runId?: string; stepId?: string; purpose?: string }
   requestId?: string
   modelId: string
   messages: import('./llm-tool-protocol').LLMChatMessage[]

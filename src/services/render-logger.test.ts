@@ -36,9 +36,24 @@ describe('renderLog', () => {
     expect(ipc.invoke).toHaveBeenCalledWith('log:write', 'info', 'Workflow', '测试消息')
   })
 
-  it('IPC 失败时静默（不抛异常）', () => {
-    vi.mocked(ipc.invoke).mockRejectedValueOnce(new Error('主进程不可用'))
-    expect(() => renderLog('error', 'Renderer', 'boom')).not.toThrow()
+  it('IPC失败不抛异常，但保留原消息并避免递归', async () => {
+    const fallback = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      vi.mocked(ipc.invoke).mockRejectedValueOnce(new Error('主进程不可用'))
+      expect(() => renderLog('error', 'Renderer', 'boom api_key=secret')).not.toThrow()
+      await vi.waitFor(() => expect(fallback).toHaveBeenCalled())
+      expect(fallback.mock.calls[0][0]).toContain('boom')
+      expect(fallback.mock.calls[0][0]).not.toContain('secret')
+      expect(ipc.invoke).toHaveBeenCalledTimes(1)
+    } finally { fallback.mockRestore() }
+  })
+  it('主日志写入失败回执触发兜底', async () => {
+    const fallback = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      vi.mocked(ipc.invoke).mockResolvedValueOnce({ success: false })
+      renderLog('warn', 'Save', '保存诊断')
+      await vi.waitFor(() => expect(fallback).toHaveBeenCalledWith(expect.stringContaining('保存诊断')))
+    } finally { fallback.mockRestore() }
   })
 })
 

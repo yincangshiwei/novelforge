@@ -6,6 +6,14 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const workflowTexts = {
+  'workflow.failedNotice': { 'zh-CN': '「{title}」在「{step}」失败：{error}', 'en-US': '“{title}” failed at “{step}”: {error}', 'ru-RU': '«{title}»: ошибка на шаге «{step}»: {error}' },
+  'workflow.errorDetails': { 'zh-CN': '错误详情', 'en-US': 'Error details', 'ru-RU': 'Подробности ошибки' },
+  'workflow.viewFailure': { 'zh-CN': '查看失败任务', 'en-US': 'View failed task', 'ru-RU': 'Открыть задачу с ошибкой' },
+  'workflow.partialOutput': { 'zh-CN': '以下为中断前的部分输出，不代表已完成或已保存。', 'en-US': 'Partial output before failure; this does not indicate completion or saving.', 'ru-RU': 'Частичный вывод до ошибки; это не означает завершение или сохранение.' },
+  'workflow.blueprintBatchFailed': { 'zh-CN': '第 {start}–{end} 章蓝图生成失败；此前已提交 {saved} 章。可继续生成，保留已保存蓝图。原因：{error}', 'en-US': 'Blueprint chapters {start}–{end} failed; {saved} chapters previously committed. Continue to keep saved blueprints. Cause: {error}', 'ru-RU': 'Ошибка планов глав {start}–{end}; ранее сохранено {saved} глав. Продолжение сохранит готовые планы. Причина: {error}' },
+  'error.streamMissingFinish': { 'zh-CN': '模型连接已结束，但未收到正常结束原因（unknown）；输出可能不完整。可能是上游断流、网关超时或协议不兼容，请缩小批次或检查模型服务后重试。', 'en-US': 'Connection ended without a normal finish reason (unknown); output may be incomplete. Check the model service/protocol or use a smaller batch.', 'ru-RU': 'Соединение закрыто без причины завершения (unknown); вывод может быть неполным. Проверьте сервис/протокол или уменьшите пакет.' },
+  'error.streamLength': { 'zh-CN': '模型输出达到长度上限（length），结果被截断。请缩小每批章数或提高模型最大输出 Token 后重试。', 'en-US': 'Model output hit the token limit (length). Use a smaller batch or increase max output tokens.', 'ru-RU': 'Достигнут лимит вывода (length). Уменьшите пакет или увеличьте лимит токенов.' },
+  'error.streamAbnormal': { 'zh-CN': '模型异常结束（{reason}），结果未作为成功提交。请查看错误详情并检查模型服务。', 'en-US': 'Model ended abnormally ({reason}); result was not delivered as successful. Check error details and the model service.', 'ru-RU': 'Модель завершилась с ошибкой ({reason}); результат не принят. Проверьте подробности и сервис.' },
   'workflow.deleteHistory': { 'zh-CN': '删除历史记录', 'en-US': 'Delete history', 'ru-RU': 'Удалить запись' },
   'workflow.deleteHistoryConfirm': { 'zh-CN': '删除该任务的历史记录和输出文件？不会删除蓝图、正文或其他作品内容，但将失去从该任务继续生成的入口。', 'en-US': 'Delete this task history and output files? Novel content is kept, but this task can no longer be resumed.', 'ru-RU': 'Удалить историю и вывод задачи? Содержимое произведения сохранится, но продолжить эту задачу будет нельзя.' },
   'workflow.deleteHistoryBusy': { 'zh-CN': '运行中或暂停任务不能删除，请先终止并等待停止', 'en-US': 'Stop the running or paused task before deleting', 'ru-RU': 'Перед удалением остановите задачу' },

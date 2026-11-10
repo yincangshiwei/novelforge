@@ -54,7 +54,8 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
 
     // 从当前默认模型获取 maxTokens，动态计算每批次章节数
     const llmStore = (await import('../../../stores/llm-store')).useLLMStore.getState()
-    const defaultModel = llmStore.models.find(m => m.id === llmStore.defaultModelId)
+    const blueprintModelId = llmStore.getModelForPurpose('blueprint_gen')
+    const defaultModel = llmStore.models.find(m => m.id === blueprintModelId)
     const modelMaxTokens = defaultModel?.maxTokens || 4096
     const outputBudget = Math.floor(modelMaxTokens * 0.6)  // 预留 40% 给 prompt + 思考
     const tokensPerChapter = 200
@@ -117,7 +118,7 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       }
 
       let prompt: string
-      if (cursor === 1 && this.params.mode === 'full') {
+      if (cursor === 1 && this.params.mode === 'full' && batchEnd === endChapter && effectiveBatchSize === batchSize) {
         const template = getPromptTemplate('chapter_blueprint')
         if (!template) throw new Error(t('error.templateMissing'))
         prompt = new DirectoryPromptBuilder(template)
@@ -164,7 +165,19 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       // ① 批次间 system 前缀完全稳定 → API 前缀缓存命中（长链路输入费用减半）
       // ② system 消息遵从度更高 → 50 章级长输出中后段不偏离架构（降幻觉）
       // 注意：必须传注入后的 prompt 字符串而非 builder（callLLMWithBuilder 内部重 build 会丢注入）
-      const resultText = await this.callLLM(prompt, systemRole, callbacks, { staticContext: architecture, purpose: 'blueprint_gen' }, context)
+      const batchTrace = `runId=${context.runId ?? '-'} stepId=${context.stepId ?? '-'} chapters=${cursor}-${batchEnd}`
+      callbacks.log(`[Blueprint:Start] ${batchTrace} saved=${newBlueprints.length} modelId=${blueprintModelId ?? '-'} batchSize=${effectiveBatchSize}`)
+      let resultText: string
+      try {
+        resultText = await this.callLLM(prompt, systemRole, callbacks, { staticContext: architecture, purpose: 'blueprint_gen' }, context)
+      } catch (error) {
+        ensureActive()
+        const message = t('workflow.blueprintBatchFailed')
+          .replace('{start}', String(cursor)).replace('{end}', String(batchEnd))
+          .replace('{saved}', String(newBlueprints.length))
+          .replace('{error}', () => error instanceof Error ? error.message : String(error))
+        throw new Error(message, { cause: error })
+      }
       ensureActive()
 
       // 接受 AI 返回的从 cursor 到 endChapter 范围内的所有有效章节
@@ -174,10 +187,13 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       const parsed = parseTextBlueprints(resultText, cursor,
         this.params.generationMode === 'batch' ? batchEnd : endChapter)
         .filter(b => !savedNumbers.has(b.chapterNumber))
+      callbacks.log(`[Blueprint:Parsed] ${batchTrace} outputChars=${resultText.length} parsed=${parsed.length}`)
       // 批次入库
       if (parsed.length > 0) {
         ensureActive()
+        callbacks.log(`[Blueprint:Saving] ${batchTrace} count=${parsed.length}`)
         await saveAllBlueprints(parsed)
+        callbacks.log(`[Blueprint:Saved] ${batchTrace} count=${parsed.length}`)
         const committed = new Map(newBlueprints.map(b => [b.chapterNumber, b]))
         for (const b of parsed) committed.set(b.chapterNumber, b)
         newBlueprints.splice(0, newBlueprints.length, ...committed.values())

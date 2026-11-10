@@ -14,6 +14,7 @@ import type { LLMChatMessage, LLMStepResult, LLMToolDefinition, LLMToolChoice } 
 export type ResolvedModelProfile = ModelProfile & { apiKey: string }
 
 export interface LLMGenerateOptions {
+  requestId?: string
   signal?: AbortSignal
   temperature: number
   maxTokens: number

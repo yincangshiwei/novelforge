@@ -49,6 +49,15 @@ describe('OpenAICompatibleStreamAdapter', () => {
     expect(events.at(-1)).toMatchObject({ usage: { totalTokens: 10 } })
   })
 
+  it('诊断区分DONE缺失、结束原因缺失及损坏事件', () => {
+    const adapter = createStreamAdapter('openai', 'test')!
+    adapter.push('data: invalid-json\n\ndata: {"choices":[{"delta":{"content":"partial"}}]}\n\n')
+    adapter.flush()
+    expect(adapter.getDiagnostics?.()).toEqual({ doneSeen: false, finishReasonSeen: false, malformedEvents: 1, events: 2 })
+    const normal = createStreamAdapter('openai', 'test')!
+    normal.push('data: {"choices":[{"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+    expect(normal.getDiagnostics?.()).toMatchObject({ doneSeen: true, finishReasonSeen: true, malformedEvents: 0 })
+  })
   it('任意字符边界切 SSE 仍得到同一事件', () => {
     const whole = collect([sse.join('')])
     for (let i = 0; i <= sse.join('').length; i += 7) {

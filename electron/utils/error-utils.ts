@@ -6,13 +6,8 @@
  */
 
 /** 从任意 catch 值中提取可读错误消息 */
+import { errorMessage } from '../../src/shared/error-diagnostics'
+
 export function safeErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  if (typeof error === 'string') return error
-  try {
-    // JSON.stringify(undefined) 返回 undefined（非字符串），需回退到 String()
-    return JSON.stringify(error) ?? String(error)
-  } catch {
-    return String(error)
-  }
+  return errorMessage(error)
 }

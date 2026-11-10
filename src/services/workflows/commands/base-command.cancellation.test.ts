@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BaseWorkflowCommand } from './base-command'
+import { renderLog } from '../../render-logger'
 import type { StepCallbacks, WorkflowContext } from '../../../stores/workflow-store'
 
 const h = vi.hoisted(() => ({ generateStream: vi.fn(), cancelGeneration: vi.fn() }))
@@ -28,6 +29,15 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers())
 
 describe('callLLM cancellation', () => {
+  it('快速失败仍有同一个请求ID关联任务、模型和日志', async () => {
+    h.generateStream.mockImplementationOnce(async (_messages, cb) => { cb.onError('network failure'); return 'unused' })
+    await expect(new Probe().run({ runId: 'run-1', stepId: 'step-1', data: {}, cancelled: false }, callbacks())).rejects.toThrow('network failure')
+    const options = h.generateStream.mock.calls[0][3]
+    expect(options.trace).toMatchObject({ runId: 'run-1', stepId: 'step-1' })
+    expect(h.generateStream.mock.calls[0][2]).toBe('m1')
+    expect(renderLog).toHaveBeenCalledWith('info', 'LLM', expect.stringContaining(`requestId=${options.requestId}`))
+    expect(renderLog).toHaveBeenCalledWith('error', 'LLM', expect.stringContaining(`requestId=${options.requestId}`))
+  })
   it('pre-aborted signal never starts a request', async () => {
     const controller = new AbortController()
     controller.abort()

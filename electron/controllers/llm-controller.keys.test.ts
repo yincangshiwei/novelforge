@@ -78,6 +78,7 @@ vi.mock('../ollama-embedding', () => ({
 }))
 
 import { t } from '../../src/shared/locale'
+import { logger } from '../utils/logger'
 import { registerLLMController } from './llm-controller'
 import { llmConcurrencyController } from '../utils/concurrency-controller'
 import { MODELS_CONFIG_PATH, writeJsonFile, __setConfigFilesForTest } from '../utils/config-utils'
@@ -154,6 +155,17 @@ beforeEach(() => {
 })
 
 describe('llm:generate 可取消生命周期', () => {
+  it('模型拒绝保留requestId与cause，日志不含正文或凭据', async () => {
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    h.provider.generate.mockRejectedValueOnce(new Error('network failure', { cause: new Error('Bearer private-secret') }))
+    const result = await call('llm:generate', { requestId: 'trace-failure', trace: { runId: 'run-1', stepId: 'step-1' }, modelId: MODEL_ID, messages: MESSAGES })
+    expect(result).toMatchObject({ success: false })
+    expect(logger.error).toHaveBeenCalledWith('LLM:Request', expect.stringContaining('requestId=trace-failure'))
+    const detail = String(vi.mocked(logger.error).mock.calls.at(-1)?.[1])
+    expect(detail).toContain('runId=run-1')
+    expect(detail).toContain('Caused by:')
+    expect(detail).not.toContain('private-secret')
+  })
   it('取消先于登记时不启动，且墓碑消费后可再请求', async () => {
     writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
     await call('llm:cancel', 'early-cancel')

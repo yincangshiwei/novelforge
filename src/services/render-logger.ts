@@ -4,11 +4,12 @@
  * 设计（2026-08-05）：
  * - 工作流日志（workflow-store addLog）与全局渲染错误（error / unhandledrejection）
  *   通过 log:write 写入主进程日志文件——用户反馈问题时文件日志完整可查（此前仅内存 500 条）
- * - fire-and-forget：不阻塞渲染主线程，失败静默（IPC 不可用 / 早期启动 / 浏览器模式）
+ * - fire-and-forget：不阻塞渲染主线程，IPC/写入失败回退终端，不递归写日志
  * - 调用方自行控制频率：LLM 流式 chunk 等高频路径不走这里（写文件会爆炸）
  */
 import { ipc } from './ipc-client'
 import { t } from '../shared/locale'
+import { errorDetails, redactErrorText } from '../shared/error-diagnostics'
 import type { LogEnvMode } from '../shared/ipc-channels'
 
 export type RenderLogLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -28,10 +29,16 @@ export function getCurrentLogEnv(): LogEnvMode {
 
 /** 写入主进程日志文件（异步落盘，不等待结果） */
 export function renderLog(level: RenderLogLevel, source: string, message: string): void {
+  const safeMessage = redactErrorText(message)
+  const fallback = (error: unknown) => {
+    console.error(`[RenderLogger] 日志传递失败 [${level}] [${source}] ${safeMessage}\n${errorDetails(error)}`)
+  }
   try {
-    ipc.invoke('log:write', level, source, message).catch(() => { /* 主进程侧失败静默 */ })
-  } catch {
-    // 测试/浏览器模式（velaAPI 未注入）时静默
+    ipc.invoke('log:write', level, source, safeMessage).then(result => {
+      if (result?.success !== true) fallback(new Error('主进程未确认日志写入'))
+    }).catch(fallback)
+  } catch (error) {
+    fallback(error)
   }
 }
 

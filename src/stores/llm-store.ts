@@ -139,7 +139,7 @@ interface LLMState {
     messages: import('../shared/llm-tool-protocol').LLMChatMessage[],
     callbacks: StreamCallbacks,
     modelId?: string,
-    options?: { responseFormat?: { type: string }; thinking?: boolean; priority?: number; temperature?: number; tools?: import('../shared/llm-tool-protocol').LLMToolDefinition[]; toolChoice?: import('../shared/llm-tool-protocol').LLMToolChoice }
+    options?: { requestId?: string; trace?: import('../shared/ipc-channels').LLMRequest['trace']; responseFormat?: { type: string }; thinking?: boolean; priority?: number; temperature?: number; tools?: import('../shared/llm-tool-protocol').LLMToolDefinition[]; toolChoice?: import('../shared/llm-tool-protocol').LLMToolChoice }
   ) => Promise<string>
   /** 取消生成 */
   cancelGeneration: (requestId: string) => Promise<void>
@@ -449,7 +449,7 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
       return ''
     }
 
-    const requestId = crypto.randomUUID()
+    const requestId = options?.requestId ?? crypto.randomUUID()
 
     // 注册流式事件监听
     const unsubChunk = ipc.on('llm:stream-chunk', (data) => {
@@ -493,6 +493,7 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
       modelId: mid,
       messages,
       stream: true,
+      trace: options?.trace,
       temperature: resolveRequestTemperature(options),
       responseFormat: options?.responseFormat as { type: 'json_object' | 'text' } | undefined,
       thinking: options?.thinking,

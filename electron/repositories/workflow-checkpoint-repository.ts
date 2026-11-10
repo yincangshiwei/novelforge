@@ -3,7 +3,7 @@ import { getProjectDb } from '../database'
 export class WorkflowCheckpointRepository {
   static save(stateJson: string): void {
     const db = getProjectDb()
-    if (!db) return
+    if (!db) throw new Error('项目数据库未打开，无法保存工作流执行记录')
     db.prepare(
       `INSERT INTO workflow_checkpoints (id, state_json, updated_at) VALUES (1, ?, unixepoch() * 1000)
        ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at`

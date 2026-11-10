@@ -166,12 +166,6 @@ export function registerConfigController() {
   /** 记录前端日志（渲染进程通过 IPC 写入；level 为字符串，主进程映射到 LogLevel） */
   guardedHandle('log:write', async (_event, level: 'debug' | 'info' | 'warn' | 'error', source: string, message: string) => {
     const logLevel = RENDER_LOG_LEVELS[level] ?? LogLevel.INFO
-    switch (logLevel) {
-      case LogLevel.DEBUG: logger.debug(source, message); break
-      case LogLevel.INFO: logger.info(source, message); break
-      case LogLevel.WARN: logger.warn(source, message); break
-      case LogLevel.ERROR: logger.error(source, message); break
-    }
-    return { success: true }
+    return { success: await logger.record(logLevel, source, message) }
   })
 }
