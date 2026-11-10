@@ -259,7 +259,6 @@ describe('工作流历史结果持久化', () => {
 
   it('当前输出173章的完整行恢复到原任务，不把旧库300章当进度', async () => {
     const directory = await import('../services/workflows/directory-workflow')
-    const parse = vi.spyOn(directory, 'parseTextBlueprints').mockReturnValueOnce([{ chapterNumber: 173, title: '完整章' }] as never)
     const save = vi.spyOn(directory, 'saveAllBlueprints').mockResolvedValueOnce(undefined)
     const registry = await import('../services/workflows/workflow-registry')
     let received: Record<string, unknown> | undefined
@@ -269,15 +268,15 @@ describe('工作流历史结果持久化', () => {
     ] }))
     const old = makeRun('173-run', { type: 'directory', status: 'failed', steps: [
       { id: 's0', name: '读取', description: '', status: 'completed', logs: [] },
-      { id: 's1', name: '生成', description: '', status: 'running', result: '| 173 | 完整章 | 发展 | 目的 | 人物 | 事件 | 悬念 |\n| 174 | 未完成', logs: [] },
+      { id: 's1', name: '生成', description: '', status: 'running', result: Array.from({ length: 173 }, (_, i) => `| ${i + 1} | 完整章 | 发展 | 目的 | 人物 | 事件 | 悬念 |`).join('\n') + '\n| 174 | 未完成 |', logs: [] },
     ], resumeData: { architecture: 'world', newBlueprints: [{ chapterNumber: 172 }] } })
     useWorkflowStore.setState({ history: [old] })
     await useWorkflowStore.getState().continueDirectory('173-run')
-    expect((received?.newBlueprints as { chapterNumber: number }[]).map(b => b.chapterNumber)).toEqual([172, 173])
-    expect(parse.mock.calls[0][0]).not.toContain('174')
+    expect((received?.newBlueprints as { chapterNumber: number }[]).map(b => b.chapterNumber)).toEqual(Array.from({ length: 173 }, (_, i) => i + 1))
+    expect(save.mock.calls[0][0]).toHaveLength(173)
     expect(h.invoke.mock.calls.some(c => c[0] === 'db:blueprint-get-all')).toBe(false)
     expect(useWorkflowStore.getState().history[0].id).toBe('173-run')
-    parse.mockRestore(); save.mockRestore(); factory.mockRestore()
+    save.mockRestore(); factory.mockRestore()
   })
 
   it('异常退出恢复的蓝图步骤不再显示运行且不自动调用模型', async () => {

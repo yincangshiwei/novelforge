@@ -653,10 +653,9 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
       const directory = await import('../services/workflows/directory-workflow')
       const generationIndex = current.steps.length > 1 ? 1 : 0
       const output = await readStepOutputTail(runId, generationIndex, { full: true })
-      const text = output.exists && output.content ? output.content : current.steps[generationIndex]?.result ?? ''
-      const completeRows = text.split('\n').filter(line => /^\s*\|\s*\d+\s*\|/.test(line) && /\|\s*$/.test(line)).join('\n')
+      const text = [output.exists ? output.content : '', current.steps[generationIndex]?.result ?? ''].filter(Boolean).join('\n')
       const end = useProjectStore.getState().currentProject?.novelConfig.totalChapters ?? Number.MAX_SAFE_INTEGER
-      const parsed = completeRows ? directory.parseTextBlueprints(completeRows, 1, end) : []
+      const parsed = directory.recoverBlueprintRows(text, 1, end)
       const committed = new Map(((data.newBlueprints ?? []) as import('../services/workflows/directory-workflow').ChapterBlueprint[]).map(b => [b.chapterNumber, b]))
       for (const blueprint of parsed) committed.set(blueprint.chapterNumber, blueprint)
       data.newBlueprints = [...committed.values()].sort((a, b) => a.chapterNumber - b.chapterNumber)

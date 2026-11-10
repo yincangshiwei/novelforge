@@ -205,6 +205,22 @@ export function parseTextBlueprintsFromTable(
  * PATH 1: Markdown 表格（主路径）— 更可靠
  * PATH 2: JSON（fallback 路径）— 向后兼容
  */
+export function recoverBlueprintRows(content: string, startNum: number, endNum: number): ChapterBlueprint[] {
+  const lines = stripThinkingTags(content).split('\n')
+  let header = '| chapterNumber | title | role | purpose | characters | keyEvents | suspenseHook |'
+  const result = new Map<number, ChapterBlueprint>()
+  for (const line of lines) {
+    const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map(cell => cell.trim())
+    if (cells.includes('chapterNumber') && cells.includes('keyEvents')) { header = line; continue }
+    const expected = header.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).length
+    if (!/^\s*\|\s*\d+\s*\|/.test(line) || !/\|\s*$/.test(line) || cells.length !== expected) continue
+    const table = `${header}\n|${Array(expected).fill('---').join('|')}|\n${line}`
+    const rows = parseTextBlueprintsFromTable(parseMarkdownTable(table) ?? [], startNum, endNum)
+    for (const row of rows) result.set(row.chapterNumber, row)
+  }
+  return [...result.values()].sort((a, b) => a.chapterNumber - b.chapterNumber)
+}
+
 export function parseTextBlueprints(content: string, startNum: number, endNum: number): ChapterBlueprint[] {
   try {
     const cleanContent = stripThinkingTags(content)
