@@ -137,6 +137,7 @@ export const IPC_CHANNEL_POLICY: Record<InvokeChannel, ChannelPolicy> = {
   'db:automation-delete': { authority: 'destructive' },
   'db:close': { authority: 'write-project' },
   'db:draft-create': { authority: 'write-project' },
+  'db:draft-delete': { authority: 'write-project' },
   'db:draft-get-all-chapter-numbers': { authority: 'read-project' },
   'db:draft-get-finalized': { authority: 'read-project' },
   'db:draft-get-full': { authority: 'read-project' },

@@ -6,6 +6,9 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const editorTexts = {
+  'draftbox.permanentDelete': { 'zh-CN': '永久删除草稿', 'en-US': 'Permanently delete draft', 'ru-RU': 'Удалить черновик навсегда' },
+  'draftbox.permanentDeleteConfirm': { 'zh-CN': '永久删除「{name}」及其快照、修稿和审稿记录？此操作不可恢复，不影响其他草稿版本。', 'en-US': 'Permanently delete “{name}” and its snapshots, revisions and reviews? This cannot be undone. Other drafts are kept.', 'ru-RU': 'Удалить «{name}», снимки, правки и рецензии навсегда? Действие необратимо. Другие версии сохранятся.' },
+  'draftbox.deleteOpenTab': { 'zh-CN': '请先关闭该章节的编辑器页签，再永久删除归档草稿，以免丢失未保存内容或正在查看的版本。', 'en-US': 'Close this chapter’s editor tabs before permanently deleting an archived draft.', 'ru-RU': 'Закройте вкладки этой главы перед удалением архивного черновика.' },
   'editor.refresh': { 'zh-CN': '刷新', 'en-US': 'Refresh', 'ru-RU': 'Обновить' },
   'editor.refreshConfirm': { 'zh-CN': '当前正文有未保存修改，刷新会丢弃这些修改。继续？', 'en-US': 'The editor has unsaved changes; refreshing will discard them. Continue?', 'ru-RU': 'В тексте есть несохранённые правки; обновление их удалит. Продолжить?' },
   'editor.refreshed': { 'zh-CN': '已重新载入', 'en-US': 'Reloaded', 'ru-RU': 'Перезагружено' },

@@ -325,6 +325,31 @@ export class DraftRepository {
         db.prepare('UPDATE drafts SET last_auto_snapshot_at = ? WHERE id = ?').run(at, id)
     }
 
+    static deleteArchived(id: number, chapterNumber: number): void {
+        const db = getProjectDb()
+        if (!db) throw new Error('项目数据库未打开')
+        if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(chapterNumber) || chapterNumber <= 0) throw new Error('无效的草稿标识')
+        db.transaction(() => {
+            const meta = DraftRepository.getMeta(id)
+            if (!meta || meta.chapterNumber !== chapterNumber || meta.status !== 'archived') throw new Error('只能永久删除对应章节的已归档草稿')
+            const dependency = db.prepare(`SELECT id FROM draft_branches WHERE head_draft_id = ? OR base_snapshot_id IN (SELECT id FROM draft_snapshots WHERE draft_id = ?) LIMIT 1`).get(id, id)
+            const merged = db.prepare('SELECT id FROM revisions WHERE merged_to_draft_id = ? AND base_draft_id != ? LIMIT 1').get(id, id)
+            if (dependency || merged) throw new Error('该草稿被分支或其他修稿记录引用，不能永久删除')
+            const contents = db.prepare(`SELECT content_id FROM drafts WHERE id = ?
+                UNION SELECT content_id FROM draft_snapshots WHERE draft_id = ?
+                UNION SELECT content_id FROM revisions WHERE base_draft_id = ?
+                UNION SELECT content_id FROM reviews WHERE base_draft_id = ?`).all(id, id, id, id) as Array<{ content_id: number }>
+            db.prepare('DELETE FROM drafts WHERE id = ?').run(id)
+            const cleanup = db.prepare(`DELETE FROM contents WHERE id = ?
+                AND NOT EXISTS (SELECT 1 FROM drafts WHERE content_id = contents.id)
+                AND NOT EXISTS (SELECT 1 FROM draft_snapshots WHERE content_id = contents.id)
+                AND NOT EXISTS (SELECT 1 FROM revisions WHERE content_id = contents.id)
+                AND NOT EXISTS (SELECT 1 FROM reviews WHERE content_id = contents.id)
+                AND NOT EXISTS (SELECT 1 FROM scenes WHERE content_id = contents.id)`)
+            for (const content of contents) cleanup.run(content.content_id)
+        })()
+    }
+
     /** 删除草稿（级联删除 revisions/reviews，但 contents 需手动清理） */
     static delete(id: number): void {
         const db = getProjectDb()

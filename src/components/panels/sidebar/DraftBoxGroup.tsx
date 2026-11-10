@@ -16,6 +16,8 @@ import { showSidebarMenu } from './SidebarShared'
 import { ipc } from '../../../services/ipc-client'
 import { useTranslation } from '../../../hooks/useTranslation'
 import SidebarGroup from './SidebarGroup'
+import { toast } from '../../ui/Toast'
+import { errorMessage } from '../../../shared/error-diagnostics'
 
 // ===== 草稿箱卡片组 =====
 
@@ -208,15 +210,29 @@ function DraftItem({
     })
   }
 
+  const [deleting, setDeleting] = useState(false)
+
   /** 将草稿标记为归档（软删除） */
   const deleteDraft = async () => {
-    if (isFinalized) return
-    const ok = await confirm(
-      t('draftbox.archiveConfirm').replace('{name}', `${chapterTitleText} v${draft.version}`),
-      { title: t('dialog.confirmArchive'), confirmText: t('draftbox.archiveAction'), danger: true }
-    )
-    if (!ok) return
-    await useDraftStore.getState().markDraftStatus(draft.filePath, draft.chapterNumber, 'archived')
+    if (isFinalized || deleting) return
+    setDeleting(true)
+    try {
+      const ok = await confirm(
+        t(archived ? 'draftbox.permanentDeleteConfirm' : 'draftbox.archiveConfirm').replace('{name}', `${chapterTitleText} v${draft.version}`),
+        { title: t(archived ? 'draftbox.permanentDelete' : 'dialog.confirmArchive'), confirmText: t(archived ? 'draftbox.permanentDelete' : 'draftbox.archiveAction'), danger: true }
+      )
+      if (!ok) return
+      if (archived) {
+        const result = await useDraftStore.getState().deleteArchivedDraft(draft.filePath, draft.chapterNumber)
+        if (!result.success) throw new Error(result.error || t('draftbox.permanentDelete'))
+      } else {
+        await useDraftStore.getState().markDraftStatus(draft.filePath, draft.chapterNumber, 'archived')
+      }
+    } catch (error) {
+      toast.error(errorMessage(error))
+    } finally {
+      setDeleting(false)
+    }
   }
 
   const isFinalized = draft.status === 'finalized'
@@ -244,7 +260,7 @@ function DraftItem({
         { key: 'div2', type: 'divider' as const },
         {
           key: 'delete',
-          label: t('action.deleteDraft'),
+          label: t(archived ? 'draftbox.permanentDelete' : 'action.deleteDraft'),
           icon: <Trash2 size={13} />,
           danger: true,
           disabled: isFinalized,
@@ -284,6 +300,17 @@ function DraftItem({
         {isFinalized && (
           <CheckCircle2 size={10} style={{ color: 'var(--color-success)', flexShrink: 0 }} />
         )}
+      </button>
+      <button
+        type="button"
+        className="icon-btn flex-shrink-0 mr-1"
+        title={t(archived ? 'draftbox.permanentDelete' : 'action.deleteDraft')}
+        aria-label={`${t(archived ? 'draftbox.permanentDelete' : 'action.deleteDraft')} ${chapterTitleText} v${draft.version}`}
+        disabled={isFinalized || deleting}
+        onClick={() => { void deleteDraft() }}
+        style={{ width: 26, height: 26, color: 'var(--color-error)', opacity: isFinalized || deleting ? 0.35 : 1 }}
+      >
+        <Trash2 size={13} />
       </button>
     </div>
   )

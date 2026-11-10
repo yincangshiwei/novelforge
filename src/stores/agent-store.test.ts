@@ -138,6 +138,48 @@ beforeEach(() => {
   Object.defineProperty(window, 'velaAPI', { value: { invoke: mockInvoke }, configurable: true })
 })
 
+describe('用户消息编辑重发', () => {
+  it('回退到用户消息之前，保留原请求和后续，原始输入重新发送一次', async () => {
+    const conv = useAgentStore.getState().createConversation({ title: '编辑' })
+    const messages = [
+      { id: 'first', role: 'user' as const, content: '前置', createdAt: 1 },
+      { id: 'answer', role: 'assistant' as const, content: '前置回复', createdAt: 2 },
+      { id: 'edit', role: 'user' as const, content: '旧请求 @file', createdAt: 3 },
+      { id: 'later', role: 'assistant' as const, content: '旧回复', createdAt: 4 },
+    ]
+    useAgentStore.setState({ generating: false, conversations: [{ ...conv, messages }] })
+    const send = vi.spyOn(useAgentStore.getState(), 'sendMessage').mockImplementation(async content => {
+      const current = useAgentStore.getState().getActiveConversation()!
+      expect(current.messages.map(m => m.id)).toEqual(['first', 'answer'])
+      useAgentStore.setState({ conversations: [{ ...current, messages: [...current.messages, { id: 'new', role: 'user', content, createdAt: 5 }] }] })
+    })
+    try {
+      expect(await useAgentStore.getState().editAndResendMessage(conv.id, 'edit', '修改请求 @file')).toEqual({ success: true })
+      expect(send).toHaveBeenCalledExactlyOnceWith('修改请求 @file')
+      expect(useAgentStore.getState().getActiveConversation()!.rewound?.[0].messages).toEqual(messages.slice(2))
+    } finally { send.mockRestore() }
+  })
+  it('首条也可编辑，发送未启动时恢复原历史', async () => {
+    const conv = useAgentStore.getState().createConversation({ title: '编辑' })
+    const message = { id: 'first', role: 'user' as const, content: '原请求', createdAt: 1 }
+    useAgentStore.setState({ generating: false, conversations: [{ ...conv, messages: [message] }] })
+    const send = vi.spyOn(useAgentStore.getState(), 'sendMessage').mockResolvedValue(undefined)
+    try {
+      expect((await useAgentStore.getState().editAndResendMessage(conv.id, 'first', '修改')).success).toBe(false)
+      expect(useAgentStore.getState().getActiveConversation()!.messages).toEqual([message])
+    } finally { send.mockRestore() }
+  })
+  it('运行中、空文本或会话不匹配不截断历史', async () => {
+    const conv = useAgentStore.getState().createConversation({ title: '编辑' })
+    useAgentStore.setState({ generating: true })
+    expect((await useAgentStore.getState().editAndResendMessage(conv.id, 'first', '修改')).success).toBe(false)
+    useAgentStore.setState({ generating: false })
+    expect((await useAgentStore.getState().editAndResendMessage(conv.id, 'first', ' ')).success).toBe(false)
+    expect((await useAgentStore.getState().editAndResendMessage('other', 'first', '修改')).success).toBe(false)
+    expect(useAgentStore.getState().getActiveConversation()!.rewound).toBeUndefined()
+  })
+})
+
 describe('agent-store 持久化', () => {
   it('createConversation 写入项目快照并落盘', async () => {
     const conv = useAgentStore.getState().createConversation({ title: 'T' })

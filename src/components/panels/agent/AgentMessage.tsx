@@ -6,7 +6,7 @@
  * - 助手消息：左侧 Markdown 风格渲染
  * - Tool 调用：ToolCallBlock / ConfirmCard / ArtifactCard
  */
-import { memo } from 'react'
+import { memo, useState } from 'react'
 import type { AgentMessage as AgentMessageType } from '../../../stores/agent-store'
 import type { ToolCallInfo } from '../../../services/agent/agent-engine'
 import MarkdownContent, { StreamingCursor } from '../../ui/MarkdownContent'
@@ -17,7 +17,7 @@ import ProcessGroup from './ProcessGroup'
 import TurnErrorRow from './TurnErrorRow'
 import PlanSteps from './PlanSteps'
 // 注：brief 声明使用 ForkRight，实测 lucide-react 1.8.0 无此导出；改用 lucide 规范 fork 图标 GitFork（语义等同「从此分支」）
-import { GitFork, Undo2, Copy, ThumbsUp, ThumbsDown } from 'lucide-react'
+import { GitFork, Undo2, Copy, ThumbsUp, ThumbsDown, Pencil, Check, X } from 'lucide-react'
 import { useTranslation } from '../../../hooks/useTranslation'
 import { splitMentionRefs } from '../../../services/agent/mention-refs'
 import { extractPlanSteps } from '../../../services/agent/plan-steps'
@@ -53,6 +53,8 @@ interface Props {
   onRewind?: (messageId: string) => void
   /** 末条消息禁用回退（F6/D1：无内容可截断——store 静默 no-op，禁用 + 解释性 tooltip 消除无声失败） */
   rewindDisabled?: boolean
+  onEdit?: (messageId: string, content: string) => Promise<{ success: boolean; error?: string }>
+  editDisabled?: boolean
 }
 
 /**
@@ -209,8 +211,23 @@ function FeedbackButtons({ message }: { message: AgentMessageType }) {
   )
 }
 
-export default memo(function AgentMessage({ message, onFork, onRewind, rewindDisabled }: Props) {
+export default memo(function AgentMessage({ message, onFork, onRewind, rewindDisabled, onEdit, editDisabled }: Props) {
   const { t } = useTranslation()
+  const [editing, setEditing] = useState(false)
+  const [editText, setEditText] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [editError, setEditError] = useState('')
+  const submitEdit = async () => {
+    if (!onEdit || submitting || editDisabled || !editText.trim()) return
+    setSubmitting(true)
+    setEditError('')
+    try {
+      const result = await onEdit(message.id, editText)
+      if (result.success) setEditing(false)
+      else setEditError(result.error || t('agent.editUnavailable'))
+    } catch (error) { setEditError(String(error)) }
+    finally { setSubmitting(false) }
+  }
   const { role, content, createdAt, streaming, toolCalls, artifacts, error } = message
 
   // 分支操作区（2026-09-22：由 hover 显隐改为**持续显示**；
@@ -252,8 +269,30 @@ export default memo(function AgentMessage({ message, onFork, onRewind, rewindDis
           <span className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>{t('agent.you')}</span>
           <span className="tabular-nums">{formatLocaleTime(createdAt)}</span>
           <CopyButton text={content} />
+          {onEdit && !editing && (
+            <button type="button" className={ACTION_BTN} style={ACTION_BTN_SIZE}
+              title={t(editDisabled ? 'agent.editUnavailable' : 'agent.editMessage')}
+              aria-label={t('agent.editMessage')} disabled={editDisabled}
+              onClick={() => { setEditText(message.originalContent ?? content); setEditError(''); setEditing(true) }}>
+              <Pencil size={12} />
+            </button>
+          )}
         </div>
-        <div
+        {editing ? (
+          <div className="space-y-2">
+            <textarea autoFocus className="w-full min-h-24 rounded border border-[var(--color-border)] bg-[var(--color-bg)] p-2 text-xs"
+              aria-label={t('agent.editMessage')} value={editText} disabled={submitting}
+              onChange={event => setEditText(event.target.value)} />
+            <p className="text-2xs" style={{ color: 'var(--color-text-muted)' }}>{t('agent.editResendHint')}</p>
+            {editError && <p role="alert" className="text-xs" style={{ color: 'var(--color-error)' }}>{editError}</p>}
+            <div className={ACTION_BAR}>
+              <button type="button" className={ACTION_BTN} style={ACTION_BTN_SIZE} title={t('agent.editResend')} aria-label={t('agent.editResend')}
+                disabled={submitting || editDisabled || !editText.trim()} onClick={() => { void submitEdit() }}><Check size={12} /></button>
+              <button type="button" className={ACTION_BTN} style={ACTION_BTN_SIZE} title={t('action.cancel')} aria-label={t('action.cancel')}
+                disabled={submitting} onClick={() => setEditing(false)}><X size={12} /></button>
+            </div>
+          </div>
+        ) : <div
           className="text-xs leading-relaxed break-words whitespace-pre-wrap"
           style={{
             borderLeft: '2px solid var(--color-border)',
@@ -262,7 +301,7 @@ export default memo(function AgentMessage({ message, onFork, onRewind, rewindDis
           }}
         >
           {renderUserContent(content)}
-        </div>
+        </div>}
       </div>
     )
   }

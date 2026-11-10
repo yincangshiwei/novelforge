@@ -788,6 +788,7 @@ export interface DatabaseChannels {
   'db:publication-list': { args: []; return: PublicationEntry[] }
   'db:publication-save': { args: [input: { chapterNumber: number; title: string; content: string; terms?: string[] }]; return: { success: boolean; error?: string } }
   'db:publication-delete': { args: [chapterNumber: number]; return: { success: boolean } }
+  'db:draft-delete': { args: [id: number, chapterNumber: number]; return: { success: boolean; error?: string } }
   'db:draft-list': { args: [chapterNumber: number]; return: DraftMeta[] }
   'db:draft-get-meta': { args: [id: number]; return: DraftMeta | null }
   'db:draft-get-full': { args: [id: number]; return: DraftFull | null }

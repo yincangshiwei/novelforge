@@ -330,6 +330,18 @@ export function registerDatabaseController() {
     return DraftRepository.getNextVersion(chapterNumber)
   })
 
+  guardedHandle('db:draft-delete', async (_event, id: number, chapterNumber: number) => {
+    try {
+      DraftRepository.deleteArchived(id, chapterNumber)
+      logger.info('DB:Draft', `永久删除归档草稿 draftId=${id} chapter=${chapterNumber}`)
+      return { success: true }
+    } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err))) throw err
+      logger.error('DB:Draft', err instanceof Error ? err : String(err))
+      return { success: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
   guardedHandle('db:draft-update-status', async (_event, id: number, status: string, wordCount?: number) => {
     try {
       DraftRepository.updateStatus(id, status, wordCount)

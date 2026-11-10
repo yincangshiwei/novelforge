@@ -6,6 +6,10 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const agentTexts = {
+  'agent.editMessage': { 'zh-CN': '编辑消息', 'en-US': 'Edit message', 'ru-RU': 'Изменить сообщение' },
+  'agent.editResend': { 'zh-CN': '确认并重新发送', 'en-US': 'Confirm and resend', 'ru-RU': 'Подтвердить и отправить' },
+  'agent.editResendHint': { 'zh-CN': '确认后将回退到这条消息之前并重新发送；原消息及后续对话保留在回退记录中。不会撤销已执行的文件、数据库或工作流操作。', 'en-US': 'Resend from before this message; the original and later messages are kept in rewind history. File, database and workflow actions are not undone.', 'ru-RU': 'Повторная отправка с позиции до сообщения; исходная история сохраняется. Действия с файлами, БД и процессами не отменяются.' },
+  'agent.editUnavailable': { 'zh-CN': '请先停止生成，再编辑重发。', 'en-US': 'Stop generation before editing and resending.', 'ru-RU': 'Остановите генерацию перед редактированием.' },
   'agentConfirm.diffPreview': { 'zh-CN': '变更预览', 'en-US': 'Change preview', 'ru-RU': 'Предпросмотр изменений' },
   'agentConfirm.diffNewFile': { 'zh-CN': '新文件', 'en-US': 'new file', 'ru-RU': 'новый файл' },
   'agentConfirm.diffMore': { 'zh-CN': '还有 {n} 行未显示', 'en-US': '{n} more lines not shown', 'ru-RU': 'Ещё {n} строк не показано' },

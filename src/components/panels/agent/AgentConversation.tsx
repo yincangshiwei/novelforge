@@ -299,6 +299,12 @@ function ActiveConversation() {
     if (ok) useAgentStore.getState().rewindToMessage(messageId)
   }, [t])
 
+  const handleEdit = useCallback(async (messageId: string, content: string) => {
+    const conversationId = activeConv?.id
+    if (!conversationId) return { success: false, error: t('agent.editUnavailable') }
+    return useAgentStore.getState().editAndResendMessage(conversationId, messageId, content)
+  }, [activeConv?.id, t])
+
   // ⚠️ 两个 hook 必须放在 `if (!activeConv) return null` **之前**（条件调用 useMemo 会被
   //    react-hooks/rules-of-hooks 拦下）；故此处对 activeConv 做可空处理
   const subSessions = activeConv?.subSessions
@@ -418,6 +424,8 @@ function ActiveConversation() {
                 message={msg}
                 onFork={handleFork}
                 onRewind={handleRewind}
+                onEdit={handleEdit}
+                editDisabled={generating}
                 // 末条：不可回退（F6 store 已 no-op）——禁用 + 解释性 tooltip 消除无声失败
                 rewindDisabled={msg.id === lastVisibleId}
               />

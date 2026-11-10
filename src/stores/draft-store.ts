@@ -17,6 +17,9 @@ import { getDraftDir } from '../services/workflows/chapter-workflow'
 import { useProjectStore } from './project-store'
 import { useWorkflowStore } from './workflow-store'
 import { globalEventBus } from '../shared/event-bus'
+import { useEditorStore } from './editor-store'
+import { errorMessage } from '../shared/error-diagnostics'
+import { t } from '../shared/locale'
 
 // ===== 类型定义 =====
 
@@ -41,6 +44,7 @@ interface DraftState {
   markDraftStatus: (draftPath: string, chapterNumber: number, status: DraftStatus) => Promise<void>
   /** 仅将已定稿的数据库正文恢复为草稿，不撤销文件或知识库后处理 */
   returnToDraft: (draftPath: string, chapterNumber: number) => Promise<{ success: boolean; error?: string }>
+  deleteArchivedDraft: (draftPath: string, chapterNumber: number) => Promise<{ success: boolean; error?: string }>
   /** 清除指定章节的缓存（下次访问时重新加载） */
   invalidateChapter: (chapterNumber: number) => void
   /** 应用合并后的修稿，更新文件和各类状态 */
@@ -132,7 +136,8 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
     if (draftPath.startsWith(VELA.DRAFT)) {
       const idRaw = draftPath.replace(VELA.DRAFT, '')
       if (/^\d+$/.test(idRaw)) {
-        await ipc.invoke('db:draft-update-status', parseInt(idRaw, 10), status)
+        const result = await ipc.invoke('db:draft-update-status', parseInt(idRaw, 10), status)
+        if (!result.success) throw new Error(result.error || '草稿状态更新失败')
         await get().loadChapterDrafts(chapterNumber)
         return
       }
@@ -191,6 +196,34 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
     } finally {
       pendingReturns.delete(requestKey)
     }
+  },
+
+  deleteArchivedDraft: async (draftPath, chapterNumber) => {
+    const match = draftPath.match(/^vela:\/\/draft\/(\d+)$/)
+    const id = match ? Number(match[1]) : NaN
+    const project = useProjectStore.getState().currentProject
+    if (!project || !Number.isSafeInteger(id) || id <= 0) return { success: false, error: '无效的数据库草稿或未打开项目' }
+    const key = `delete:${project.path}:${id}`
+    if (pendingReturns.has(key)) return { success: false, error: '正在删除，请勿重复提交' }
+    pendingReturns.add(key)
+    try {
+      const meta = await ipc.invoke('db:draft-get-meta', id)
+      if (!meta || meta.chapterNumber !== chapterNumber || meta.status !== 'archived') return { success: false, error: '草稿不存在或不是已归档版本' }
+      if (useProjectStore.getState().currentProject !== project) return { success: false, error: '项目已切换，请重新确认' }
+      if (useWorkflowStore.getState().activeRuns.length) return { success: false, error: '请先停止工作流再永久删除草稿' }
+      const drafts = get().draftsByChapter[chapterNumber] ?? []
+      const paths = new Set(drafts.flatMap(d => [d.filePath, d.filePath.replace('vela://draft/', 'vela://manuscript/')]))
+      paths.add(draftPath)
+      const open = useEditorStore.getState().tabs.some(tab => tab.chapterNumber === chapterNumber || paths.has(tab.filePath ?? '') || paths.has(tab.id))
+      if (open) return { success: false, error: t('draftbox.deleteOpenTab') }
+      const result = await ipc.invoke('db:draft-delete', id, chapterNumber)
+      if (result.success && useProjectStore.getState().currentProject === project) {
+        set(s => ({ draftsByChapter: { ...s.draftsByChapter, [chapterNumber]: (s.draftsByChapter[chapterNumber] ?? []).filter(d => d.filePath !== draftPath) } }))
+        globalEventBus.emit('REFRESH_RESOURCE', { resources: ['drafts'] })
+      }
+      return result
+    } catch (error) { return { success: false, error: errorMessage(error) } }
+    finally { pendingReturns.delete(key) }
   },
 
   invalidateChapter: (chapterNumber) => {

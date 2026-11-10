@@ -15,6 +15,7 @@ import { act } from 'react'
 import AgentMessage from './AgentMessage'
 import ToolCallBlock from './ToolCallBlock'
 import type { ToolCallInfo } from '../../../services/agent/agent-engine'
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 
 function render(ui: React.ReactElement): { container: HTMLElement; root: Root } {
   const container = document.createElement('div')
@@ -48,6 +49,33 @@ function domOrder(container: HTMLElement): string[] {
     return `tool:${el.getAttribute('data-tool')}`
   })
 }
+
+describe('用户消息编辑', () => {
+  afterEach(() => { document.body.innerHTML = '' })
+  it('纯图标编辑原输入，确认提交修改文本而不是增强正文', async () => {
+    const onEdit = vi.fn(async () => ({ success: true }))
+    const msg = { id: 'user', role: 'user' as const, content: '增强后的正文', originalContent: '原输入 @file', createdAt: 0 }
+    const { container, root } = render(<AgentMessage message={msg} onEdit={onEdit} />)
+    try {
+      const edit = container.querySelector('[aria-label="编辑消息"]') as HTMLButtonElement
+      expect(edit.textContent).toBe('')
+      act(() => edit.click())
+      const input = container.querySelector('textarea')!
+      expect(input.value).toBe('原输入 @file')
+      act(() => {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(input, '修改 @file')
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      await act(async () => (container.querySelector('[aria-label="确认并重新发送"]') as HTMLButtonElement).click())
+      expect(onEdit).toHaveBeenCalledExactlyOnceWith('user', '修改 @file')
+    } finally { act(() => root.unmount()) }
+  })
+  it('生成期间编辑图标禁用', () => {
+    const { container, root } = render(<AgentMessage message={{ id: 'u', role: 'user', content: '原输入', createdAt: 0 }} onEdit={vi.fn()} editDisabled />)
+    expect((container.querySelector('[aria-label="编辑消息"]') as HTMLButtonElement).disabled).toBe(true)
+    act(() => root.unmount())
+  })
+})
 
 describe('AgentMessage 思考折叠', () => {
   afterEach(() => { document.body.innerHTML = '' })

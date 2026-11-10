@@ -67,6 +67,7 @@ export interface AgentMessage {
   id: string
   role: 'user' | 'assistant' | 'system'
   content: string
+  originalContent?: string
   createdAt: number
   /** 是否正在流式生成中 */
   streaming?: boolean
@@ -262,6 +263,7 @@ interface AgentState {
   /** 回退到指定消息（截断到起点含，被截断消息入 rewound 归档可恢复）；
    *  返回是否成功；无活跃会话或 messageId 无效返回 false */
   rewindToMessage: (messageId: string) => boolean
+  editAndResendMessage: (conversationId: string, messageId: string, content: string) => Promise<{ success: boolean; error?: string }>
   /** B7：把压缩产物标为失效（历史变更后调用 —— rewind / 恢复原文 / 编辑消息） */
   invalidateCompactions: () => void
   /** B3：按需读某批次的分卷原文（展开压缩卡片时调用） */
@@ -620,6 +622,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
   sendMessage: async (content) => {
     if (preparingClose || isCloseCoordinating() || !content.trim() || get().generating) return
     if (useProjectStore.getState().loading) return
+    const originalContent = content
 
     // 确保 Tool 已初始化
     get().initializeTools()
@@ -755,6 +758,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
       id: genId(),
       role: 'user',
       content: enhancedContent ?? content.trim(),
+      originalContent,
       createdAt: Date.now(),
     }
 
@@ -2047,6 +2051,34 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     // 自学习压缩 v1：重生成 = 弱负反馈（v1 只统计）
     void recordLearningFeedback('regeneration')
     return null   // 成功：卡片据此清除内联错误
+  },
+
+  editAndResendMessage: async (conversationId, messageId, content) => {
+    if (preparingClose || isCloseCoordinating() || get().generating || useProjectStore.getState().loading) return { success: false, error: t('agent.editUnavailable') }
+    if (!content.trim()) return { success: false, error: '消息内容不能为空' }
+    const conv = get().getActiveConversation()
+    if (!conv || conv.id !== conversationId) return { success: false, error: '会话已切换，请重新编辑' }
+    const index = conv.messages.findIndex(message => message.id === messageId && message.role === 'user')
+    if (index < 0) return { success: false, error: '原消息已变更，请重新编辑' }
+    const entry: RewoundBranch = { messageId, messages: conv.messages.slice(index), rewoundAt: Date.now() }
+    set(s => ({ conversations: s.conversations.map(c => c.id === conversationId
+      ? { ...c, messages: c.messages.slice(0, index), rewound: [...(c.rewound ?? []), entry], updatedAt: Date.now() } : c) }))
+    get().invalidateCompactions()
+    get().persistCurrent(conversationId)
+    try {
+      await get().sendMessage(content)
+      const after = get().conversations.find(c => c.id === conversationId)
+      if (!after || after.messages.length <= index) {
+        if (after && after.messages.length === index) {
+          set(s => ({ conversations: s.conversations.map(c => c.id === conversationId ? { ...conv, updatedAt: Date.now() } : c) }))
+          get().persistCurrent(conversationId)
+        }
+        return { success: false, error: '重新发送未启动，原对话已保留，请检查模型或会话状态后重试' }
+      }
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: `重新发送失败，原消息已保留在回退记录中：${String(error)}` }
+    }
   },
 
   rewindToMessage: (messageId) => {
