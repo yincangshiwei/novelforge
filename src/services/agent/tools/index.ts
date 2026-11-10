@@ -14,6 +14,7 @@ import { readBlueprintTool } from './read-blueprint.tool'
 import { readCharactersTool } from './read-characters.tool'
 import { readProjectStateTool } from './read-project-state.tool'
 import { readDraftsTool } from './read-drafts.tool'
+import { aiFlavorAuditTool } from './ai-flavor-audit.tool'
 import { listChaptersTool } from './list-chapters.tool'
 // 大纲汇总（只读，自动执行）— 一次读完架构/蓝图/草稿，并对空数据显式给出下一步指引
 import { listOutlineTool } from './list-outline.tool'
@@ -56,6 +57,7 @@ export const builtinTools = [
   readCharactersTool,
   readProjectStateTool,
   readDraftsTool,
+  aiFlavorAuditTool,
   listChaptersTool,
   listOutlineTool,
   // 字数统计（只读，自动执行）— 字数限制场景免 LLM 逐字计数

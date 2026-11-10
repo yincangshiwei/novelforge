@@ -164,13 +164,16 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
       }
     }
 
-    // DB 持久化: 始终保存完整结构化数据 + 原始响应（如有）
-    const dbContent: Record<string, unknown> = {
-      items: parsedResult.items,
-      summary: parsedResult.summary,
-    }
-    if (parsedResult.rawResponse) {
-      dbContent.rawResponse = parsedResult.rawResponse
+    const { aiFlavorAudit } = await import('../../audit/audits')
+    const { loadAuditWhitelist } = await import('../../audit/audit-context')
+    const { mergeAiFlavorReview } = await import('../../audit/ai-flavor-review')
+    const flavorAudit = aiFlavorAudit(draft, await loadAuditWhitelist())
+    callbacks.log(flavorAudit.summary)
+    const dbContent = {
+      ...mergeAiFlavorReview(parsedResult, flavorAudit, draft),
+      baseDraftId: baseDraft.id,
+      baseVersion,
+      baseContentHash: await (await import('../../review-actions')).reviewContentHash(draft),
     }
     await ipc.invoke('db:review-create', {
       baseDraftId: baseDraft.id,
@@ -178,11 +181,7 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
       content: JSON.stringify(dbContent, null, 2),
     })
 
-    // Tab 内容: L1/L2 传 JSON 字符串供 ReviewReport 结构化渲染
-    //           L3 传原始文本供 ReviewReport.parseLegacyReport() 旧版解析器处理
-    const reportContent = parsedResult.rawResponse
-      ? parsedResult.rawResponse
-      : JSON.stringify(parsedResult, null, 2)
+    const reportContent = JSON.stringify(dbContent, null, 2)
 
     const { useEditorStore } = await import('../../../stores/editor-store')
     const pseudoReviewPath = `vela://draft/ch${this.params.chapterNumber}/v${baseVersion}/review${revIndex}`
@@ -198,7 +197,7 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
     })
 
     callbacks.log(t('log.review.done').replace('{revision}', String(revIndex)))
-    return reviewResultRaw
+    return reportContent
   }
 
   /** 角色枚举 → 本地化角色标签（未知枚举原样保留，避免改动既有数据语义） */

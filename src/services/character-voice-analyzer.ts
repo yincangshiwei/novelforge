@@ -175,17 +175,26 @@ export function upsertVoiceProfile(notes: string, profile: CharacterVoiceProfile
 }
 
 /**
- * 从角色卡 notes 中加载全部声音档案（[VOICE:角色名] JSON 标记）
- * 供写稿 prompt 注入（防 OOC）与审计复用
+ * 从角色卡 notes 中加载声音档案（[VOICE:角色名] JSON 标记）
+ * 供写稿 prompt 注入（防 OOC）与审计复用；支持传入 characterNames 仅加载本章出场角色，节省 Token 预算。
  */
-export async function loadCharacterVoiceProfiles(): Promise<CharacterVoiceProfile[]> {
+export async function loadCharacterVoiceProfiles(characterNames?: string[]): Promise<CharacterVoiceProfile[]> {
   try {
     const { ipc } = await import('./ipc-client')
-    const allChars = await ipc.invoke('db:character-get-all') as Array<{ name: string; notes?: string }>
+    const { parseAliases } = await import('./character-normalize')
+    const allChars = await ipc.invoke('db:character-get-all') as Array<{ name: string; aliases?: string; notes?: string; tier?: number; role?: string }>
+    const filterSet = characterNames && characterNames.length > 0
+      ? new Set(characterNames.map(n => n.trim()).filter(Boolean))
+      : null
     const profiles: CharacterVoiceProfile[] = []
 
     for (const c of allChars) {
       if (!c.name || !c.notes) continue
+      if (filterSet) {
+        const names = [c.name, ...parseAliases(c.aliases)]
+        const isProtagonist = c.role === 'protagonist' || c.tier === 1
+        if (!isProtagonist && !names.some(n => filterSet.has(n))) continue
+      }
       const p = extractVoiceProfileFromNotes(c.notes, c.name)
       if (p) profiles.push(p)
     }
@@ -256,6 +265,23 @@ function extractDialogue(content: string, name: string): string[] {
     lines.push(match[1].trim())
   }
 
+  // 模式4（去 AI 味动作引导台词）：如「苏晚把烟按灭。“不去。”」或「“不去。”苏晚把烟按灭。」
+  // 同一自然段或相邻短句中角色名紧邻引号（间距 ≤ 25 字且不含其他引号），无需显式“说/道”动词
+  const actionLeadRegex = new RegExp(
+    `${escaped}[^“”"\\n]{1,25}[，。：:]\\s*[“"]([^“”"\\n]{2,120})[”"]`,
+    'g',
+  )
+  while ((match = actionLeadRegex.exec(content)) !== null) {
+    lines.push(match[1].trim())
+  }
+  const actionTrailRegex = new RegExp(
+    `[“"]([^“”"\\n]{2,120})[”"]\\s*${escaped}[^“”"\\n]{1,20}[，。！？]`,
+    'g',
+  )
+  while ((match = actionTrailRegex.exec(content)) !== null) {
+    lines.push(match[1].trim())
+  }
+
   return [...new Set(lines)].filter(l => l.length > 2)
 }
 
@@ -289,6 +315,8 @@ function extractTopWords(lines: string[], count: number): string[] {
   const stopWords = new Set([
     '的', '了', '是', '我', '你', '他', '她', '不', '就', '也', '都', '要',
     '说', '在', '有', '人', '这', '那', '什么', '怎么', '吗', '呢', '啊',
+    '一个', '没有', '知道', '可以', '现在', '已经', '自己', '就是', '因为', '所以',
+    '但是', '如果', '不过', '虽然', '而且', '不仅', '如此', '仿佛', '犹如', '宛如',
     // P2-2：英文高频停用词（英文对话分词片段）
     'the', 'and', 'you', 'your', 'that', 'this', 'with', 'have', 'are', 'was',
     'were', 'for', 'but', 'not', 'they', 'she', 'his', 'her', 'them', 'what',
@@ -298,10 +326,12 @@ function extractTopWords(lines: string[], count: number): string[] {
   ])
 
   for (const line of lines) {
-    // 简单分词（2-4 字片段）
+    // 简单分词（2-4 字片段，跳过标点与跨边界虚字）
     for (let i = 0; i <= line.length - 2; i++) {
       for (let len = 2; len <= 4 && i + len <= line.length; len++) {
         const word = line.slice(i, i + len)
+        if (/[，。！？；：""''“”《》、（）—…·～【】\s]/.test(word)) continue
+        if (/^[的了着过地得吗呢啊吧呀么们]|[的了着过地得吗呢啊吧呀么]$/.test(word)) continue
         if (stopWords.has(word)) continue
         freq.set(word, (freq.get(word) || 0) + 1)
       }

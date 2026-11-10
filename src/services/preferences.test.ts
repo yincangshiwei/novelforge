@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { extractPreferencePair } from './preferences'
+import { extractPreferencePair, DELETED_PREF_SENTINEL } from './preferences'
 
 describe('extractPreferencePair', () => {
   it('提取中间替换对（神色一凝 → 皱了皱眉）', () => {
@@ -7,6 +7,13 @@ describe('extractPreferencePair', () => {
     const user = '他皱了皱眉，望向窗外。'
     const r = extractPreferencePair(ai, user)
     expect(r).toEqual({ ai: '神色一凝', user: '皱了皱眉' })
+  })
+
+  it('提取用户直接删掉的 AI 冗余修饰词（不由自主地 → __DELETED__）', () => {
+    const ai = '他不由自主地握紧了拳头。'
+    const user = '他握紧了拳头。'
+    const r = extractPreferencePair(ai, user)
+    expect(r).toEqual({ ai: '不由自主地', user: DELETED_PREF_SENTINEL })
   })
 
   it('前后缀匹配容忍长度变化（用户扩写）', () => {

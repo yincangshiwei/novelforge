@@ -60,13 +60,30 @@ export class SelfReviewCommand extends BaseWorkflowCommand<void> {
 
       // ===== 1. 终审 Agent：审计报告 → 修改建议清单 =====
       const issueText = audit.issues
-        .map((iss, i) => `${i + 1}. [${iss.kind}] ${iss.message}`)
+        .map((iss, i) => `${i + 1}. [${iss.kind}]${iss.position ? ` (${iss.position})` : ''} ${iss.message}`)
         .join('\n')
-      // ⚠️ M 级修复：审稿输入全文分段采样（此前只见前 3000 字——后半章问题不可见却给全稿建议，
-      //    "基于不完整输入的自信判断"）
-      const draftPreview = current.length <= 4500
-        ? current
-        : current.slice(0, 1500) + '\n\n[中段略]...\n\n' + current.slice(-3000)
+      // 靶向采样：若全文 > 4500 字，除首尾段外，额外提取 audit.issues 标出的问题段落（防止中段 AI 味问题在 [中段略] 中不可见）
+      let draftPreview: string
+      if (current.length <= 4500) {
+        draftPreview = current
+      } else {
+        const paragraphs = current.split(/\n\s*\n+/).map(p => p.trim()).filter(Boolean)
+        const hitIndices = new Set<number>()
+        for (const iss of audit.issues) {
+          for (const m of (iss.position ?? '').matchAll(/第(\d+)段/g)) {
+            const idx = parseInt(m[1], 10) - 1
+            if (idx >= 0 && idx < paragraphs.length) hitIndices.add(idx)
+          }
+        }
+        const targetedSnippets = [...hitIndices]
+          .sort((a, b) => a - b)
+          .slice(0, 6)
+          .map(idx => `[第${idx + 1}段] ${paragraphs[idx]}`)
+          .join('\n\n')
+        draftPreview = current.slice(0, 1500)
+          + (targetedSnippets ? `\n\n[审计命中问题段落摘录]\n${targetedSnippets}\n\n` : '\n\n[中段略]...\n\n')
+          + current.slice(-2500)
+      }
       const reviewerPrompt =
         constraints + '\n\n' + t('prompt.selfReview.reviewerTitle') + '\n' + issueText + '\n\n' +
         t('prompt.selfReview.draftPreviewTitle') + '\n' + draftPreview + '\n\n' +
@@ -112,6 +129,12 @@ export class SelfReviewCommand extends BaseWorkflowCommand<void> {
       } catch { /* 蓝图读取失败不阻断 */ }
       current = rewritten
       rewrote = true
+    }
+
+    const finalAudit = auditText(ctx, current)
+    callbacks.log(t('log.selfReview.finalAudit').replace('{summary}', finalAudit.summary))
+    if (!finalAudit.passed) {
+      callbacks.log(finalAudit.issues.map(issue => [issue.position, issue.message].filter(Boolean).join('：')).join('\n'))
     }
 
     // ===== 3. 落库：重写稿另存新版本（不覆盖初稿） =====

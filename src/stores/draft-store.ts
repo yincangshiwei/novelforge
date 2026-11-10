@@ -237,6 +237,18 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
   applyMergedRevision: async (chapterDir, chapterNumber, filePath, revPath, mergedText) => {
     try {
       const { markRevisionMerged } = await import('../services/draft-index')
+      if (/^\d+$/.test(revPath)) {
+        const revision = await ipc.invoke('db:revision-get-full', Number(revPath))
+        if (revision?.auditReport) {
+          const audit = JSON.parse(revision.auditReport) as { baseContentHash?: string }
+          if (audit.baseContentHash) {
+            const full = await ipc.invoke('db:draft-get-full', revision.baseDraftId)
+            const { reviewContentHash } = await import('../services/review-actions')
+            if (!full || await reviewContentHash(full.content) !== audit.baseContentHash) throw new Error(t('review.staleReport'))
+            if (useEditorStore.getState().tabs.some(tab => tab.filePath === filePath && tab.dirty)) throw new Error(t('tool.draftDirty'))
+          }
+        }
+      }
 
       const versionMatch = filePath.match(/v(\d+)/)
       const version = versionMatch ? parseInt(versionMatch[1]) : 1
@@ -249,7 +261,8 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
       if (filePath.startsWith(VELA.DRAFT) || filePath.startsWith(VELA.MANUSCRIPT)) {
         const prefix = filePath.startsWith(VELA.DRAFT) ? VELA.DRAFT : VELA.MANUSCRIPT
         targetDraftId = parseInt(filePath.replace(prefix, ''))
-        await ipc.invoke('db:draft-update-content', targetDraftId, mergedText, mergedWordCount)
+        const updated = await ipc.invoke('db:draft-update-content', targetDraftId, mergedText, mergedWordCount)
+        if (!updated.success) throw new Error(updated.error)
       } else {
         // 从 filePath 解析 chapterNumber 和 version，查出 draftId 再更新
         const chMatch = filePath.match(/ch(\d+)/)
@@ -259,7 +272,8 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
           const target = (drafts as unknown as Array<Record<string, unknown>>).find((d) => d.version === version)
           if (target) {
             targetDraftId = target.id as number
-            await ipc.invoke('db:draft-update-content', targetDraftId, mergedText, mergedWordCount)
+            const updated = await ipc.invoke('db:draft-update-content', targetDraftId, mergedText, mergedWordCount)
+            if (!updated.success) throw new Error(updated.error)
           }
         }
       }
@@ -276,8 +290,30 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
         await markRevisionMerged(chapterDir, revFileName, origFileName)
       }
 
+      if (targetDraftId) {
+        try {
+          const { auditRefinement } = await import('../services/audit/refinement-audit')
+          const meta = await ipc.invoke('db:draft-get-meta', targetDraftId)
+          const report = await auditRefinement(mergedText, targetDraftId, meta?.version)
+          const { reviewContentHash } = await import('../services/review-actions')
+          const reportContent = JSON.stringify({ ...report, scope: 'merged_draft', revisionId: revPath, baseContentHash: await reviewContentHash(mergedText) })
+          const reviewIndex = await ipc.invoke('db:review-next-index', targetDraftId)
+          const saved = await ipc.invoke('db:review-create', { baseDraftId: targetDraftId, reviewIndex, content: reportContent })
+          if (!saved.success) throw new Error(saved.error)
+          useEditorStore.getState().openFile({
+            id: `merged-audit-${targetDraftId}-${reviewIndex}`,
+            name: t('audit.mergedReport'),
+            type: 'review-report',
+            content: reportContent,
+            chapterNumber,
+            reportPath: `vela://draft/${targetDraftId}/review${reviewIndex}`,
+          })
+        } catch (error) {
+          console.warn(t('audit.refinementUnchecked'), error)
+        }
+      }
+
       // 同步到编辑器（需通过 filePath 查找对应 tab 的 id）
-      const { useEditorStore } = await import('./editor-store')
       const editorState = useEditorStore.getState()
       const targetTab = editorState.tabs.find(t => t.filePath === filePath)
       if (targetTab) {

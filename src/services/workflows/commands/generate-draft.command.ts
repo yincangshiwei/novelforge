@@ -167,7 +167,47 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
     const { readWritingConstraints } = await import('../../writing-constraints')
     const antiDefectSections: string[] = [await readWritingConstraints({ characterNames: this.chapterInfo.characters, includeGlobal: false })]
 
-    // 1. 未回收伏笔（≤5 条，埋设于本章之前）——防止伏笔断裂/提前回收
+    // 1. 角色声音档案（仅注入本章出场角色 + 核心主角，防 OOC 且省 Token；高优先级保留）
+    try {
+      const { loadCharacterVoiceProfiles, formatVoiceForPrompt } = await import('../../character-voice-analyzer')
+      const profiles = await loadCharacterVoiceProfiles(this.chapterInfo.characters)
+      const voicePrompt = formatVoiceForPrompt(profiles)
+      if (voicePrompt) antiDefectSections.push(voicePrompt)
+    } catch { /* 声音注入失败不阻断 */ }
+
+    // 2. 偏好记忆注入（用户历史替换对与高频删减厌恶词——短小且直接决定去 AI 味效果，高优先级保留）
+    try {
+      const { getTopPreferences, DELETED_PREF_SENTINEL } = await import('../../preferences')
+      const prefs = await getTopPreferences(8)
+      if (prefs.length > 0) {
+        const replacePrefs = prefs.filter(p => p.userText !== DELETED_PREF_SENTINEL)
+        const deletePrefs = prefs.filter(p => p.userText === DELETED_PREF_SENTINEL)
+        const lines: string[] = []
+        for (const p of replacePrefs) {
+          lines.push(
+            t('inject.userPreferenceItem')
+              .replace(/\{userText\}/g, () => String(p.userText))
+              .replace(/\{aiText\}/g, () => String(p.aiText))
+              .replace(/\{count\}/g, () => String(p.count)),
+          )
+        }
+        for (const p of deletePrefs) {
+          lines.push(
+            t('inject.userPreferenceDeletedItem')
+              .replace(/\{aiText\}/g, () => String(p.aiText))
+              .replace(/\{count\}/g, () => String(p.count)),
+          )
+        }
+        antiDefectSections.push(
+          t('inject.userPreferencesTitle') + '\n' +
+          lines.join('\n') +
+          t('inject.userPreferenceFooter')
+            .replace(/\{aiTexts\}/g, () => prefs.map(p => String(p.aiText)).join('」「')),
+        )
+      }
+    } catch { /* 偏好注入失败不阻断 */ }
+
+    // 3. 未回收伏笔（≤5 条，埋设于本章之前）——防止伏笔断裂/提前回收
     try {
       const { loadAllForeshadowing } = await import('../../foreshadowing-manager')
       const all = await loadAllForeshadowing()
@@ -187,37 +227,12 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
       }
     } catch { /* 伏笔注入失败不阻断 */ }
 
-    // 2. 角色声音档案（tier1 台词风格，防 OOC）
-    try {
-      const { loadCharacterVoiceProfiles, formatVoiceForPrompt } = await import('../../character-voice-analyzer')
-      const profiles = await loadCharacterVoiceProfiles()
-      const voicePrompt = formatVoiceForPrompt(profiles)
-      if (voicePrompt) antiDefectSections.push(voicePrompt)
-    } catch { /* 声音注入失败不阻断 */ }
-
-    // 3. 冷门设定采样（创意多样性，可选非强制）
+    // 4. 冷门设定采样（创意多样性，可选非强制，置于末尾优先被裁剪）
     try {
       const { sampleColdSettings } = await import('../../agent/tools/setting-sampler.tool')
       const cold = await sampleColdSettings(2)
       if (cold) antiDefectSections.push(t('inject.creativityDiversity') + '\n' + cold)
     } catch { /* 采样失败不阻断 */ }
-
-    // 4. 偏好记忆注入（用户历史替换对——"偏好 X 而非 Y"，优先使用用户表达）
-    try {
-      const { getTopPreferences } = await import('../../preferences')
-      const prefs = await getTopPreferences(5)
-      if (prefs.length > 0) {
-        antiDefectSections.push(
-          t('inject.userPreferencesTitle') + '\n' +
-          prefs.map(p => t('inject.userPreferenceItem')
-            .replace(/\{userText\}/g, () => String(p.userText))
-            .replace(/\{aiText\}/g, () => String(p.aiText))
-            .replace(/\{count\}/g, () => String(p.count))).join('\n') +
-          t('inject.userPreferenceFooter')
-            .replace(/\{aiTexts\}/g, () => prefs.map(p => String(p.aiText)).join('」「')),
-        )
-      }
-    } catch { /* 偏好注入失败不阻断 */ }
 
     // ⚠️ M 级修复：超限降级——provider 静默截断会恰好截掉 prompt 尾部的角色状态/伏笔清单
     //    （幻觉高发段）。按优先级从尾部裁剪低关键段（设定采样/偏好在后，伏笔/声音档案在前），

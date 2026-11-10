@@ -6,6 +6,9 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const workflowTexts = {
+  'audit.refinementUnchecked': { 'zh-CN': '修稿复查未完成，不能视为通过；候选正文仍予保留。', 'en-US': 'Revision audit incomplete; not a pass. Candidate prose is retained.', 'ru-RU': 'Проверка правки не завершена; это не успех. Текст сохранён.' },
+  'audit.refinementReport': { 'zh-CN': '修稿 #{id} 候选复查（非合并结果）', 'en-US': 'Revision #{id} candidate audit (not merged prose)', 'ru-RU': 'Проверка кандидата #{id} (не итог слияния)' },
+  'audit.mergedReport': { 'zh-CN': '合并正文专项复查', 'en-US': 'Merged prose audit', 'ru-RU': 'Проверка текста после слияния' },
   'workflow.failedNotice': { 'zh-CN': '「{title}」在「{step}」失败：{error}', 'en-US': '“{title}” failed at “{step}”: {error}', 'ru-RU': '«{title}»: ошибка на шаге «{step}»: {error}' },
   'workflow.errorDetails': { 'zh-CN': '错误详情', 'en-US': 'Error details', 'ru-RU': 'Подробности ошибки' },
   'workflow.viewFailure': { 'zh-CN': '查看失败任务', 'en-US': 'View failed task', 'ru-RU': 'Открыть задачу с ошибкой' },
@@ -49,6 +52,14 @@ export const workflowTexts = {
   'audit.timelineConflict': { 'zh-CN': '时间线矛盾：「{time}」出现在更早的「已过 {n} 天」之后', 'en-US': 'Timeline conflict: "{time}" appears after an earlier "day {n}"', 'ru-RU': 'Конфликт таймлайна: «{time}» после более раннего «день {n}»' },
   'audit.timelineOk': { 'zh-CN': '时间线检查通过（{n} 个时间锚点）', 'en-US': 'Timeline check passed ({n} anchors)', 'ru-RU': 'Таймлайн в порядке ({n} якорей)' },
   'audit.timelineFound': { 'zh-CN': '发现 {n} 处时间线矛盾', 'en-US': '{n} timeline conflicts found', 'ru-RU': 'Найдено {n} конфликтов таймлайна' },
+  'audit.aiSimileOveruse': { 'zh-CN': 'AI 味比喻词（仿佛/犹如/宛如等）全章出现 {n} 次（上限 {max} 次，见 {pos}），建议直接用动作/物象描写替代空泛比喻', 'en-US': 'AI-style simile words (seemed/as if/like) appear {n} times (cap {max}, at {pos}) — replace with concrete actions or imagery', 'ru-RU': 'Шаблонные сравнения (словно/будто) встречаются {n} раз (лимит {max}, см. {pos}) — замените конкретными деталями' },
+  'audit.aiClicheHit': { 'zh-CN': 'AI 高频套路表达「{label}」出现 {n} 次（见 {pos}），建议改为贴合角色身份的具体动作或直接删减', 'en-US': 'High-frequency AI cliché "{label}" appears {n} times (at {pos}) — replace with character-specific actions or trim', 'ru-RU': 'Частое ИИ-клише «{label}» встречается {n} раз (см. {pos}) — замените характерным действием или сократите' },
+  'audit.aiEndingSummary': { 'zh-CN': '检测到 AI 式段尾总结/升华套话：「{phrase}」（{pos}），请直接删去旁白总结，留给画面或对话收束', 'en-US': 'AI-style summary/philosophical ending detected: "{phrase}" ({pos}) — remove narrator summary and end on action or dialogue', 'ru-RU': 'Обнаружено ИИ-резюме в конце абзаца: «{phrase}» ({pos}) — уберите авторский вывод, завершите действием или репликой' },
+  'audit.aiDialogueRepeat': { 'zh-CN': '角色台词复读/句式雷同：「{line}」重复 {n} 次', 'en-US': 'Repeated dialogue line: "{line}" appears {n} times', 'ru-RU': 'Повтор реплики в диалоге: «{line}» ({n} раз)' },
+  'audit.aiFlavorCategory': { 'zh-CN': '去AI味规则检查', 'en-US': 'AI-style rule audit', 'ru-RU': 'Проверка шаблонов ИИ' },
+  'audit.aiFlavorRulePass': { 'zh-CN': '未发现当前专项规则信号；不代表对话、文风和文学质量全部通过。', 'en-US': 'No current rule signals found; this is not a verdict on dialogue, style or literary quality.', 'ru-RU': 'Сигналов по текущим правилам нет; это не оценка диалогов, стиля или литературного качества.' },
+  'audit.aiFlavorPassed': { 'zh-CN': '去 AI 味检查通过', 'en-US': 'Anti-AI-flavor check passed', 'ru-RU': 'Проверка на ИИ-шаблоны пройдена' },
+  'audit.aiFlavorFound': { 'zh-CN': '发现 {n} 处 AI 味/套路化表达', 'en-US': '{n} AI-flavor clichés found', 'ru-RU': 'Найдено {n} ИИ-шаблонов' },
   'audit.allPassed': { 'zh-CN': '全部审计通过', 'en-US': 'All audits passed', 'ru-RU': 'Все проверки пройдены' },
   'audit.allFound': { 'zh-CN': '{n} 个问题（{m} 类）', 'en-US': '{n} issues ({m} categories)', 'ru-RU': '{n} проблем ({m} категорий)' },
   'blueprintVerify.summary': { 'zh-CN': '共 {total} 章，已有 {existing} 章蓝图', 'en-US': '{total} chapters total, {existing} with blueprints', 'ru-RU': 'Всего {total} глав, планы есть у {existing}' },

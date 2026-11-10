@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   repetitionAudit,
   waterAudit,
+  aiFlavorAudit,
   continuityAudit,
   terminologyAudit,
   blueprintAudit,
@@ -339,3 +340,45 @@ describe('waterAudit 英文正文（issue #38 回归）', () => {
     expect(r.passed).toBe(false)
   })
 })
+
+describe('aiFlavorAudit 与 AI 味自污染防护', () => {
+  it('buildBaselineFreqs 排除 AI 惯用套话词（瞳孔/嘴角/缓缓），不给予跨章豁免', () => {
+    const ch1 = '他瞳孔骤缩，嘴角勾起，缓缓起身。'
+    const ch2 = '她瞳孔微缩，嘴角扬起，缓缓坐下。'
+    const base = buildBaselineFreqs([ch1, ch2])
+    expect(base['瞳孔']).toBeUndefined()
+    expect(base['嘴角']).toBeUndefined()
+    expect(base['缓缓']).toBeUndefined()
+  })
+
+  it('检出「仿佛/犹如/宛如」全章超过 3 次并定位段落', () => {
+    const text = [
+      '第一段仿佛是一场梦，犹如烟云散去。',
+      '第二段正常叙事。',
+      '第三段宛如寒冰，仿佛坠入深渊。',
+    ].join('\n\n')
+    const r = aiFlavorAudit(text)
+    expect(r.passed).toBe(false)
+    expect(r.issues.some(i => i.message.includes('比喻词') && i.position?.includes('第1段') && i.position?.includes('第3段'))).toBe(true)
+  })
+
+  it('检出高频微表情套话（瞳孔骤缩/嘴角勾起）与段尾升华总结句', () => {
+    const text = [
+      '林默瞳孔骤缩，死死盯着前方。',
+      '反派瞳孔微缩，随后瞳孔猛地一缩。',
+      '他看着远方，他知道，这一切才刚刚开始。',
+    ].join('\n\n')
+    const r = aiFlavorAudit(text)
+    expect(r.passed).toBe(false)
+    expect(r.issues.some(i => i.message.includes('瞳孔骤缩'))).toBe(true)
+    expect(r.issues.some(i => i.message.includes('这一切才刚刚开始') && i.position === '第3段')).toBe(true)
+  })
+
+  it('检出对话区台词复读（弥补 stripDialogue 盲区）', () => {
+    const text = '“你根本不知道自己面对的是什么！”他说。\n\n“你根本不知道自己面对的是什么！”她又喊道。'
+    const r = aiFlavorAudit(text)
+    expect(r.passed).toBe(false)
+    expect(r.issues.some(i => i.message.includes('台词复读'))).toBe(true)
+  })
+})
+

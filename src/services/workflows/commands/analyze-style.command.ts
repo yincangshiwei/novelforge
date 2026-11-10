@@ -75,12 +75,20 @@ export class AnalyzeWritingStyleCommand extends BaseWorkflowCommand<string> {
       return ''
     }
 
-    // 写入 NovelConfig
+    // 写入 NovelConfig：若已有用户手动设定的目标文风，保留目标文风并仅更新「[自动归纳近期特征]」区块，防止 AI 生成物反向覆盖作者原始风格锚点
     const { updateNovelConfig, saveProject } = useProjectStore.getState()
-    updateNovelConfig({ writingStyle: cleanResult })
+    const AUTO_STYLE_MARKER = '\n\n【近期定稿行文特征（系统自动归纳，仅供延续参考）】\n'
+    const existingStyle = (project.novelConfig.writingStyle || '').trim()
+    const baseStyle = existingStyle.includes('【近期定稿行文特征')
+      ? existingStyle.split(/\n*【近期定稿行文特征/)[0].trim()
+      : existingStyle
+    const mergedStyle = baseStyle
+      ? `${baseStyle}${AUTO_STYLE_MARKER}${cleanResult}`
+      : cleanResult
+    updateNovelConfig({ writingStyle: mergedStyle })
     await saveProject()
     callbacks.log(t('log.analyzeStyle.saved'))
 
-    return cleanResult
+    return mergedStyle
   }
 }

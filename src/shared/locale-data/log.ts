@@ -6,6 +6,7 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const logTexts = {
+  'log.selfReview.finalAudit': { 'zh-CN': '最终正文复查：{summary}；残留问题会列出，未通过不等于已修复。', 'en-US': 'Final prose audit: {summary}; unresolved issues follow and are not considered fixed.', 'ru-RU': 'Итоговая проверка: {summary}; оставшиеся проблемы перечислены и не считаются исправленными.' },
   'log.fillGaps.partialCoverage': { 'zh-CN': '⚠️ 缺口补全不完整：第 {start}–{end} 章中缺少：{missing}（建议重新补全）', 'en-US': '⚠️ Gap fill incomplete: missing Ch.{missing} in {start}–{end} (recommend re-filling)', 'ru-RU': '⚠️ Заполнение пробелов неполное: отсутствуют гл. {missing} из {start}–{end} (рекомендуется повторить)' },
   'log.selfReview.keyEventsLost': { 'zh-CN': '⚠️ 重写稿关键情节保留不足（命中 {hit}/{total}），放弃本轮重写', 'en-US': '⚠️ Rewrite lost key plot points ({hit}/{total} kept) — discarding this round', 'ru-RU': '⚠️ Переписанный текст потерял ключевые сюжетные моменты ({hit}/{total}) — раунд отменён' },
   'log.title': { 'zh-CN': '日志文件', 'en-US': 'Log Files', 'ru-RU': 'Файлы журнала' },

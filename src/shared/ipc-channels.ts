@@ -810,7 +810,7 @@ export interface DatabaseChannels {
   'db:draft-branch-archive': { args: [branchId: number]; return: { success: boolean; error?: string } }
 
   // 5. revisions
-  'db:revision-create': { args: [params: { baseDraftId: number; revisionIndex: number; revisionType: 'refine' | 'review-fix'; userPrompt?: string; reviewSourceId?: number; content: string; wordCount: number }]; return: { success: boolean; id?: number; error?: string } }
+  'db:revision-create': { args: [params: { baseDraftId: number; revisionIndex: number; revisionType: 'refine' | 'review-fix'; userPrompt?: string; reviewSourceId?: number; auditReport?: string; content: string; wordCount: number }]; return: { success: boolean; id?: number; error?: string } }
   'db:revision-list': { args: [baseDraftId: number]; return: RevisionMeta[] }
   'db:revision-get-pending': { args: [baseDraftId: number]; return: RevisionMeta[] }
   'db:revision-get-full': { args: [id: number]; return: RevisionFull | null }

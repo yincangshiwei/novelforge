@@ -11,11 +11,27 @@ import { createToolIpc } from '../tool-ipc'
 import type { ToolExecutionContext } from '../tool-registry'
 import { useProjectStore } from '../../../stores/project-store'
 
-/** 低频检索词池（与常见网文套路词拉开距离） */
-const COLD_QUERY_POOL = [
-  '古籍残页', '锈蚀机关', '边疆驿道', '老匠人', '废弃祭坛',
-  '旧信札', '织机', '沙漏', '灯塔', '渡口', '石窟壁画', '铜铃',
+/** 按流派分桶的低频检索词池（与常见网文高频套路词拉开距离，同时避免跨流派串味） */
+const GENRE_COLD_QUERY_POOLS: Record<string, string[]> = {
+  '玄幻': ['古籍残页', '锈蚀机关', '边疆驿道', '老匠人', '废弃祭坛', '石窟壁画', '铜铃', '荒原界碑'],
+  '仙侠': ['古籍残页', '丹炉余烬', '边疆驿道', '旧剑穗', '废弃祭坛', '石窟壁画', '铜铃', '渡口孤舟'],
+  '都市': ['老旧街区', '便利店夜班', '旧票据', '地下车库', '天台水箱', '报刊亭', '末班地铁', '旧收音机'],
+  '科幻': ['废弃轨道站', '旧型号芯片', '冷却管道', '加密日志', '边缘殖民地', '休眠舱', '频段杂音', '旧时代遗物'],
+  '悬疑': ['旧案卷宗', '褪色照片', '停摆挂钟', '走廊尽头', '匿名信件', '潮湿地下室', '不在场记录', '钥匙孔'],
+  '历史': ['边关烽燧', '地方县志', '旧漕船', '驿站马牌', '祠堂碑文', '铁匠铺', '铜钱锈迹', '城门告示'],
+}
+
+const DEFAULT_COLD_QUERY_POOL = [
+  '角落旧物', '边缘人物', '日常器物', '破损信件', '地方风物',
+  '旧规矩', '偏僻场所', '微小习惯', '往事细节', '特殊禁忌',
 ]
+
+function pickColdQuery(genre?: string): string {
+  const g = (genre || '').trim()
+  const matchedKey = Object.keys(GENRE_COLD_QUERY_POOLS).find(k => g.includes(k))
+  const pool = matchedKey ? GENRE_COLD_QUERY_POOLS[matchedKey] : DEFAULT_COLD_QUERY_POOL
+  return pool[Math.floor(Math.random() * pool.length)]
+}
 
 /**
  * 从知识库采样冷门设定片段（低相关度尾部）
@@ -27,8 +43,8 @@ export async function sampleColdSettings(count = 2, context?: ToolExecutionConte
   if (!project) return ''
 
   try {
-    // 随机选一个低频词检索，取尾部（低相关度）结果
-    const query = COLD_QUERY_POOL[Math.floor(Math.random() * COLD_QUERY_POOL.length)]
+    // 按本书流派选择低频词检索，取尾部（低相关度）结果
+    const query = pickColdQuery(project.novelConfig?.genre)
     const results = (await toolIpc.invoke('kb:search', query, 8)) as Array<{
       text: string; fileName: string; score: number
     }> | null

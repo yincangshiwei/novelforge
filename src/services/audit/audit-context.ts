@@ -71,27 +71,27 @@ export async function collectAuditContext(chapterNumber: number): Promise<AuditC
     }
   } catch { /* 忽略 */ }
 
-  // 4. 项目级水文白名单（{project}/.novelforge/audit-whitelist.json）
+  ctx.whitelist = await loadAuditWhitelist()
+
+  return ctx
+}
+
+export async function loadAuditWhitelist(client: Pick<typeof ipc, 'invoke'> = ipc): Promise<AuditWhitelist | undefined> {
   try {
     const { useProjectStore } = await import('../../stores/project-store')
     const project = useProjectStore.getState().currentProject
-    if (project) {
-      // L4 S8：该文件**在项目内**，本来就在白名单里（项目根），无需任何外部授权 ——
-      // 改用普通 fs:read-file。原先靠渲染层自行登记 fs:grant-external-file 绕一圈，
-      // 那条通道已删除（它是「渲染层可自报任意路径」的缺口所在）。
-      const wlRes = await ipc.invoke('fs:read-file', `${project.path}/${DIR_VELA_INTERNAL}/audit-whitelist.json`) as { success?: boolean; content?: string } | null
-      if (wlRes?.success && wlRes.content) {
-        const parsed = JSON.parse(wlRes.content) as Record<string, unknown>
-        ctx.whitelist = {
-          words: Array.isArray(parsed.words) ? parsed.words.map(String) : undefined,
-          patterns: Array.isArray(parsed.patterns) ? parsed.patterns.map(String) : undefined,
-          sentences: Array.isArray(parsed.sentences) ? parsed.sentences.map(String) : undefined,
-        }
-      }
+    if (!project) return undefined
+    const result = await client.invoke('fs:read-file', `${project.path}/${DIR_VELA_INTERNAL}/audit-whitelist.json`)
+    if (!result?.success || !result.content) return undefined
+    const parsed = JSON.parse(result.content) as Record<string, unknown>
+    return {
+      words: Array.isArray(parsed.words) ? parsed.words.map(String) : undefined,
+      patterns: Array.isArray(parsed.patterns) ? parsed.patterns.map(String) : undefined,
+      sentences: Array.isArray(parsed.sentences) ? parsed.sentences.map(String) : undefined,
     }
-  } catch { /* 白名单不存在或损坏 → 不使用 */ }
-
-  return ctx
+  } catch {
+    return undefined
+  }
 }
 
 /** 用上下文对正文执行全量审计 */

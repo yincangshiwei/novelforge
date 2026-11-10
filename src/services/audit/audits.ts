@@ -312,10 +312,23 @@ export const repetitionAudit = waterAudit
 // ===== 1.5 基线频率与设定专名（重复词审计的数据源） =====
 
 /**
+ * AI 惯用套话/生理反应 2-gram 黑名单：
+ * 即使在前几章定稿中高频出现，也**绝不进入 baselineFreqs 豁免基线**，
+ * 斩断「AI 每章都写“缓缓/嘴角/瞳孔/一抹” → 被识别为本书正常文风密度 → 永久免检」的自污染闭环。
+ */
+const AI_CLICHE_BASELINE_BLOCKLIST = new Set([
+  '仿佛', '犹如', '宛如', '好似', '恰似', '不禁', '不由', '一抹', '弧度',
+  '瞳孔', '嘴角', '深吸', '倒吸', '凉气', '精光', '寒芒', '冷笑', '苦笑',
+  '缓缓', '淡淡', '冷冷', '微微', '轻轻', '瞬间', '刹那', '顿时', '赫然',
+  '显然', '无疑', '意味', '深长', '齿轮', '惊涛', '骇浪',
+])
+
+/**
  * 从本书已定稿章节正文构建 2-gram 基线频率表。
  * - 每章独立统计（章节长度波动天然归一化）
  * - 只在 ≥2 章出现的词才入表（跨章稳定词——角色名/术语/场景词/常用词
  *   每章都出现属"本书正常密度"；单章偶然词是本章特有，不构成基线）
+ * - 命中 AI_CLICHE_BASELINE_BLOCKLIST 的词一律排除，防止 AI 口水词借基线合法化
  * - 值 = 出现章的平均频次
  * - 少于 2 章返回 {}（调用方回退动态阈值）
  */
@@ -325,6 +338,7 @@ export function buildBaselineFreqs(chapters: string[]): Record<string, number> {
     .map(ch => {
       const m = new Map<string, number>()
       for (const w of extractNgrams(stripDialogue(ch), 2)) {
+        if (AI_CLICHE_BASELINE_BLOCKLIST.has(w)) continue
         m.set(w, (m.get(w) ?? 0) + 1)
       }
       return m
@@ -643,6 +657,138 @@ export function timelineAudit(chapterText: string): AuditResult {
   }
 }
 
+// ===== 7. 去 AI 味专项审计（比喻泛滥 / 高频微表情套话 / 段尾升华 / 对话区复读） =====
+
+const AI_CLICHE_PATTERNS: Array<{ label: string; regex: RegExp; threshold: number; severity?: 'warn' | 'error' }> = [
+  { label: '瞳孔骤缩/微缩', regex: /瞳孔(?:骤然)?(?:骤缩|微缩|一缩|猛地一缩|剧烈收缩)/g, threshold: 2 },
+  { label: '嘴角勾起/一抹弧度', regex: /嘴角(?:微微)?(?:勾起|扬起|扯出|掠过|浮现)|一抹(?:冷笑|苦笑|讥诮|弧度|精光|寒芒|意味深长)/g, threshold: 2 },
+  { label: '深吸/倒吸凉气', regex: /深吸(?:了)?一口气|倒吸(?:了)?一口(?:凉气|冷气)/g, threshold: 2 },
+  { label: '心中暗道/掀起惊涛骇浪', regex: /心中(?:不禁|不由|暗道|一凛|掀起(?:了)?惊涛骇浪|五味杂陈)/g, threshold: 2 },
+  { label: '不由自主/情不自禁', regex: /不由自主(?:地)?|情不自禁(?:地)?|下意识地/g, threshold: 3 },
+  { label: '空气仿佛凝固/死一般寂静', regex: /空气(?:仿佛|似乎)?(?:凝固|安静得可怕)|死一般(?:的)?寂静|落针可闻/g, threshold: 1 },
+]
+
+const AI_ENDING_SUMMARY_REGEX = /(?:他|她|谁也)?(?:知道|明白|意识到|清楚)[，,]?(?:这一切|一切)(?:才)?刚刚开始|命运的齿轮(?:开始|悄然)?转动|暴风雨前的宁静|只(?:不过)?是(?:一场)?序幕|等待(?:着)?(?:他们|他|她)的将是|未来的路还很长/
+
+/**
+ * 去 AI 味专项纯函数审计（零 LLM 成本）：
+ * 1. 兑现 Prompt 硬约束：「仿佛/犹如/宛如」全章合计 ≤ 3 次
+ * 2. 拦截网文 AI 高频生理反应/套话（瞳孔骤缩、嘴角勾起一抹弧度、深吸一口气等），精确标注段落号
+ * 3. 拦截段尾/章末总结升华套话（「这一切才刚刚开始」「命运的齿轮开始转动」）
+ * 4. 补齐对话区盲区：检测引号内台词整句复读
+ */
+export function aiFlavorAudit(text: string, whitelist?: AuditWhitelist): AuditResult {
+  if (!text || !text.trim() || looksLikeEnglish(text)) {
+    return { passed: true, issues: [], summary: t('audit.aiFlavorPassed') }
+  }
+
+  const paragraphs = text
+    .split(/\n\s*\n+/)
+    .map(p => p.trim())
+    .filter(Boolean)
+
+  const issues: AuditIssue[] = []
+  const wlWords = new Set(whitelist?.words ?? [])
+
+  // 1. 比喻词「仿佛/犹如/宛如」总数检测（上限 3 次）
+  const simileRegex = /仿佛|犹如|宛如/g
+  let simileCount = 0
+  const simileParas: number[] = []
+  paragraphs.forEach((p, idx) => {
+    const matches = p.match(simileRegex)
+    if (matches && matches.length > 0) {
+      const valid = matches.filter(m => !wlWords.has(m))
+      if (valid.length > 0) {
+        simileCount += valid.length
+        simileParas.push(idx + 1)
+      }
+    }
+  })
+  if (simileCount > 3) {
+    const pos = simileParas.slice(0, 5).map(n => `第${n}段`).join('、')
+    issues.push({
+      kind: 'repetition',
+      severity: simileCount >= 6 ? 'error' : 'warn',
+      position: pos,
+      message: t('audit.aiSimileOveruse')
+        .replace('{n}', String(simileCount))
+        .replace('{max}', '3')
+        .replace('{pos}', pos),
+    })
+  }
+
+  // 2. AI 高频微表情与套路表达检测
+  for (const pat of AI_CLICHE_PATTERNS) {
+    if (wlWords.has(pat.label)) continue
+    let count = 0
+    const hitParas: number[] = []
+    paragraphs.forEach((p, idx) => {
+      const m = p.match(pat.regex)
+      if (m && m.length > 0) {
+        count += m.length
+        hitParas.push(idx + 1)
+      }
+    })
+    if (count > pat.threshold) {
+      const pos = hitParas.slice(0, 5).map(n => `第${n}段`).join('、')
+      issues.push({
+        kind: 'repetition',
+        severity: pat.severity ?? (count >= pat.threshold + 2 ? 'error' : 'warn'),
+        position: pos,
+        message: t('audit.aiClicheHit')
+          .replace('{label}', pat.label)
+          .replace('{n}', String(count))
+          .replace('{pos}', pos),
+      })
+    }
+  }
+
+  // 3. 段尾/章末升华总结套话检测
+  paragraphs.forEach((p, idx) => {
+    const tail = p.slice(-60)
+    const m = tail.match(AI_ENDING_SUMMARY_REGEX)
+    if (m && !whitelist?.sentences?.some(s => tail.includes(s))) {
+      const pos = `第${idx + 1}段`
+      issues.push({
+        kind: 'repetition',
+        severity: 'error',
+        position: pos,
+        message: t('audit.aiEndingSummary')
+          .replace('{phrase}', m[0])
+          .replace('{pos}', pos),
+      })
+    }
+  })
+
+  // 4. 对话区台词复读检测（弥补 waterAudit stripDialogue 盲区）
+  const dialogueFreq = new Map<string, number>()
+  for (const m of text.matchAll(/[“「]([^”」\n]{5,60})[”」]/g)) {
+    const line = m[1].replace(/[，。！？…\s]+$/g, '').trim()
+    if (line.length < 5) continue
+    if (whitelist?.sentences?.includes(line)) continue
+    dialogueFreq.set(line, (dialogueFreq.get(line) ?? 0) + 1)
+  }
+  for (const [line, count] of dialogueFreq.entries()) {
+    if (count >= 3 || (line.length >= 12 && count >= 2)) {
+      issues.push({
+        kind: 'repetition',
+        severity: 'warn',
+        message: t('audit.aiDialogueRepeat')
+          .replace('{line}', line.length > 25 ? line.slice(0, 25) + '…' : line)
+          .replace('{n}', String(count)),
+      })
+    }
+  }
+
+  return {
+    passed: issues.length === 0,
+    issues,
+    summary: issues.length === 0
+      ? t('audit.aiFlavorPassed')
+      : t('audit.aiFlavorFound').replace('{n}', String(issues.length)),
+  }
+}
+
 // ===== 聚合 =====
 
 export interface FullAuditInput {
@@ -670,6 +816,7 @@ export function runAllAudits(input: FullAuditInput): AuditResult {
   const terms = input.terms ?? []
   const all: AuditResult[] = [
     waterAudit(input.chapterText, { excludeWords: terms, baselineFreqs: input.baselineFreqs, whitelist: input.whitelist }),
+    aiFlavorAudit(input.chapterText, input.whitelist),
     continuityAudit(input.chapterText, input.prevChapterEnding, { excludeWords: terms }),
     terminologyAudit(input.chapterText, terms),
     blueprintAudit(input.chapterText, input.keyEvents ?? []),

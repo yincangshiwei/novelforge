@@ -99,6 +99,7 @@ export default function DraftEditor({ filePath, content }: Props) {
   }, [])
   const [confirmAction, setConfirmAction] = useState<'refine' | 'review' | null>(null)
   const [userRefinePrompt, setUserRefinePrompt] = useState('')
+  const [forceFullRefine, setForceFullRefine] = useState(false)
   const [reviewDims, setReviewDims] = useState<Record<string, boolean>>(
     Object.fromEntries(getReviewDims(t).map(d => [d.key, true]))
   )
@@ -176,15 +177,23 @@ export default function DraftEditor({ filePath, content }: Props) {
     if (!currentProject || !meta) return
     try {
       const { useWorkflowStore } = await import('../../stores/workflow-store')
-      const { createRefineOnlyWorkflow } = await import('../../services/workflows/chapter-workflow')
+      const { createRefineOnlyWorkflow, createRefineFromReviewWorkflow, parseDraftMeta } = await import('../../services/workflows/chapter-workflow')
+      const { getCurrentDraftReview } = await import('../../services/review-actions')
+      if (useEditorStore.getState().tabs.some(tab => tab.filePath === filePath && tab.dirty)) throw new Error(t('tool.draftDirty'))
       const body = await readDraftBody(filePath)
-      useWorkflowStore.getState().startWorkflow(createRefineOnlyWorkflow({
+      const dbMeta = await parseDraftMeta(filePath)
+      const report = !forceFullRefine && dbMeta ? await getCurrentDraftReview(dbMeta.id, body, currentProject.id) : null
+      const params = {
         chapterNumber: meta.chapterNumber,
         chapterTitle: meta.chapterTitle ?? t('editor.unknownTitle'),
         draftPath: filePath,
         draftContent: body,
         userRefinePrompt: userRefinePrompt.trim() || undefined,
-      }), false)
+      }
+      const workflow = report
+        ? createRefineFromReviewWorkflow({ ...params, reviewReport: report, reviewFileName: '' })
+        : createRefineOnlyWorkflow(params)
+      useWorkflowStore.getState().startWorkflow(workflow, false)
     } catch (e) {
       toast.error(t('error.polishFailed').replace('{error}', String(e)))
     }
@@ -383,7 +392,7 @@ export default function DraftEditor({ filePath, content }: Props) {
   // 稳定回调（配合 memo(EditorToolbar) / CodeMirrorEditor 的 handleUpdate 依赖）——
   // 否则流式期间（activeRuns 每 100ms 变化）内联函数重建，EditorToolbar 的 memo 形同虚设
   const handleToolbarSave = useCallback(() => doSave(currentBodyRef.current, { manual: true }), [doSave])
-  const handleToolbarRefine = useCallback(() => { setUserRefinePrompt(''); setConfirmAction('refine') }, [])
+  const handleToolbarRefine = useCallback(() => { setUserRefinePrompt(''); setForceFullRefine(false); setConfirmAction('refine') }, [])
   const handleToolbarReview = useCallback(() => setConfirmAction('review'), [])
   const handleEditorChange = useCallback((text: string) => {
     currentBodyRef.current = text
@@ -450,6 +459,8 @@ export default function DraftEditor({ filePath, content }: Props) {
         chapterTitle={meta?.chapterTitle}
         version={meta?.version}
         refinePrompt={userRefinePrompt}
+        forceFullRefine={forceFullRefine}
+        onForceFullRefineChange={setForceFullRefine}
         reviewDims={reviewDims}
         onClose={() => setConfirmAction(null)}
         onRefinePromptChange={setUserRefinePrompt}

@@ -121,7 +121,7 @@ export function getProjectDb(): BetterSqlite3.Database | null {
 
 // ===== Schema 版本管理 =====
 /** 当前数据库 schema 版本号（v18：写作自动化三表——D 档） */
-const CURRENT_SCHEMA_VERSION = 23
+const CURRENT_SCHEMA_VERSION = 24
 
 /** 检查并执行 schema 迁移（仅在版本号低于当前版本时运行） */
 function ensureSchemaVersion(db: BetterSqlite3.Database): void {
@@ -412,6 +412,7 @@ function createTables(db: BetterSqlite3.Database) {
       merged_to_draft_id INTEGER,                 -- 合并产出的新 draft
       user_prompt TEXT DEFAULT '',                -- 用户指导
       review_source_id INTEGER,                   -- 关联审稿 ID
+      audit_report TEXT DEFAULT '',
       content_id INTEGER NOT NULL,                -- FK -> contents
       word_count INTEGER DEFAULT 0,               -- 字数缓存
       created_at INTEGER DEFAULT (unixepoch() * 1000),
@@ -661,6 +662,8 @@ function ensureMigrationColumns(db: BetterSqlite3.Database) {
   safeAddColumn(db, 'drafts', 'content_hash', "TEXT DEFAULT ''")
   safeAddColumn(db, 'drafts', 'last_auto_snapshot_at', 'INTEGER DEFAULT 0')
   safeAddColumn(db, 'drafts', 'branch_id', 'INTEGER')
+
+  safeAddColumn(db, 'revisions', 'audit_report', "TEXT DEFAULT ''")
 
   // v23: 角色稳定 ID + 蓝图角色 ID 列表
   safeAddColumn(db, 'characters', 'uid', 'TEXT')

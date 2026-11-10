@@ -335,27 +335,6 @@ async function getLatestDraft(chapterNumber: number): Promise<{
   }
 }
 
-/** 获取章节的最新审稿报告 */
-async function getLatestReview(chapterNumber: number): Promise<string | null> {
-  try {
-    const { VELA, readVelaContent } = await import('../vela-protocol')
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const drafts = await ipc.invoke('db:draft-list', chapterNumber) as any[]
-    // 找带 review 的版本
-    const withReviews = drafts.filter(d => (d.hasReview as boolean) || (d.reviewId as number))
-    if (withReviews.length === 0) return null
-    const latest = withReviews.sort((a, b) => (b.version as number) - (a.version as number))[0]
-    const reviewId = (latest.reviewId as number) || (latest.id as number)
-    try {
-      return await readVelaContent(`${VELA.REVIEW}${reviewId}`)
-    } catch {
-      return null
-    }
-  } catch {
-    return null
-  }
-}
-
 /** 构建写稿工作流 */
 async function buildDraftWorkflow(chapterNumber: number, context?: ToolExecutionContext) {
   const { guardChapterWriting } = await import('./workflow-guards')
@@ -402,7 +381,8 @@ async function buildRefineWorkflow(chapterNumber: number, context?: ToolExecutio
   checkStartup(context)
   if (!draft) return null
 
-  const reviewReport = await getLatestReview(chapterNumber)
+  const { getCurrentDraftReview } = await import('../review-actions')
+  const reviewReport = await getCurrentDraftReview(Number(draft.meta.id), draft.content, useProjectStore.getState().currentProject?.id ?? '')
   checkStartup(context)
 
   if (reviewReport) {

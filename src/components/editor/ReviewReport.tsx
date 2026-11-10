@@ -1,4 +1,6 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
+import { useProjectStore } from '../../stores/project-store'
+import { getIgnoredReviewIssues, saveIgnoredReviewIssues, reviewIssueKey, isReviewCurrent, locateReviewEdits } from '../../services/review-actions'
 import { AlertTriangle, CheckCircle, Info, Sparkles, HelpCircle, Quote } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import { useTranslation } from '../../hooks/useTranslation'
@@ -61,7 +63,7 @@ function getSeverityMeta(t: TFunc): Record<ReviewIssue['severity'], {
 }
 
 /** 审稿报告查看器 */
-export default function ReviewReport({ reportText, draftPath, chapterNumber, chapterDir }: ReviewReportProps) {
+export default function ReviewReport({ reportText, draftPath }: ReviewReportProps) {
   const { t } = useTranslation()
   const severityMeta = useMemo(() => getSeverityMeta(t), [t])
 
@@ -77,6 +79,23 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
   const [userRefinePrompt, setUserRefinePrompt] = useState('')
   const [processing, setProcessing] = useState(false)
   const [showLegend, setShowLegend] = useState(false)
+  const projectId = useProjectStore(state => state.currentProject?.id ?? '')
+  const [ignored, setIgnored] = useState<Set<string>>(new Set())
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [actionError, setActionError] = useState('')
+  useEffect(() => {
+    setIgnored(getIgnoredReviewIssues(reportText, projectId))
+    setSelected(new Set())
+    setActionError('')
+  }, [reportText, projectId])
+  const originalIssue = (item: ReviewIssue) => rawIssues.find(issue => issue.description === item.description && issue.quote === item.quote && issue.severity === item.severity) ?? item
+  const toggleIgnore = (item: ReviewIssue) => {
+    const key = reviewIssueKey(originalIssue(item))
+    const next = new Set(ignored)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    try { saveIgnoredReviewIssues(reportText, projectId, next); setIgnored(next) } catch (error) { setActionError(String(error)) }
+  }
 
   // 按分类分组
   const categories = new Map<string, ReviewIssue[]>()
@@ -91,44 +110,37 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
   const warningCount = issues.filter((i) => i.severity === 'warning').length
   const passCount = issues.filter((i) => i.severity === 'pass').length
 
-  /** 根据审稿意见修稿 */
-  const doRefineFromReview = async () => {
-    if (!draftPath || !chapterDir) return
+  const doRefineFromReview = async (chosen?: ReviewIssue[]) => {
+    if (!draftPath || processing) return
     setProcessing(true)
+    setActionError('')
     setShowRefineDialog(false)
     try {
       const { useWorkflowStore } = await import('../../stores/workflow-store')
-
-      const { createRefineFromReviewWorkflow } = await import('../../services/workflows/chapter-workflow')
-      const { getLatestReview } = await import('../../services/draft-index')
-      const { readDraftBody } = await import('../../stores/draft-store')
-
-      const draftContent = await readDraftBody(draftPath)
-      if (!draftContent) return
-
-      // 提取版本信息
-      const versionMatch = draftPath.match(/draft_v(\d+)\.md$/)
-      const baseVersion = versionMatch ? parseInt(versionMatch[1]) : 1
-      const chapterNum = chapterNumber || 0
-
-      // 获取最新审稿文件名（用于关联）
-      const latestReview = await getLatestReview(chapterDir, baseVersion)
-      const reviewFileName = latestReview?.fileName || ''
-
-      // 从 index.json 读取章节标题
-      const { readDraftIndex } = await import('../../services/draft-index')
-      const index = await readDraftIndex()
-      const chapterTitle = index.chapterTitle || t('chapter.nLabel').replace('{n}', String(chapterNum))
-
+      const { createRefineFromReviewWorkflow, parseDraftMeta } = await import('../../services/workflows/chapter-workflow')
+      const { ipc } = await import('../../services/ipc-client')
+      const { useEditorStore } = await import('../../stores/editor-store')
+      const meta = await parseDraftMeta(draftPath)
+      if (!meta) throw new Error(t('error.noBaseDraft'))
+      if (useEditorStore.getState().tabs.some(tab => tab.filePath === draftPath && tab.dirty)) throw new Error(t('tool.draftDirty'))
+      const full = await ipc.invoke('db:draft-get-full', meta.id)
+      if (!full || !await isReviewCurrent(reportText, meta.id, full.content)) throw new Error(t('review.staleReport'))
+      const activeIssues = chosen ?? rawIssues.filter(item => item.severity !== 'pass' && !ignored.has(reviewIssueKey(item)))
+      if (!activeIssues.length) return
+      if (chosen) locateReviewEdits(full.content, chosen)
+      const filteredReport = JSON.stringify({ ...JSON.parse(reportText), items: activeIssues })
       useWorkflowStore.getState().startWorkflow(createRefineFromReviewWorkflow({
-        chapterNumber: chapterNum,
-        chapterTitle,
+        chapterNumber: meta.chapterNumber,
+        chapterTitle: meta.chapterTitle || t('chapter.nLabel').replace('{n}', String(meta.chapterNumber)),
         draftPath,
-        draftContent,
-        reviewReport: reportText,
-        reviewFileName,
+        draftContent: full.content,
+        reviewReport: filteredReport,
+        reviewFileName: '',
+        localOnly: !!chosen,
         userRefinePrompt: userRefinePrompt.trim() || undefined,
       }), false)
+    } catch (error) {
+      setActionError(t('review.fixError').replace('{error}', String(error)))
     } finally {
       setProcessing(false)
     }
@@ -141,10 +153,11 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
   }
 
   // 是否可以触发修稿（有草稿路径和章节信息时）
-  const canRefine = !!(draftPath && chapterDir)
+  const canRefine = !!draftPath
 
   return (
-    <div className="h-full overflow-y-auto">
+    <div className="h-full min-h-0 flex flex-col">
+      <div className="flex-1 min-h-0 overflow-y-auto">
       <div className="max-w-2xl mx-auto px-6 py-4">
         {/* 统计栏 */}
         <div className="flex items-center gap-4 mb-4 pb-3 border-b border-[var(--color-border)]">
@@ -287,6 +300,23 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
                             {item.quote}
                           </div>
                         )}
+                        {canRefine && item.severity !== 'pass' && (
+                          <div className="mt-2 ml-5 flex flex-wrap items-center gap-2">
+                            <input type="checkbox" aria-label={t('review.fixSelected')}
+                              checked={selected.has(reviewIssueKey(originalIssue(item)))}
+                              disabled={processing || ignored.has(reviewIssueKey(originalIssue(item)))}
+                              onChange={() => {
+                                const key = reviewIssueKey(originalIssue(item))
+                                setSelected(prev => { const next = new Set(prev); if (next.has(key)) next.delete(key); else next.add(key); return next })
+                              }} />
+                            <Button size="sm" variant="ai" disabled={processing || ignored.has(reviewIssueKey(originalIssue(item))) || !item.quote}
+                              title={!item.quote ? t('review.noExactQuote') : undefined}
+                              onClick={() => void doRefineFromReview([originalIssue(item)])}>{t('review.fixOne')}</Button>
+                            <Button size="sm" variant="ghost" disabled={processing} onClick={() => toggleIgnore(item)}>
+                              {t(ignored.has(reviewIssueKey(originalIssue(item))) ? 'review.restoreOne' : 'review.ignoreOne')}
+                            </Button>
+                          </div>
+                        )}
                       </div>
                     )
                   })}
@@ -304,24 +334,28 @@ export default function ReviewReport({ reportText, draftPath, chapterNumber, cha
           </pre>
         </Disclosure>
 
-        {/* 🔧 根据审稿意见修稿 — 核心循环入口 */}
+      </div>
+      </div>
         {canRefine && (
-          <div className="mt-6 pt-6 border-t border-[var(--color-border)] flex flex-col items-center">
-            <Button
-              variant="ai"
-              className="px-8"
-              onClick={() => { setUserRefinePrompt(''); setShowRefineDialog(true) }}
-              disabled={processing}
-            >
-              <Sparkles size={14} className="mr-1" />
-              {t('review.aiFixBtn')}
-            </Button>
-            <p className="text-micro text-center mt-3" style={{ color: 'var(--color-text-muted)' }}>
-              {t('review.aiFixDesc')}
-            </p>
+          <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-4 py-3 shadow-[0_-4px_12px_rgba(0,0,0,0.08)] z-10">
+            {actionError && <p role="alert" className="max-w-2xl mx-auto mb-2 text-sm text-[var(--color-error)]">{actionError}</p>}
+            <div className="max-w-2xl mx-auto flex items-center justify-center gap-3">
+              <Button variant="ai" className="flex-1 min-w-0" disabled={processing || !rawIssues.some(item => selected.has(reviewIssueKey(item)) && !ignored.has(reviewIssueKey(item)))}
+                onClick={() => void doRefineFromReview(rawIssues.filter(item => selected.has(reviewIssueKey(item)) && !ignored.has(reviewIssueKey(item))))}>
+                {t('review.fixSelected')}
+              </Button>
+              <Button
+                variant="ai"
+                className="flex-1 min-w-0"
+                onClick={() => { setUserRefinePrompt(''); setShowRefineDialog(true) }}
+                disabled={processing}
+              >
+                <Sparkles size={14} className="mr-1" />
+                {t('review.aiFixBtn')}
+              </Button>
+            </div>
           </div>
         )}
-      </div>
 
       {/* 审稿修稿确认弹窗（线③ 第 3 条：复用 AIActionDialog 壳，删内联复制体） */}
       <AIActionDialog

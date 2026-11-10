@@ -18,6 +18,7 @@ export interface RevisionMeta {
     mergedToDraftId: number | null
     userPrompt: string
     reviewSourceId: number | null
+    auditReport?: string
     contentId: number
     wordCount: number
     createdAt: number
@@ -39,6 +40,7 @@ function rowToMeta(row: Record<string, unknown>): RevisionMeta {
         mergedToDraftId: (row.merged_to_draft_id as number | null) ?? null,
         userPrompt: (row.user_prompt as string) ?? '',
         reviewSourceId: (row.review_source_id as number | null) ?? null,
+        auditReport: (row.audit_report as string) ?? '',
         contentId: row.content_id as number,
         wordCount: row.word_count as number,
         createdAt: row.created_at as number,
@@ -54,6 +56,7 @@ export class RevisionRepository {
         revisionType: 'refine' | 'review-fix'
         userPrompt?: string
         reviewSourceId?: number
+        auditReport?: string
         content: string
         wordCount: number
     }): number {
@@ -65,8 +68,8 @@ export class RevisionRepository {
             const result = db.prepare(`
         INSERT INTO revisions (
           base_draft_id, revision_index, revision_type,
-          user_prompt, review_source_id, content_id, word_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          user_prompt, review_source_id, content_id, word_count, audit_report
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
                 params.baseDraftId,
                 params.revisionIndex,
@@ -75,6 +78,7 @@ export class RevisionRepository {
                 params.reviewSourceId ?? null,
                 contentId,
                 params.wordCount,
+                params.auditReport ?? '',
             )
             return Number(result.lastInsertRowid)
         })

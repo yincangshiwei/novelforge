@@ -6,6 +6,10 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const toolTexts = {
+  'tool.aiFlavorAuditDesc': { 'zh-CN': '检查指定章节的去AI味规则信号（比喻滥用、套路动作、段尾总结、台词复读），返回草稿ID、版本和问题位置。只读，不自动修改；通过不等于文学质量通过。普通审稿也自动执行此检查。', 'en-US': 'Audit chapter prose for rule-based AI-style signals; returns draft ID, version and locations. Read-only, not a literary quality verdict. Regular review also runs this audit.', 'ru-RU': 'Проверить главу на шаблонные выражения; вернуть ID, версию и позиции. Только чтение, не оценка литературного качества. Проверка также включена в рецензию.' },
+  'tool.aiFlavorDraftId': { 'zh-CN': '可选草稿ID，必须属于该章且未归档；省略时检查最新有效版本', 'en-US': 'Optional non-archived draft ID belonging to this chapter; defaults to latest active version', 'ru-RU': 'Необязательный ID неархивного черновика этой главы; по умолчанию последняя активная версия' },
+  'tool.aiFlavorInvalidParams': { 'zh-CN': '章节号和草稿ID必须为正整数', 'en-US': 'Chapter number and draft ID must be positive integers', 'ru-RU': 'Номер главы и ID должны быть положительными целыми числами' },
+  'tool.aiFlavorInterrupted': { 'zh-CN': '检查已取消或当前项目已切换，请重新检查', 'en-US': 'Audit cancelled or project changed; run it again', 'ru-RU': 'Проверка отменена или проект изменён; повторите проверку' },
   'tool.draftReadonly': { 'zh-CN': '数据库草稿已定稿，不能由 Agent 直接修改', 'en-US': 'This database draft is finalized and cannot be edited by the Agent', 'ru-RU': 'Этот черновик финализирован и не может быть изменён Agent' },
   'tool.draftNotFound': { 'zh-CN': '数据库草稿不存在', 'en-US': 'Database draft not found', 'ru-RU': 'Черновик в базе не найден' },
   'tool.draftDirty': { 'zh-CN': '当前草稿有未保存的编辑，请先保存再让 Agent 修改', 'en-US': 'The open draft has unsaved edits; save it before the Agent edits it', 'ru-RU': 'В открытом черновике есть несохранённые правки; сохраните его перед изменением Agent' },

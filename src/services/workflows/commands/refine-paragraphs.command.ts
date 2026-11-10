@@ -31,6 +31,8 @@ export interface RefineParagraphsResult {
   summary: string
   /** 字数变化 */
   wordDelta: number
+  auditReport?: string
+  revisionId?: number
 }
 
 /** 改写类型 → 指令段落（i18n） */
@@ -119,33 +121,44 @@ export class RefineParagraphsCommand extends BaseWorkflowCommand<RefineParagraph
         .replace('{after}', String(computeTextStats(modifiedText).novelWordCount))
         .replace('{delta}', `${wordDelta >= 0 ? '+' : ''}${wordDelta}`)
 
+    const { auditRefinement, openRefinementAudit } = await import('../../audit/refinement-audit')
+    const draftMeta = await this.findDraftMeta()
+    const candidateAudit = await auditRefinement(modifiedContent, draftMeta?.id)
+    const auditReport = JSON.stringify(candidateAudit)
+    callbacks.log(candidateAudit.summary)
+    let revisionId: number | undefined
     // 创建修订记录
     try {
-      const draftMeta = await this.findDraftMeta()
       if (draftMeta) {
         const revIndex = await ipc.invoke('db:revision-next-index', draftMeta.id)
-        await ipc.invoke('db:revision-create', {
+        const created = await ipc.invoke('db:revision-create', {
           baseDraftId: draftMeta.id,
           revisionIndex: revIndex,
           revisionType: 'refine' as const,
           userPrompt: `${refineType}: ${instruction}`,
+          auditReport,
           content: modifiedContent,
           wordCount: computeTextStats(modifiedContent).novelWordCount,
         })
+        if (created.success && created.id) {
+          revisionId = created.id
+          openRefinementAudit(auditReport, created.id)
+        }
         callbacks.log(summary)
       }
     } catch {
       // 修订创建失败不影响主流程
     }
 
-    return { modifiedContent, summary, wordDelta }
+    return { modifiedContent, summary, wordDelta, auditReport, revisionId }
   }
 
   private async findDraftMeta(): Promise<{ id: number } | null> {
     try {
       // 从当前编辑器 tab 获取 draft 信息
       const { useEditorStore } = await import('../../../stores/editor-store')
-      const activeTab = useEditorStore.getState().tabs.find(t => t.type === 'chapter')
+      const editor = useEditorStore.getState()
+      const activeTab = editor.tabs.find(tab => tab.id === editor.activeTabId && tab.type === 'chapter')
       if (activeTab?.filePath) {
         const { parseDraftMeta } = await import('../chapter-workflow')
         return parseDraftMeta(activeTab.filePath)

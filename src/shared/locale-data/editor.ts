@@ -6,6 +6,18 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const editorTexts = {
+  'review.localFixSystem': { 'zh-CN': '你是精准小说编辑。只修改JSON中excerpt的内容以解决指定issue。前后context只供参考，不得输出或修改。保留剧情事实、人物声音与必要伏笔，不添加新剧情。不扩写其他内容。只输出替换片段纯文本，不要解释或Markdown。', 'en-US': 'Edit only the JSON excerpt to address its issue. Context is reference only; never output it. Preserve plot facts, voice and clues. Return only replacement prose, no commentary or Markdown.', 'ru-RU': 'Правьте только excerpt по issue. Контекст не выводить. Сохраняйте сюжет, голос и подсказки. Только заменяющий текст, без пояснений.' },
+  'review.fixOne': { 'zh-CN': 'AI修复此项', 'en-US': 'Fix this issue', 'ru-RU': 'Исправить пункт' },
+  'review.fixSelected': { 'zh-CN': 'AI修复选中项（精确局部）', 'en-US': 'Fix selected excerpts', 'ru-RU': 'Исправить выбранные фрагменты' },
+  'review.ignoreOne': { 'zh-CN': '忽略此项', 'en-US': 'Ignore', 'ru-RU': 'Игнорировать' },
+  'review.restoreOne': { 'zh-CN': '恢复此项', 'en-US': 'Restore', 'ru-RU': 'Восстановить' },
+  'review.staleReport': { 'zh-CN': '报告缺少正文校验信息或正文已变化，请重新AI审稿后修复。', 'en-US': 'Report lacks a fingerprint or prose changed. Review again before fixing.', 'ru-RU': 'Нет отпечатка текста или текст изменился. Повторите рецензию.' },
+  'review.noExactQuote': { 'zh-CN': '该项没有可定位引用，请使用章节级按报告修稿。', 'en-US': 'No excerpt to locate; use chapter-level review revision.', 'ru-RU': 'Нет цитаты; используйте правку главы по рецензии.' },
+  'review.ambiguousQuote': { 'zh-CN': '引用不存在或重复出现，无法安全定位；请重新审稿或单独处理。', 'en-US': 'Excerpt missing or repeated; cannot locate safely.', 'ru-RU': 'Цитата отсутствует или повторяется; безопасное определение невозможно.' },
+  'review.overlappingQuotes': { 'zh-CN': '选中引用互相重叠，请分次修复。', 'en-US': 'Selected excerpts overlap; fix separately.', 'ru-RU': 'Цитаты пересекаются; исправляйте отдельно.' },
+  'review.fixError': { 'zh-CN': '修稿未启动：{error}', 'en-US': 'Revision not started: {error}', 'ru-RU': 'Правка не запущена: {error}' },
+  'review.forceFull': { 'zh-CN': '全文精修（不使用报告）', 'en-US': 'Full polish (ignore review)', 'ru-RU': 'Полная правка без рецензии' },
+  'review.autoMode': { 'zh-CN': '默认：有当前有效报告则按报告修稿，否则全文精修。', 'en-US': 'Default: use current valid review; otherwise full polish.', 'ru-RU': 'По умолчанию: актуальная рецензия или полная правка.' },
   'draftbox.permanentDelete': { 'zh-CN': '永久删除草稿', 'en-US': 'Permanently delete draft', 'ru-RU': 'Удалить черновик навсегда' },
   'draftbox.permanentDeleteConfirm': { 'zh-CN': '永久删除「{name}」及其快照、修稿和审稿记录？此操作不可恢复，不影响其他草稿版本。', 'en-US': 'Permanently delete “{name}” and its snapshots, revisions and reviews? This cannot be undone. Other drafts are kept.', 'ru-RU': 'Удалить «{name}», снимки, правки и рецензии навсегда? Действие необратимо. Другие версии сохранятся.' },
   'draftbox.deleteOpenTab': { 'zh-CN': '请先关闭该章节的编辑器页签，再永久删除归档草稿，以免丢失未保存内容或正在查看的版本。', 'en-US': 'Close this chapter’s editor tabs before permanently deleting an archived draft.', 'ru-RU': 'Закройте вкладки этой главы перед удалением архивного черновика.' },

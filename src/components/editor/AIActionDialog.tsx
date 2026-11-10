@@ -61,6 +61,8 @@ export interface AIActionDialogProps {
   onConfirm: () => void
   /** 线③：修稿场景文案定制（审稿修稿复用本壳时传入） */
   refineCopy?: AIActionRefineCopy
+  forceFullRefine?: boolean
+  onForceFullRefineChange?: (value: boolean) => void
 }
 
 export default memo(function AIActionDialog({
@@ -74,6 +76,8 @@ export default memo(function AIActionDialog({
   onReviewDimToggle,
   onConfirm,
   refineCopy,
+  forceFullRefine,
+  onForceFullRefineChange,
 }: AIActionDialogProps) {
   const { t } = useTranslation()
   const reviewDimsData = useMemo(() => getReviewDims(t), [t])
@@ -105,7 +109,15 @@ export default memo(function AIActionDialog({
           {action === 'refine' ? (
             <>
               <div className="font-medium text-[var(--color-text)]">{t(refineScopeTitleKey)}</div>
-              {refineScopeItems.map((key, i) => (
+              {onForceFullRefineChange ? (
+                <>
+                  <p>{t('review.autoMode')}</p>
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={!!forceFullRefine} onChange={event => onForceFullRefineChange(event.target.checked)} />
+                    {t('review.forceFull')}
+                  </label>
+                </>
+              ) : refineScopeItems.map((key, i) => (
                 <div key={key}>{i + 1}. {t(key)}</div>
               ))}
             </>

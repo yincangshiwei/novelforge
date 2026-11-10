@@ -41,6 +41,7 @@ export interface RefineFromReviewParams {
   reviewReport: string
   reviewFileName: string
   userRefinePrompt?: string
+  localOnly?: boolean
 }
 
 export interface ReviewOnlyParams {
@@ -203,6 +204,7 @@ export function createRefineFromReviewWorkflow(params: RefineFromReviewParams): 
             draftContent: params.draftContent,
             reviewReport: params.reviewReport,
             reviewFileName: params.reviewFileName,
+            localOnly: params.localOnly,
             chapterNumber: params.chapterNumber,
             userRefinePrompt: params.userRefinePrompt,
           })

@@ -7,6 +7,9 @@
 import { ipc } from './ipc-client'
 import type { PreferenceData } from '../../electron/repositories/preference-repository'
 
+/** 用户将 AI 冗余短语直接删空时的哨兵值（复用 preferences 表，无需额外迁移表结构） */
+export const DELETED_PREF_SENTINEL = '__DELETED__'
+
 /** 记录一个替换对（防抖由调用方控制） */
 export async function recordPreference(aiText: string, userText: string): Promise<void> {
   try {
@@ -24,9 +27,10 @@ export async function getTopPreferences(limit = 5): Promise<PreferenceData[]> {
 }
 
 /**
- * 从 AI 原文与用户改后文本中提取替换对。
- * 算法：前缀/后缀匹配 → 中间差异段；差异段必须为 2-12 字纯中文
- * （排除结构性增删/整段重写——那不算词汇偏好，误记会污染注入）。
+ * 从 AI 原文与用户改后文本中提取替换对或删减偏好。
+ * 算法：前缀/后缀匹配 → 中间差异段；
+ * 1. 替换模式：差异段为 2-20 字中文短语（允许含常见句内标点，捕获节奏微调与词组平替）
+ * 2. 删减模式：用户将 AI 的 2-12 字修饰词/套话直接删空（userDiff 为空）→ 记录为 DELETED_PREF_SENTINEL 厌恶表达
  */
 export function extractPreferencePair(
   aiText: string,
@@ -50,11 +54,17 @@ export function extractPreferencePair(
   const aiDiff = aiText.slice(prefix, aiText.length - suffix)
   const userDiff = userText.slice(prefix, userText.length - suffix)
 
+  // 模式 B：用户直接删掉 AI 的冗余套话短语（如删掉“不由自主地”“在这一刻”）
+  const trimmedAiDeleted = aiDiff.replace(/^[，、\s]+|[，、\s]+$/g, '')
+  if (!userDiff.trim() && isValidDiff(trimmedAiDeleted)) {
+    return { ai: trimmedAiDeleted, user: DELETED_PREF_SENTINEL }
+  }
+
   if (!isValidDiff(aiDiff) || !isValidDiff(userDiff)) return null
   return { ai: aiDiff, user: userDiff }
 }
 
-/** 差异段有效判定：2-12 字纯中文（无标点/空白/字母） */
+/** 差异段有效判定：2-12 字纯中文（无标点/空白/字母，排除句子级增删与整段重写） */
 function isValidDiff(diff: string): boolean {
   const len = diff.length
   if (len < 2 || len > 12) return false

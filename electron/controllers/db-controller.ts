@@ -556,6 +556,7 @@ export function registerDatabaseController() {
     revisionType: 'refine' | 'review-fix'
     userPrompt?: string
     reviewSourceId?: number
+    auditReport?: string
     content: string
     wordCount: number
   }) => {
