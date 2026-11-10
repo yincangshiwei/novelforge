@@ -252,6 +252,33 @@ describe('历史会话同步打开所属项目', () => {
   })
 })
 
+describe('工作区名称同步持久化', () => {
+  it('按路径更新普通及归档会话，保存后重新恢复仍保留新名称', async () => {
+    const base: AgentConversation = {
+      id: 'rename-active', title: '原对话标题', messages: [], modelId: null,
+      createdAt: 1, updatedAt: 1, projectPath: '/rename-project', projectName: '旧项目名',
+    }
+    const archived = { ...base, id: 'rename-archived', archived: true }
+    const other = { ...base, id: 'rename-other', projectPath: '/other-project' }
+    const unbound = { ...base, id: 'rename-unbound', projectPath: undefined }
+    useAgentStore.setState({ conversations: [base, archived, other, unbound], activeConversationId: base.id })
+    expect(await useAgentStore.getState().renameWorkspace(base.projectPath!, ' 新项目名 ')).toBe(true)
+    expect(useAgentStore.getState().conversations).toEqual([
+      { ...base, projectName: '新项目名' }, { ...archived, projectName: '新项目名' }, other, unbound,
+    ])
+    for (const id of [base.id, archived.id]) {
+      expect(parseArchive(archiveFiles.get(id)!)).toMatchObject({ projectName: '新项目名', projectPath: base.projectPath, title: base.title })
+    }
+    expect(archiveFiles.has(other.id)).toBe(false)
+    expect(archiveFiles.has(unbound.id)).toBe(false)
+    useAgentStore.setState({ conversations: [], activeConversationId: null })
+    await useAgentStore.getState().restoreArchives()
+    expect(useAgentStore.getState().conversations).toHaveLength(2)
+    expect(useAgentStore.getState().conversations.every(c => c.projectName === '新项目名')).toBe(true)
+    expect(useAgentStore.getState().conversations.find(c => c.id === archived.id)?.archived).toBe(true)
+  })
+})
+
 describe('用户消息编辑重发', () => {
   it('回退到用户消息之前，保留原请求和后续，原始输入重新发送一次', async () => {
     const conv = useAgentStore.getState().createConversation({ title: '编辑' })

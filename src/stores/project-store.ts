@@ -240,8 +240,16 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
           ...state.recentProjects.filter(p => p.path !== project.path),
         ].slice(0, 20),
       }))
-      // project:save 已更新历史文件；同时同步全局配置供活动聚合读取。
+      // project:save 已更新最近项目历史；同时同步全局配置供活动聚合读取。
       ipc.invoke('config:set', { recentProjects: get().recentProjects }).catch(() => {})
+      try {
+        const { useAgentStore } = await import('./agent-store')
+        const saved = await useAgentStore.getState().renameWorkspace(project.path, trimmedName)
+        if (!saved) toast.warning('项目已改名，但部分历史对话名称保存失败，请重试保存后再关闭应用。')
+      } catch (err) {
+        renderLog('error', 'Project', `项目已改名，历史对话名称同步失败: ${String(err)}`)
+        toast.warning('项目已改名，但历史对话名称同步失败。')
+      }
       return true
     } catch (err) {
       console.error('[project-store.renameProject] 改名失败:', err)

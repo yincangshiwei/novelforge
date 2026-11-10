@@ -205,7 +205,7 @@ interface AgentState {
   /** **整条会话**分叉：复制全部消息为新会话（区别于消息级的 forkConversation） */
   duplicateConversation: (id: string) => void
   /** 重命名**工作区**（只改该组会话的显示名，不动磁盘上的实际项目） */
-  renameWorkspace: (projectPath: string, name: string) => void
+  renameWorkspace: (projectPath: string, name: string) => Promise<boolean>
   /** 删除**工作区**：删掉该分组下全部会话（含归档）。调用方必须先二次确认 */
   deleteWorkspace: (projectPath: string) => void
   /** 激活指定会话 */
@@ -2241,18 +2241,17 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     void copyAllOriginals(id, copy.id).catch(() => { /* 复制失败不阻断 */ })
   },
 
-  renameWorkspace: (projectPath, name) => {
+  renameWorkspace: async (projectPath, name) => {
     const next = name.trim()
-    if (!next) return
+    if (!next) return false
     const key = projectPath || '__none__'
     const inGroup = (p?: string) => (p || '__none__') === key
+    const ids = get().conversations.filter(c => inGroup(c.projectPath)).map(c => c.id)
     set({
       conversations: get().conversations.map(c => (inGroup(c.projectPath) ? { ...c, projectName: next } : c)),
     })
-    // 该组每条都要落盘（persistCurrent 是按会话的）
-    for (const c of get().conversations) {
-      if (inGroup(c.projectPath)) get().persistCurrent(c.id)
-    }
+    const saved = await Promise.all(ids.map(id => get().persistCurrent(id)))
+    return saved.every(Boolean)
   },
 
   deleteWorkspace: (projectPath) => {

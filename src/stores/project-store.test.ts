@@ -82,6 +82,48 @@ describe('project-store 执行中项目隔离', () => {
 })
 
 describe('project-store 项目改名', () => {
+  beforeEach(async () => {
+    const { useAgentStore } = await import('./agent-store')
+    useAgentStore.setState({ conversations: [], activeConversationId: null })
+  })
+
+  it.each([true, false])('项目保存 success=%s 时历史名称仅随成功同步', async success => {
+    const { useAgentStore } = await import('./agent-store')
+    const conversation = {
+      id: 'project-rename-history', title: '对话标题', messages: [], modelId: null,
+      createdAt: 1, updatedAt: 1, projectPath: BASE.path, projectName: BASE.name,
+    }
+    const other = { ...conversation, id: 'other-history', projectPath: '/other' }
+    useAgentStore.setState({ conversations: [conversation, { ...conversation, id: 'archived-history', archived: true }, other], activeConversationId: other.id })
+    vi.mocked(ipc.invoke).mockResolvedValueOnce({ success })
+    expect(await useProjectStore.getState().renameProject(' 新名称 ')).toBe(success)
+    const histories = useAgentStore.getState().conversations
+    expect(histories[0].projectName).toBe(success ? '新名称' : BASE.name)
+    expect(histories[1].projectName).toBe(success ? '新名称' : BASE.name)
+    expect(histories[2]).toEqual(other)
+    expect(useAgentStore.getState().activeConversationId).toBe(other.id)
+    const writes = vi.mocked(ipc.invoke).mock.calls.filter(call => call[0] === 'fs:agent-archive-write')
+    expect(writes).toHaveLength(success ? 2 : 0)
+    if (success) {
+      for (const call of writes) expect(JSON.parse(String(call[2]))).toMatchObject({ projectName: '新名称', projectPath: BASE.path })
+    }
+  })
+
+  it('历史保存失败不回滚已改名项目，失败快照可重试保存', async () => {
+    const { useAgentStore } = await import('./agent-store')
+    useAgentStore.setState({ conversations: [{
+      id: 'rename-save-failure', title: '对话', messages: [], modelId: null,
+      createdAt: 1, updatedAt: 1, projectPath: BASE.path, projectName: BASE.name,
+    }] })
+    vi.mocked(ipc.invoke).mockImplementation(async (...args: unknown[]) => ({ success: args[0] !== 'fs:agent-archive-write' }))
+    expect(await useProjectStore.getState().renameProject('新名称')).toBe(true)
+    expect(useProjectStore.getState().currentProject?.name).toBe('新名称')
+    expect(useAgentStore.getState().conversations[0].projectName).toBe('新名称')
+    expect(useAgentStore.getState().archiveSaveStates['rename-save-failure'].status).toBe('failed')
+    vi.mocked(ipc.invoke).mockResolvedValue({ success: true })
+    expect(await useAgentStore.getState().flushArchives()).toBe(true)
+    expect(useAgentStore.getState().archiveSaveStates['rename-save-failure'].status).toBe('saved')
+  })
   it('无项目、空名称和同名均不调用 IPC', async () => {
     const { renameProject } = useProjectStore.getState()
     expect(await renameProject(' \n ')).toBe(false)
