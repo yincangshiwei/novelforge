@@ -1,6 +1,7 @@
 import { t } from '../shared/locale'
 import { create } from 'zustand'
 import { ipc } from '../services/ipc-client'
+import { registerLLMRequest, finishLLMRequest, trackLLMStart, cancelTrackedLLMRequest } from '../services/llm/request-drain'
 import { renderLog } from '../services/render-logger'
 import { toast } from '../components/ui/Toast'
 import { getThinkingTemperature } from './thinking-store'
@@ -408,12 +409,13 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
         if (settled) return
         settled = true
         cleanup()
-        if (sent) void ipc.invoke('llm:cancel', requestId).catch(() => {})
+        if (sent) void get().cancelGeneration(requestId).catch(() => {})
         resolve(cancelled())
       }
       signal?.addEventListener('abort', onAbort, { once: true })
       if (signal?.aborted) { onAbort(); return }
       sent = true
+      registerLLMRequest(requestId)
       ipc.invoke('llm:generate', {
         requestId,
         modelId: mid,
@@ -425,11 +427,13 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
         toolChoice: options?.toolChoice,
         priority: options?.priority ?? 10,
       }).then((result) => {
+        finishLLMRequest(requestId)
         if (settled) return
         settled = true
         cleanup()
         resolve(result)
       }, (error) => {
+        void get().cancelGeneration(requestId).catch(() => {})
         if (settled) return
         settled = true
         cleanup()
@@ -469,6 +473,7 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
     })
 
     const cleanup = () => {
+      finishLLMRequest(requestId)
       unsubChunk()
       unsubDone()
       unsubError()
@@ -483,7 +488,8 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
     set({ activeRequests: reqs })
 
     // 发起流式请求
-    const started = await ipc.invoke('llm:generate-stream', requestId, {
+    registerLLMRequest(requestId)
+    const started = await trackLLMStart(requestId, ipc.invoke('llm:generate-stream', requestId, {
       modelId: mid,
       messages,
       stream: true,
@@ -493,7 +499,8 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
       tools: options?.tools,
       toolChoice: options?.toolChoice,
       priority: options?.priority ?? 10,
-    }).catch(error => {
+    })).catch(error => {
+      void get().cancelGeneration(requestId).catch(() => {})
       cleanup()
       callbacks.onError?.(String(error))
       throw error
@@ -507,7 +514,7 @@ export const useLLMStore = create<LLMState>()((set, get) => ({
   },
 
   cancelGeneration: async (requestId) => {
-    await ipc.invoke('llm:cancel', requestId)
+    await cancelTrackedLLMRequest(requestId, id => ipc.invoke('llm:cancel', id).then(() => {}))
   },
 
   testConnection: async (model, apiKeyDraft) => {

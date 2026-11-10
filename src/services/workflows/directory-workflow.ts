@@ -31,6 +31,7 @@ const EMPTY_BLUEPRINT: ChapterBlueprint = {
 
 export interface DirectoryWorkflowParams {
   mode: 'full' | 'append'
+  continueSaved?: boolean
   startChapter?: number
   count?: number
   /** 节奏/风格指导（可选） */
@@ -378,36 +379,16 @@ export function createDirectoryWorkflow(params: DirectoryWorkflowParams = { mode
           let merged: ChapterBlueprint[]
           if (params.mode === 'full') {
             merged = newBlueprints
-            // 全量模式：删除不在新列表中的旧蓝图
-            const newChapterNums = new Set(newBlueprints.map(b => b.chapterNumber))
-            const allExisting = await loadDirectoryBlueprints()
-            const coverageRatio = allExisting.length > 0
-              ? newBlueprints.length / Math.max(allExisting.length, newBlueprints.length)
-              : 1
 
-            if (coverageRatio >= 0.5 || newBlueprints.length >= project.novelConfig.totalChapters * 0.8) {
-              for (const existing of allExisting) {
-                if (!newChapterNums.has(existing.chapterNumber)) {
-                  try {
-                    await ipc.invoke('db:blueprint-delete', existing.chapterNumber)
-                  } catch {
-                    callbacks.log(t('log.dirKeepOld').replace('{n}', String(existing.chapterNumber)))
-                  }
-                }
-              }
-            } else {
-              callbacks.log(t('log.dirCoverageWarn')
-                .replace('{percent}', (coverageRatio * 100).toFixed(0))
-                .replace('{new}', String(newBlueprints.length))
-                .replace('{old}', String(allExisting.length)))
-            }
           } else {
             const existingMap = new Map(existingBlueprints.map(b => [b.chapterNumber, b]))
             for (const nb of newBlueprints) existingMap.set(nb.chapterNumber, nb)
             merged = Array.from(existingMap.values()).sort((a, b) => a.chapterNumber - b.chapterNumber)
           }
 
+          if (context.cancelled || context.signal?.aborted) throw new DOMException('工作流已停止', 'AbortError')
           await saveAllBlueprints(merged)
+          if (context.cancelled || context.signal?.aborted) throw new DOMException('工作流已停止', 'AbortError')
           try {
             const { extractPlannedCharacters } = await import('./planned-character-extract')
             await extractPlannedCharacters(newBlueprints, project.id, callbacks, context)

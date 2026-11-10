@@ -333,7 +333,7 @@ export function createRepairFinalizeWorkflow(chapterNumber: number): WorkflowDef
           const scope = getChapterFinalizeScope(chapterNumber)
           const steps = buildFinalizePostProcessSteps(project, chapterNumber, chapterTitle, full.content)
 
-          await runPostProcessPipeline(project.path, scope, t('workflow.chapterFinalizeSource').replace('{n}', String(chapterNumber)), steps, callbacks, { onlyFailed: true })
+          await runPostProcessPipeline(project.path, scope, t('workflow.chapterFinalizeSource').replace('{n}', String(chapterNumber)), steps, callbacks, { onlyFailed: true, context: _context })
 
           // 通知刷新：定稿改变了草稿状态/正式稿列表/角色卡/文件树——用 'all' 全刷
           // （FINALIZE_COMPLETE 供 project-service 刷新草稿+角色+文件树，

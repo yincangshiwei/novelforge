@@ -4,6 +4,9 @@ import { ipc } from '../ipc-client'
 import { calculateCost } from '../llm/prompt-cache'
 import { parseMemoryFile, buildChapterEntryBlock, type ChapterSummaryEntry } from './memory-codec'
 import { maybeTriggerBookState } from './book-memory'
+import type { WorkflowContext } from '../../stores/workflow-store'
+import { throwIfWorkflowCancelled, isWorkflowAbortError } from '../workflows/workflow-utils'
+type CancellationContext = Pick<WorkflowContext, 'cancelled' | 'signal'>
 
 /** 15 章滚动窗口（无分卷/未命中/进行中卷时） */
 const CHAPTERS_PER_FILE = 15
@@ -49,11 +52,13 @@ export async function generateChapterSummary(opts: {
   chapterTitle: string
   draftContent: string
   modelId: string
-}): Promise<ChapterSummaryEntry> {
+}, context?: CancellationContext): Promise<ChapterSummaryEntry> {
+  throwIfWorkflowCancelled(context)
   const prompt = buildChapterSummaryPrompt(opts.chapterNumber, opts.chapterTitle, opts.draftContent)
   const mid = useLLMStore.getState().getModelForPurpose('summarize') ?? opts.modelId
   const startTime = Date.now()
-  const response = await useLLMStore.getState().generate([{ role: 'user', content: prompt }], mid, { temperature: 0.2, priority: 12 })
+  const response = await useLLMStore.getState().generate([{ role: 'user', content: prompt }], mid, { temperature: 0.2, priority: 12, signal: context?.signal })
+  throwIfWorkflowCancelled(context)
   const duration = Date.now() - startTime
   const model = useLLMStore.getState().models.find(m => m.id === mid)
   const usage = response.usage
@@ -99,7 +104,8 @@ export async function generateChapterSummary(opts: {
  * - 单章块用 buildChapterEntryBlock（无 frontmatter/标题残留）
  * - 重定稿判定（文件已有本章条目 = 重定稿）由调用方在 DAG 步骤内完成（覆盖生成即清除 stale）
  */
-export async function upsertChapterMemory(entry: ChapterSummaryEntry, file: string): Promise<{ file: string; success: boolean }> {
+export async function upsertChapterMemory(entry: ChapterSummaryEntry, file: string, context?: CancellationContext): Promise<{ file: string; success: boolean }> {
+  throwIfWorkflowCancelled(context)
   try {
     const raw = await ipc.invoke('memory:read', file) as string | null
     const existing = parseMemoryFile(raw ?? '')
@@ -121,9 +127,13 @@ export async function upsertChapterMemory(entry: ChapterSummaryEntry, file: stri
     // frontmatter：保留 range 等字段，**清除 status**（stale 闭环）
     const fmEntries = Object.entries(existing?.frontmatter ?? {}).filter(([k]) => k !== 'status')
     const fm = fmEntries.length > 0 ? `---\n${fmEntries.map(([k, v]) => `${k}: ${v}`).join('\n')}\n---\n\n` : ''
+    throwIfWorkflowCancelled(context)
     await ipc.invoke('memory:write', file, `${fm}${body.join('\n')}`)
+    throwIfWorkflowCancelled(context)
     return { file, success: true }
-  } catch {
+  } catch (error) {
+    throwIfWorkflowCancelled(context)
+    if (isWorkflowAbortError(error)) throw error
     return { file, success: false }
   }
 }
@@ -160,7 +170,9 @@ export function buildVolumeSummaryFile(
  */
 export async function ensureVolumeSummary(
   volume: { volumeNumber: number; title: string; chapterStart: number; chapterEnd: number },
+  context?: CancellationContext,
 ): Promise<{ file: string | null; success: boolean }> {
+  throwIfWorkflowCancelled(context)
   try {
     const list = (await ipc.invoke('memory:list')) as { file: string; kind: string; stale: boolean }[] | null
     if (!list) return { file: null, success: false }
@@ -172,7 +184,9 @@ export async function ensureVolumeSummary(
     // 收集上界：已闭合卷 = chapterEnd；进行中卷 = 无上界（收集后按条目最大章节号确定——见下）
     const cap = volume.chapterEnd === 0 ? Number.MAX_SAFE_INTEGER : volume.chapterEnd
     for (const file of chapterFiles) {
+      throwIfWorkflowCancelled(context)
       const raw = await ipc.invoke('memory:read', file) as string | null
+      throwIfWorkflowCancelled(context)
       if (!raw) continue
       const { body } = parseMemoryFile(raw) ?? { body: raw }
       // 从章节文件正文解析条目（按「## 第 N 章 ·」块；标题从块头分离——审阅修正）
@@ -195,11 +209,14 @@ export async function ensureVolumeSummary(
     if (!has) return { file: null, success: false } // 未完整，跳过
     const entries = [...byChapter.values()].sort((a, b) => a.chapterNumber - b.chapterNumber)
     const file = `volume-${String(volume.volumeNumber).padStart(3, '0')}.md` // 零填充防字典序错排（审阅修正）
+    throwIfWorkflowCancelled(context)
     await ipc.invoke('memory:write', file, buildVolumeSummaryFile(volume, entries))
-    // P2 Task 3：卷聚合成功后检查点触发全书重建（每满 3 个非 stale 卷；低频，失败静默不阻断定稿）
-    await maybeTriggerBookState()
+    throwIfWorkflowCancelled(context)
+    await maybeTriggerBookState(context)
     return { file, success: true }
-  } catch {
+  } catch (error) {
+    throwIfWorkflowCancelled(context)
+    if (isWorkflowAbortError(error)) throw error
     return { file: null, success: false }
   }
 }

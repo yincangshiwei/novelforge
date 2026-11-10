@@ -9,7 +9,7 @@
  */
 
 import { t } from '../../shared/locale'
-import type { StepCallbacks } from '../../stores/workflow-store'
+import type { StepCallbacks, WorkflowContext } from '../../stores/workflow-store'
 import { ipc } from '../ipc-client'
 
 // ===== 文本处理通用工具 =====
@@ -695,6 +695,75 @@ function repairSingleObject(objStr: string): string | null {
   }
 }
 
+export function isWorkflowAbortError(error: unknown): boolean {
+  return !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
+}
+
+export function throwIfWorkflowCancelled(context?: Pick<WorkflowContext, 'cancelled' | 'signal'>): void {
+  if (context?.cancelled || context?.signal?.aborted) {
+    const error = new Error(t('error.workflowCancelled'))
+    error.name = 'AbortError'
+    throw error
+  }
+}
+
+/** 回调和启动 promise 共用出口；取消后忽略迟到回调，待 requestId 返回再取消对应请求。 */
+export function settleWorkflowStream<T>(
+  start: (callbacks: { onChunk: (chunk: string) => void; onDone: (value: T) => void; onError: (error: string) => void }) => Promise<string>,
+  onChunk: (chunk: string) => void,
+  cancel: (requestId: string) => Promise<void>,
+  context?: Pick<WorkflowContext, 'cancelled' | 'signal'>,
+): Promise<T> {
+  throwIfWorkflowCancelled(context)
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    let requestId: string | undefined
+    let aborted = false
+    const cleanup = () => context?.signal?.removeEventListener('abort', onAbort)
+    const fail = (error: unknown) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(error)
+    }
+    const onAbort = () => {
+      aborted = true
+      if (requestId) void cancel(requestId).catch(() => {})
+      const error = new Error(t('error.workflowCancelled'))
+      error.name = 'AbortError'
+      fail(error)
+    }
+    context?.signal?.addEventListener('abort', onAbort, { once: true })
+    if (context?.signal?.aborted || context?.cancelled) { onAbort(); return }
+    try {
+      start({
+        onChunk: chunk => {
+          if (settled) return
+          if (context?.cancelled || context?.signal?.aborted) { onAbort(); return }
+          onChunk(chunk)
+        },
+        onDone: value => {
+          if (settled) return
+          if (context?.cancelled || context?.signal?.aborted) { onAbort(); return }
+          settled = true
+          cleanup()
+          resolve(value)
+        },
+        onError: error => {
+          if (settled) return
+          if (context?.cancelled || context?.signal?.aborted) { onAbort(); return }
+          fail(new Error(error))
+        },
+      }).then(id => {
+        requestId = id
+        if (aborted && id) void cancel(id).catch(() => {})
+      }, fail)
+    } catch (error) {
+      fail(error)
+    }
+  })
+}
+
 // ===== 通用重试包装器 =====
 
 /**
@@ -710,12 +779,17 @@ export async function withRetry(
   maxRetries: number,
   label: string,
   callbacks: StepCallbacks,
+  context?: WorkflowContext,
 ): Promise<{ ok: boolean; error?: string; attempts: number }> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    throwIfWorkflowCancelled(context)
     try {
       await fn()
+      throwIfWorkflowCancelled(context)
       return { ok: true, attempts: attempt + 1 }
     } catch (err) {
+      throwIfWorkflowCancelled(context)
+      if (isWorkflowAbortError(err)) throw err
       const errMsg = err instanceof Error ? err.message : String(err)
       if (attempt < maxRetries) {
         callbacks.log(t('log.retryFailed').replace('{label}', label).replace('{n}', String(attempt + 1)).replace('{err}', errMsg))
@@ -740,7 +814,7 @@ export interface PostProcessStep {
   /** 依赖的前置步骤 key 列表（空数组 = 无依赖，可与同级步骤并行） */
   dependsOn?: string[]
   /** 步骤执行器 */
-  executor: (callbacks: StepCallbacks) => Promise<void>
+  executor: (callbacks: StepCallbacks, context?: WorkflowContext) => Promise<void>
 }
 
 /** 单步后处理执行结果（持久化到状态文件） */
@@ -844,6 +918,7 @@ export interface PipelineOptions {
   retryCount?: number
   /** true = 只重跑失败步骤（修复模式） */
   onlyFailed?: boolean
+  context?: WorkflowContext
 }
 
 /**
@@ -867,6 +942,8 @@ export async function runPostProcessPipeline(
 ): Promise<PostProcessStatus> {
   const retryCount = options?.retryCount ?? 2
   const onlyFailed = options?.onlyFailed ?? false
+  const context = options?.context
+  throwIfWorkflowCancelled(context)
 
   const { sourceType, sourceId } = parseScope(scope)
 
@@ -876,6 +953,7 @@ export async function runPostProcessPipeline(
   if (!onlyFailed || !run) {
     // 新建跑批
     callbacks.log(t('log.postProcessInit'))
+    throwIfWorkflowCancelled(context)
     const createRes = await ipc.invoke('db:post-process-create-run', {
       triggerSourceType: sourceType,
       triggerSourceId: sourceId,
@@ -940,9 +1018,11 @@ export async function runPostProcessPipeline(
 
   // 按层级依次执行（同层并行，跨层串行）
   for (const level of levels) {
+    throwIfWorkflowCancelled(context)
     if (hasCriticalFailure) break
 
     const levelPromises = level.map(async (step) => {
+      throwIfWorkflowCancelled(context)
       const existingStep = stepMap.get(step.key)
 
       if (onlyFailed && existingStep?.ok) {
@@ -952,7 +1032,8 @@ export async function runPostProcessPipeline(
 
       const stepDeps = (step.dependsOn ?? []).join(', ')
       callbacks.log(t('log.stepRunning').replace('{label}', step.label) + (stepDeps ? t('log.stepDepsSuffix').replace('{deps}', stepDeps) : ''))
-      const result = await withRetry(() => step.executor(callbacks), retryCount, step.label, callbacks)
+      const result = await withRetry(() => step.executor(callbacks, context), retryCount, step.label, callbacks, context)
+      throwIfWorkflowCancelled(context)
 
       if (result.ok) {
         await ipc.invoke('db:post-process-mark-step-ok', runId, step.key)
@@ -974,7 +1055,9 @@ export async function runPostProcessPipeline(
   }
 
   // 返回最终状态汇总供 UI 展示
+  throwIfWorkflowCancelled(context)
   const status = await readPostProcessStatus(projectPath, scope)
+  throwIfWorkflowCancelled(context)
   if (!status) {
     throw new Error(t('error.summaryFetch'))
   }

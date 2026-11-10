@@ -39,7 +39,8 @@ export interface DraftCandidate {
 export class GenerateMultiDraftsCommand extends BaseWorkflowCommand<DraftCandidate[]> {
   constructor(private params: MultiDraftParams) { super() }
 
-  async execute({ callbacks }: CommandExecuteParams): Promise<DraftCandidate[]> {
+  async execute({ context, callbacks }: CommandExecuteParams): Promise<DraftCandidate[]> {
+    this.throwIfCancelled(context)
     const count = Math.min(this.params.count || 2, 3)
     const template = getPromptTemplate('first_chapter_draft')
     if (!template) throw new Error(t('error.templateMissing'))
@@ -73,7 +74,9 @@ export class GenerateMultiDraftsCommand extends BaseWorkflowCommand<DraftCandida
           builder.getSystemRole(),
           callbacks,
           { cacheScope: 'chapter_draft', staticContext: this.params.blueprintContext, purpose: 'draft_chapter', temperature: style.temp },
+          context,
         )
+        this.throwIfCancelled(context)
 
         candidates.push({
           index: i,
@@ -87,6 +90,7 @@ export class GenerateMultiDraftsCommand extends BaseWorkflowCommand<DraftCandida
           .replace('{name}', style.name)
           .replace('{chars}', String(content.length)))
       } catch (e) {
+        this.throwIfCancelled(context)
         callbacks.log(t('log.multiDrafts.failed')
           .replace('{name}', style.name)
           .replace('{error}', () => String(e)))
@@ -94,11 +98,12 @@ export class GenerateMultiDraftsCommand extends BaseWorkflowCommand<DraftCandida
     })
 
     await Promise.all(promises)
+    this.throwIfCancelled(context)
 
     // AI 评分择优
     if (candidates.length >= 2) {
       callbacks.log(t('log.multiDrafts.scoring'))
-      await this.scoreCandidates(candidates, callbacks)
+      await this.scoreCandidates(candidates, callbacks, context)
     }
 
     return candidates.sort((a, b) => (b.score || 0) - (a.score || 0))
@@ -107,12 +112,20 @@ export class GenerateMultiDraftsCommand extends BaseWorkflowCommand<DraftCandida
   private async scoreCandidates(
     candidates: DraftCandidate[],
     callbacks: CommandExecuteParams['callbacks'],
+    context: CommandExecuteParams['context'],
   ): Promise<void> {
     const llmStore = useLLMStore.getState()
     const modelId = llmStore.getModelForPurpose('review_chapter')
     if (!modelId) return
 
     for (const c of candidates) {
+      this.throwIfCancelled(context)
+      const controller = new AbortController()
+      const onAbort = () => controller.abort()
+      context.signal?.addEventListener('abort', onAbort, { once: true })
+      const cancelTimer = setInterval(() => {
+        if (context.cancelled || context.signal?.aborted) controller.abort()
+      }, 200)
       try {
         const response = await llmStore.generate(
           [
@@ -123,8 +136,9 @@ export class GenerateMultiDraftsCommand extends BaseWorkflowCommand<DraftCandida
             { role: 'user', content: c.content.slice(0, 3000) },
           ],
           modelId,
-          { responseFormat: { type: 'json_object' }, priority: 4 },
+          { responseFormat: { type: 'json_object' }, priority: 4, signal: controller.signal },
         )
+        this.throwIfCancelled(context)
 
         if (response.success) {
           try {
@@ -157,8 +171,12 @@ export class GenerateMultiDraftsCommand extends BaseWorkflowCommand<DraftCandida
         }
         callbacks.log(`  ${c.style}: ${c.score}/10`)
       } catch {
+        this.throwIfCancelled(context)
         c.score = -1
         callbacks.log(`  ${c.style}: 评分异常，已剔除`)
+      } finally {
+        clearInterval(cancelTimer)
+        context.signal?.removeEventListener('abort', onAbort)
       }
     }
   }

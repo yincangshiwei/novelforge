@@ -7,7 +7,7 @@ import { ipc } from '../ipc-client'
 import { stripNameAlias } from '../character-normalize'
 import type { NovelConfig } from '../../shared/ipc-channels'
 
-import { runPostProcessPipeline, stripThinkingTags, extractAndRepairJSON, robustParseJSON, stringifyField as stringifyFieldUtils } from './workflow-utils'
+import { runPostProcessPipeline, settleWorkflowStream, throwIfWorkflowCancelled, stripThinkingTags, extractAndRepairJSON, robustParseJSON, stringifyField as stringifyFieldUtils } from './workflow-utils'
 import { registerWorkflow } from './workflow-registry'
 import { getFieldLabel, type GeneratableField } from './commands/generate-field.command'
 
@@ -354,7 +354,8 @@ export function createCharacterExtractSteps(_projectPath: string, characterDynam
       key: 'extract_character_cards',
       label: t('workflow.extractInitialCards'),
       critical: true,
-      executor: async (cb: { appendText: (t: string) => void; log: (m: string) => void }) => {
+      executor: async (cb: { appendText: (t: string) => void; log: (m: string) => void }, context?: WorkflowContext) => {
+        throwIfWorkflowCancelled(context)
         const { ArchitecturePromptBuilder } = await import('../prompts/prompt-builder')
         const template = getPromptTemplate('extract_initial_characters')
         if (!template) throw new Error(t('error.templateNotFound').replace('{name}', 'extract_initial_characters'))
@@ -365,21 +366,16 @@ export function createCharacterExtractSteps(_projectPath: string, characterDynam
         cb.appendText(t('log.extractCardsStart'))
 
         let fullContent = ''
-        await new Promise<void>((resolve, reject) => {
-          llmStore.generateStream(
-            [
-              { role: 'system', content: systemRole },
-              { role: 'user', content: extractPrompt }
-            ],
-            {
-              onChunk: (chunk) => { fullContent += chunk; cb.appendText(chunk) },
-              onDone: () => resolve(),
-              onError: (err) => reject(new Error(err))
-            },
-            undefined,
-            { responseFormat: { type: 'json_object' } }
-          )
-        })
+        await settleWorkflowStream<void>(streamCallbacks => llmStore.generateStream(
+          [
+            { role: 'system', content: systemRole },
+            { role: 'user', content: extractPrompt }
+          ],
+          { ...streamCallbacks, onDone: () => streamCallbacks.onDone(undefined) },
+          undefined,
+          { responseFormat: { type: 'json_object' } },
+        ), chunk => { fullContent += chunk; cb.appendText(chunk) }, id => llmStore.cancelGeneration(id), context)
+        throwIfWorkflowCancelled(context)
 
         const cleanedCards = stripThinkingTags(fullContent)
         const rawText = cleanedCards.replace(/```json?\n?/g, '').replace(/```/g, '').trim()
@@ -400,8 +396,14 @@ export function createCharacterExtractSteps(_projectPath: string, characterDynam
 
         // 批量写入（#34 块 A：仅填空合并——已存在角色 LLM 非空字段覆盖、空白保留 DB 现值，
         // 防重跑提取全列覆盖清空手写档案/tags/动态状态）
-        const { mergeCharacterCards } = await import('../character-card-merge')
-        const stats = await mergeCharacterCards(characterDataList)
+        const { mergeCardRows } = await import('../character-card-merge')
+        const existing = await ipc.invoke('db:character-get-all') as unknown as Array<Record<string, unknown>>
+        const { rows, stats } = mergeCardRows(existing, characterDataList)
+        throwIfWorkflowCancelled(context)
+        if (rows.length > 0) {
+          const result = await ipc.invoke('db:character-save-all', rows as unknown as import('../../../electron/repositories/character-repository').CharacterData[])
+          if (!result.success) throw new Error(result.error || 'save failed')
+        }
         cb.log(t('log.extractCardsDone').replace('{n}', String(stats.saved)))
       },
     },
@@ -463,9 +465,10 @@ export function createArchCharacterExtractWorkflow(params: ArchCharacterExtractW
       {
         name: t('workflow.extractCards'),
         description: t('workflow.extractCardsDesc'),
-        executor: async (_step, _ctx, callbacks) => {
+        executor: async (_step, context, callbacks) => {
+          throwIfWorkflowCancelled(context)
           const { globalEventBus } = await import('../../shared/event-bus')
-          const archStatus = await runPostProcessPipeline(projectPath, ARCH_CHARACTER_SCOPE, t('workflow.archCharacterSource'), steps, callbacks)
+          const archStatus = await runPostProcessPipeline(projectPath, ARCH_CHARACTER_SCOPE, t('workflow.archCharacterSource'), steps, callbacks, { context })
           if (archStatus.allCriticalPassed) {
             // 角色卡提取成功 → 通过 EventBus 通知 ProjectService 刷新
             globalEventBus.emit('ARCH_POSTPROCESS_UPDATED', {})
@@ -510,7 +513,8 @@ export function createRepairArchCharacterCardsWorkflow(params: RepairArchCharact
       {
         name: t('workflow.retryCards'),
         description: t('workflow.retryCardsDesc'),
-        executor: async (_step, _ctx, callbacks) => {
+        executor: async (_step, context, callbacks) => {
+          throwIfWorkflowCancelled(context)
           // charactersArch/genre 运行时 DB/项目解析（§5.2：让工厂重建时同样查库）。
           // 【已知限制·review Important 接受】原 repairArchCharacterCards 在 startWorkflow 前校验
           // （无 core.charactersArch / 无 project 则 throw、工作流不启动）；因 WorkflowRehydrateFactory
@@ -522,7 +526,7 @@ export function createRepairArchCharacterCardsWorkflow(params: RepairArchCharact
           if (!project) throw new Error(t('error.noProject'))
           const steps = createCharacterExtractSteps(projectPath, core.charactersArch, project.novelConfig.genre)
           const { globalEventBus } = await import('../../shared/event-bus')
-          const archStatus = await runPostProcessPipeline(projectPath, ARCH_CHARACTER_SCOPE, t('workflow.archCharacterSource'), steps, callbacks, { onlyFailed: true })
+          const archStatus = await runPostProcessPipeline(projectPath, ARCH_CHARACTER_SCOPE, t('workflow.archCharacterSource'), steps, callbacks, { onlyFailed: true, context })
           if (archStatus.allCriticalPassed) {
             globalEventBus.emit('ARCH_POSTPROCESS_UPDATED', {})
           } else {

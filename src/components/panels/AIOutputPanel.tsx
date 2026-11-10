@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { getCurrentLocale } from '../../shared/locale'
-import { CheckCircle2, Circle, Sparkles, X, ChevronRight, StopCircle, Play, HardDrive } from 'lucide-react'
+import { CheckCircle2, Circle, Sparkles, X, ChevronRight, StopCircle, Play, HardDrive, Pause, RotateCcw, Maximize2, Minimize2, Trash2 } from 'lucide-react'
+import { createPortal } from 'react-dom'
 import { Spinner } from '../ui/Spinner'
 import { useWorkflowStore, type WorkflowRun, type WorkflowStep } from '../../stores/workflow-store'
 import { useLayoutStore } from '../../stores/layout-store'
@@ -15,6 +16,26 @@ import { cleanupMessageText } from '../../services/agent/conversation-recovery'
  */
 export default function AIOutputPanel() {
   const { t } = useTranslation()
+  const [expanded, setExpanded] = useState(false)
+  const [showList, setShowList] = useState(false)
+  const fullscreenButton = useRef<HTMLButtonElement>(null)
+  const inlineHost = useRef<HTMLDivElement>(null)
+  const [portalHost] = useState(() => document.createElement('div'))
+  useLayoutEffect(() => {
+    portalHost.style.height = '100%'
+    const parent = expanded ? document.body : inlineHost.current
+    parent?.appendChild(portalHost)
+    return () => { portalHost.remove() }
+  }, [expanded, portalHost])
+  useEffect(() => {
+    if (!expanded) return
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); setExpanded(false) }
+    }
+    document.addEventListener('keydown', keydown)
+    fullscreenButton.current?.focus()
+    return () => document.removeEventListener('keydown', keydown)
+  }, [expanded])
   // ✅ 使用 selector 精确订阅，避免 globalLogs 高频更新导致整个面板重渲染
   const activeRuns = useWorkflowStore(s => s.activeRuns)
   const history = useWorkflowStore(s => s.history)
@@ -53,9 +74,11 @@ export default function AIOutputPanel() {
 
   const recentHistory = history.slice(0, 10)
 
-  return (
+  const panel = (
     <div
-      className="flex flex-col h-full overflow-hidden"
+      role={expanded ? 'dialog' : undefined}
+      aria-label={t('agent.aiOutput')}
+      className={expanded ? 'fixed inset-0 z-[1000] flex flex-col overflow-hidden' : 'flex flex-col h-full overflow-hidden'}
       style={{
         backgroundColor: 'var(--color-sidebar)',
         borderLeft: '1px solid var(--color-border)',
@@ -65,7 +88,9 @@ export default function AIOutputPanel() {
       <div
         className="no-select flex items-center justify-between gap-1.5 px-2 flex-shrink-0"
         style={{
-          height: 'var(--height-panel-header)',
+          height: expanded ? 64 : 'var(--height-panel-header)',
+          minHeight: expanded ? 64 : 36,
+          paddingTop: expanded ? 24 : undefined,
           borderBottom: '1px solid var(--color-border)',
         }}
       >
@@ -75,19 +100,26 @@ export default function AIOutputPanel() {
         >
           {t('agent.aiOutput')}
         </span>
-        <button
-          onClick={() => useLayoutStore.getState().setAIPanelOpen(false)}
-          title={t('action.close')}
-          className="icon-btn"
-          style={{ width: 20, height: 20 }}
-        >
-          <X size={13} strokeWidth={1.5} />
-        </button>
+        <div className="flex items-center gap-1">
+          {viewRun && !showList && <button className="icon-btn" style={{ width: 'auto', padding: '0 8px' }} title={t('workflow.backToTasks')} aria-label={t('workflow.backToTasks')} onClick={() => setShowList(true)}><ChevronRight className="rotate-180" size={15} /><span className="ml-1 text-xs">{t('workflow.taskList')}</span></button>}
+          <button ref={fullscreenButton} onClick={() => setExpanded(value => !value)} title={t(expanded ? 'workflow.exitFullscreen' : 'workflow.fullscreen')} aria-label={t(expanded ? 'workflow.exitFullscreen' : 'workflow.fullscreen')} className="icon-btn" style={{ width: expanded ? 'auto' : 28, height: 32, padding: expanded ? '0 10px' : undefined, WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            {expanded ? <><Minimize2 size={15} /><span className="ml-2 text-xs">{t('workflow.exitFullscreen')}</span></> : <Maximize2 size={15} />}
+          </button>
+          <button
+            onClick={() => expanded ? setExpanded(false) : useLayoutStore.getState().setAIPanelOpen(false)}
+            title={t('action.close')}
+            aria-label={t('action.close')}
+            className="icon-btn"
+            style={{ width: 28, height: 28 }}
+          >
+            <X size={13} strokeWidth={1.5} />
+          </button>
+        </div>
       </div>
 
       {/* 内容区 */}
       <div className="flex-1 overflow-hidden">
-        {viewRun ? (
+        {viewRun && !showList ? (
           <ActiveRunView
             run={viewRun}
             activeRuns={activeRuns}
@@ -95,11 +127,11 @@ export default function AIOutputPanel() {
           />
         ) : (
           <div className="h-full overflow-y-auto">
-            {recentHistory.length === 0 ? (
+            {recentHistory.length === 0 && activeRuns.length === 0 ? (
               <EmptyState />
             ) : (
               <div className="px-3 py-3">
-                <HistoryList items={recentHistory} onSelect={setViewRunId} />
+                <HistoryList items={[...activeRuns, ...recentHistory]} onSelect={id => { setViewRunId(id); setShowList(false) }} />
               </div>
             )}
           </div>
@@ -107,6 +139,7 @@ export default function AIOutputPanel() {
       </div>
     </div>
   )
+  return <div ref={inlineHost} className="h-full">{createPortal(panel, portalHost)}</div>
 }
 
 
@@ -137,6 +170,15 @@ function ActiveRunView({
   const scrollRef = useRef<HTMLDivElement>(null)
   const [autoScroll, setAutoScroll] = useState(true)
   const isActive = run.status === 'running' || run.status === 'waiting'
+  const canResume = run.status === 'paused' && activeRuns.some(r => r.id === run.id)
+  const isDirectory = run.type === 'directory'
+  const canContinueSaved = isDirectory && !isActive && run.status !== 'completed'
+  const [controlBusy, setControlBusy] = useState(false)
+  const control = async (action: () => Promise<void>) => {
+    if (controlBusy) return
+    setControlBusy(true)
+    try { await action() } catch (error) { window.alert(String(error)) } finally { setControlBusy(false) }
+  }
   // M2：崩溃恢复回来的 paused/failed run（仅 activeRuns 内）——其空 result 步骤可从磁盘
   // workflow-output 文件续读（组件挂载/展开才 1s 轮询 tail，不可见即停）
   const isRecoveredRun = activeRuns.some(r => r.id === run.id) && (run.status === 'paused' || run.status === 'failed')
@@ -194,7 +236,7 @@ function ActiveRunView({
   return (
     <div className="flex flex-col h-full overflow-hidden relative">
       {/* 多任务切换（多于1个任务时显示） */}
-      {activeRuns.length > 1 && (
+      {(activeRuns.length > 1 || (activeRuns.length === 1 && activeRuns[0].id !== run.id)) && (
         <div
           className="flex items-center gap-1 px-2 py-1.5 flex-shrink-0 overflow-x-auto"
           style={{ borderBottom: '1px solid var(--color-border)' }}
@@ -265,44 +307,26 @@ function ActiveRunView({
       </div>
 
       {/* 固定在底部的操作悬浮区 — 等待确认时提供「继续执行」（与底部任务面板一致） */}
-      {isActive && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2">
-          {waitingForConfirm && (
-            <button
-              onClick={() => confirmContinue(run.id)}
-              className="flex items-center justify-center gap-1.5 text-xs px-3 py-1.5 rounded-full transition-all shadow-[var(--shadow-md)] backdrop-blur-md"
-              style={{
-                color: 'var(--color-text)',
-                backgroundColor: 'var(--color-accent)',
-                border: '1px solid var(--color-accent)'
-              }}
-            >
-              <Play size={13} />
-              <span className="font-medium">{t('nextStep.continue')}</span>
-            </button>
+      {(isActive || canResume || isDirectory) && (
+        <div role="toolbar" aria-label={t('agent.aiOutput')} className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-sidebar)] p-1 shadow-[var(--shadow-md)]">
+          {isDirectory && isActive && (
+            <button className="icon-btn" style={{ width: 32, height: 32 }} onClick={() => useWorkflowStore.getState().pauseWorkflow(run.id)} title={t('workflow.pauseBlueprintHint')} aria-label={t('workflow.pauseBlueprint')}><Pause size={16} /></button>
           )}
-          <button
-            onClick={() => cancelWorkflow(run.id)}
-            className="flex items-center justify-center gap-1.5 text-xs px-3 py-1.5 rounded-full transition-all shadow-[var(--shadow-md)] backdrop-blur-md"
-            style={{
-              color: 'var(--color-text)',
-              backgroundColor: 'var(--color-hover)',
-              border: '1px solid var(--color-border)'
-            }}
-            onMouseEnter={e => {
-              e.currentTarget.style.color = 'var(--color-text)'
-              e.currentTarget.style.backgroundColor = 'var(--color-error)'
-              e.currentTarget.style.borderColor = 'var(--color-error)'
-            }}
-            onMouseLeave={e => {
-              e.currentTarget.style.color = 'var(--color-text)'
-              e.currentTarget.style.backgroundColor = 'var(--color-hover)'
-              e.currentTarget.style.borderColor = 'var(--color-border)'
-            }}
-          >
-            <StopCircle size={13} />
-            <span className="font-medium">{t('agent.abortGen')}</span>
-          </button>
+          {(waitingForConfirm || canResume || canContinueSaved) && (
+            <button className="icon-btn" style={{ width: 32, height: 32, color: 'var(--color-accent)' }} disabled={controlBusy || !!run.pauseRequested} title={t('workflow.continueBlueprint')} aria-label={t('workflow.continueBlueprint')} onClick={() => {
+              if (canContinueSaved) void control(() => useWorkflowStore.getState().continueDirectory(run.id))
+              else confirmContinue(run.id)
+            }}><Play size={16} /></button>
+          )}
+          {isDirectory && (
+            <button className="icon-btn" style={{ width: 32, height: 32 }} disabled={controlBusy || !!run.pauseRequested} title={t('workflow.restartBlueprint')} aria-label={t('workflow.restartBlueprint')} onClick={() => {
+              if (window.confirm(t('workflow.restartBlueprintConfirm'))) void control(() => useWorkflowStore.getState().restartWorkflow(run.id))
+            }}><RotateCcw size={16} /></button>
+          )}
+          {(isActive || canResume) && (
+            <button className="icon-btn" style={{ width: 32, height: 32 }} disabled={controlBusy} title={t('agent.abortGen')} aria-label={t('agent.abortGen')} onClick={() => cancelWorkflow(run.id)}><StopCircle size={16} /></button>
+          )}
+          {(controlBusy || run.pauseRequested) && <span role="status" title={t('workflow.stoppingBlueprint')}><Spinner size={14} /></span>}
         </div>
       )}
     </div>
@@ -563,6 +587,13 @@ function ThinkingBlock({ thinking, showCursor, hasContent }: { thinking: string;
 
 function HistoryList({ items, onSelect }: { items: WorkflowRun[]; onSelect: (id: string) => void }) {
   const { t } = useTranslation()
+  const activeRuns = useWorkflowStore(s => s.activeRuns)
+  const [deleting, setDeleting] = useState<string | null>(null)
+  const remove = async (id: string) => {
+    if (deleting || !window.confirm(t('workflow.deleteHistoryConfirm'))) return
+    setDeleting(id)
+    try { await useWorkflowStore.getState().deleteHistory(id) } catch (error) { window.alert(String(error)) } finally { setDeleting(null) }
+  }
   return (
     <div>
       <p
@@ -573,8 +604,8 @@ function HistoryList({ items, onSelect }: { items: WorkflowRun[]; onSelect: (id:
       </p>
       <div className="flex flex-col gap-0.5">
         {items.map(run => (
+          <div key={run.id} className="flex items-center gap-1">
           <button
-            key={run.id}
             onClick={() => onSelect(run.id)}
             className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left transition-colors"
             onMouseEnter={e => { e.currentTarget.style.backgroundColor = 'var(--color-hover)' }}
@@ -591,6 +622,10 @@ function HistoryList({ items, onSelect }: { items: WorkflowRun[]; onSelect: (id:
               {new Date(run.createdAt).toLocaleTimeString(getCurrentLocale(), { hour: '2-digit', minute: '2-digit' })}
             </span>
           </button>
+          <button className="icon-btn shrink-0" disabled={deleting !== null || activeRuns.some(r => r.id === run.id)} title={t(activeRuns.some(r => r.id === run.id) ? 'workflow.deleteHistoryBusy' : 'workflow.deleteHistory')} aria-label={t('workflow.deleteHistory')} onClick={() => void remove(run.id)}>
+            {deleting === run.id ? <Spinner size={13} /> : <Trash2 size={13} />}
+          </button>
+          </div>
         ))}
       </div>
     </div>

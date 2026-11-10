@@ -230,6 +230,36 @@ describe('llm:generate 可取消生命周期', () => {
     expect(await call('llm:generate-stream', 'late-stream-cancel', { modelId: MODEL_ID, messages: MESSAGES })).toMatchObject({ started: true })
   })
 
+  it('流式运行中取消立即释放槽位，不依赖provider回调', async () => {
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    h.provider.generateStream.mockImplementationOnce(() => new Promise<void>(() => {}))
+    await call('llm:generate-stream', 'silent-stream-cancel', { modelId: MODEL_ID, messages: MESSAGES })
+    await vi.waitFor(() => expect(h.provider.generateStream).toHaveBeenCalledTimes(1))
+    await call('llm:cancel', 'silent-stream-cancel')
+    await vi.waitFor(() => expect(llmConcurrencyController.getStatus().activeCount).toBe(0))
+    expect(fakeEvent.sender.send).toHaveBeenCalledWith('llm:stream-error', expect.objectContaining({ requestId: 'silent-stream-cancel' }))
+  })
+
+  it('流式排队取消立即出队且发送终态，不调用provider', async () => {
+    writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
+    const previous = llmConcurrencyController.getStatus().maxConcurrent
+    llmConcurrencyController.updateConfig({ maxConcurrent: 1 })
+    let release!: () => void
+    const blocker = llmConcurrencyController.execute(() => new Promise<void>(resolve => { release = resolve }), { timeoutMs: 0 })
+    try {
+      await call('llm:generate-stream', 'queued-stream-cancel', { modelId: MODEL_ID, messages: MESSAGES })
+      expect(llmConcurrencyController.getStatus().queueLength).toBe(1)
+      await call('llm:cancel', 'queued-stream-cancel')
+      await vi.waitFor(() => expect(llmConcurrencyController.getStatus().queueLength).toBe(0))
+      expect(h.provider.generateStream).not.toHaveBeenCalled()
+      expect(fakeEvent.sender.send).toHaveBeenCalledWith('llm:stream-error', expect.objectContaining({ requestId: 'queued-stream-cancel' }))
+    } finally {
+      release()
+      await blocker
+      llmConcurrencyController.updateConfig({ maxConcurrent: previous })
+    }
+  })
+
   it('先到取消也阻止流式晚登记', async () => {
     writeJsonFile(MODELS_CONFIG_PATH, [modelFixture()])
     await call('llm:cancel', 'early-stream-cancel')

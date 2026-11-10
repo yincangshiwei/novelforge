@@ -12,7 +12,8 @@ import { ipc } from '../../ipc-client'
  * 结果写入 NovelConfig.writingStyle 以锚定后续生成/修稿。
  */
 export class AnalyzeWritingStyleCommand extends BaseWorkflowCommand<string> {
-  async execute({ callbacks }: CommandExecuteParams): Promise<string> {
+  async execute({ callbacks, context }: CommandExecuteParams): Promise<string> {
+    this.throwIfCancelled(context)
     const project = useProjectStore.getState().currentProject
     if (!project) throw new Error(t('error.noProject'))
 
@@ -39,6 +40,7 @@ export class AnalyzeWritingStyleCommand extends BaseWorkflowCommand<string> {
       }
       callbacks.log(t('log.analyzeStyle.sampled').replace('{count}', String(sampleTexts.length)))
     } catch {
+      this.throwIfCancelled(context)
       callbacks.log(t('log.analyzeStyle.fetchFailed'))
       return ''
     }
@@ -63,7 +65,9 @@ export class AnalyzeWritingStyleCommand extends BaseWorkflowCommand<string> {
       template.systemRole || t('role.literaryCritic'),
       callbacks,
       { purpose: 'style_analysis' },
+      context,
     )
+    this.throwIfCancelled(context)
 
     const cleanResult = this.stripThinkingTags(result).trim()
     if (!cleanResult) {

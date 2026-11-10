@@ -9,6 +9,9 @@
  *       聚合章节级而非卷级）。
  */
 import { ipc } from '../ipc-client'
+import type { WorkflowContext } from '../../stores/workflow-store'
+import { throwIfWorkflowCancelled, isWorkflowAbortError } from '../workflows/workflow-utils'
+type CancellationContext = Pick<WorkflowContext, 'cancelled' | 'signal'>
 import { buildChapterEntryBlock, parseMemoryFile, type ChapterSummaryEntry, type MemoryFileMeta } from './memory-codec'
 
 /** 每满 3 个非 stale 卷检查点触发一次全书重建（低频） */
@@ -68,7 +71,8 @@ function parseChapterBlocks(body: string): ChapterSummaryEntry[] {
  * 无分卷 → 聚合最新章节文件（mtime 最新，章节级）。
  * 失败返回 success:false + reason（触发方静默容错 / 手动按钮 toast 指引）。
  */
-export async function rebuildBookState(): Promise<{ success: boolean; file: string | null; reason?: string }> {
+export async function rebuildBookState(context?: CancellationContext): Promise<{ success: boolean; file: string | null; reason?: string }> {
+  throwIfWorkflowCancelled(context)
   try {
     const list = (await ipc.invoke('memory:list')) as MemoryFileMeta[] | null
     if (!list) return { success: false, file: null, reason: 'memory:list failed' }
@@ -85,7 +89,9 @@ export async function rebuildBookState(): Promise<{ success: boolean; file: stri
     if (volumeFiles.length > 0) {
       // 卷级聚合：扫描全部非 stale 卷文件，收集卷 frontmatter + 卷内章节条目
       for (const f of volumeFiles) {
+        throwIfWorkflowCancelled(context)
         const raw = await ipc.invoke('memory:read', f.file) as string | null
+        throwIfWorkflowCancelled(context)
         if (!raw) continue
         const parsed = parseMemoryFile(raw)
         const volumeNumber = Number(parsed?.frontmatter.volume ?? NaN)
@@ -107,10 +113,14 @@ export async function rebuildBookState(): Promise<{ success: boolean; file: stri
       entries = [{ volumeNumber: 0, chapters }]
     }
     if (entries.length === 0) return { success: false, file: null, reason: 'no readable volume memory' }
+    throwIfWorkflowCancelled(context)
     const res = await ipc.invoke('memory:write', 'book-state.md', buildBookSummaryFile(volumes, entries))
+    throwIfWorkflowCancelled(context)
     if (!res || !res.success) return { success: false, file: null, reason: 'memory:write failed' }
     return { success: true, file: 'book-state.md' }
   } catch (e) {
+    throwIfWorkflowCancelled(context)
+    if (isWorkflowAbortError(e)) throw e
     return { success: false, file: null, reason: String(e) }
   }
 }
@@ -119,15 +129,19 @@ export async function rebuildBookState(): Promise<{ success: boolean; file: stri
  * 检查点触发：非 stale 卷文件计数，每满 CHECKPOINT_EVERY 卷触发一次全书重建。
  * 返回是否触发成功；未到检查点 / 失败均返回 false（低频重建不阻断定稿主流程）。
  */
-export async function maybeTriggerBookState(): Promise<boolean> {
+export async function maybeTriggerBookState(context?: CancellationContext): Promise<boolean> {
+  throwIfWorkflowCancelled(context)
   try {
     const list = (await ipc.invoke('memory:list')) as MemoryFileMeta[] | null
     if (!list) return false
     const count = list.filter(f => f.kind === 'volume' && !f.stale).length
     if (count < CHECKPOINT_EVERY || count % CHECKPOINT_EVERY !== 0) return false
-    const res = await rebuildBookState()
+    throwIfWorkflowCancelled(context)
+    const res = await rebuildBookState(context)
     return res.success
-  } catch {
+  } catch (error) {
+    throwIfWorkflowCancelled(context)
+    if (isWorkflowAbortError(error)) throw error
     return false
   }
 }

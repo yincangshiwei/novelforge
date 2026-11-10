@@ -18,6 +18,7 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
   }
 
   async execute({ context, callbacks }: CommandExecuteParams): Promise<string> {
+    this.throwIfCancelled(context)
     const project = useProjectStore.getState().currentProject
     if (!project) throw new Error(t('error.noProject'))
 
@@ -245,13 +246,15 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
 
     // staticContext：架构入 system 前缀（同项目连续调用缓存命中 + 模型遵从度更高）
     // 注意：必须传注入后的 prompt 字符串而非 builder —— callLLMWithBuilder 会重新 build() 丢失防缺陷注入
-    const draftText = await this.callLLM(prompt, promptBuilder.getSystemRole(), callbacks, { staticContext: architecture, purpose: 'draft_chapter' })
+    const draftText = await this.callLLM(prompt, promptBuilder.getSystemRole(), callbacks, { staticContext: architecture, purpose: 'draft_chapter' }, context)
+    this.throwIfCancelled(context)
     const cleanDraftText = this.stripThinkingTags(draftText)
     if (!cleanDraftText.trim()) throw new Error(t('workflow.draftEmpty'))
 
     // 落于数据库（wordCount 用统一"有效字数"口径：汉字 + 英文单词，非 length）
     const novelWordCount = computeTextStats(cleanDraftText).novelWordCount
     const nextVersion: number = await ipc.invoke('db:draft-next-version', this.chapterInfo.chapterNumber)
+    this.throwIfCancelled(context)
     const createResult = await ipc.invoke('db:draft-create', {
       chapterNumber: this.chapterInfo.chapterNumber,
       version: nextVersion,
@@ -263,6 +266,7 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
     if (!createResult.success || !createResult.id) {
       throw new Error(t('workflow.draftSaveFailed').replace('{error}', () => createResult.error || t('status.unknown')))
     }
+    this.throwIfCancelled(context)
     const pseudoPath = `vela://draft/${createResult.id}`
 
     context.data.draft = cleanDraftText
@@ -276,11 +280,13 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
     useProjectStore.getState().refreshFileTree()
     try {
       const { useDraftStore } = await import('../../../stores/draft-store')
+      this.throwIfCancelled(context)
       await useDraftStore.getState().loadAllDrafts()
     } catch { /* 忽略 */ }
 
     try {
       const { useEditorStore } = await import('../../../stores/editor-store')
+      this.throwIfCancelled(context)
       useEditorStore.getState().openFile({
         id: pseudoPath,
         name: t('draft.versionName')
@@ -293,6 +299,7 @@ export class GenerateDraftCommand extends BaseWorkflowCommand {
       })
     } catch { /* 忽略 */ }
 
+    this.throwIfCancelled(context)
     callbacks.log(t('log.generateDraft.saved')
       .replace('{version}', String(nextVersion))
       .replace('{words}', String(novelWordCount)))

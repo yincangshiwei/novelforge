@@ -68,6 +68,27 @@ beforeEach(() => {
   })
 })
 
+describe('作品记忆取消边界', () => {
+  it('章节摘要透传signal，取消后迟到成功不记录或落盘', async () => {
+    const controller = new AbortController()
+    const generate = vi.fn<ReturnType<typeof useLLMStore.getState>['generate']>(async () => { controller.abort(); return { success: true, content: '关键事件：迟到' } })
+    useLLMStore.setState({ generate })
+    await expect(generateChapterSummary({ chapterNumber: 1, chapterTitle: 'a', draftContent: 'text', modelId: 'model' }, { cancelled: false, signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(generate.mock.calls[0]?.[2]?.signal).toBe(controller.signal)
+    expect(mockInvoke.mock.calls.some(c => c[0] === 'db:log-llm-call')).toBe(false)
+  })
+  it('读取记忆期间取消，不提交新的章节写入', async () => {
+    const context = { cancelled: false }
+    mockInvoke.mockImplementationOnce(async () => { context.cancelled = true; return null })
+    await expect(upsertChapterMemory({ chapterNumber: 1, title: 'a', keyEvents: '', characters: '', foreshadowing: '', newElements: '', currentState: '' }, 'chapters-001-015.md', context)).rejects.toMatchObject({ name: 'AbortError' })
+    expect(memoryFiles.size).toBe(0)
+  })
+  it('预取消不启动卷聚合扫描', async () => {
+    await expect(ensureVolumeSummary({ volumeNumber: 1, title: 'v', chapterStart: 1, chapterEnd: 1 }, { cancelled: true })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(mockInvoke).not.toHaveBeenCalled()
+  })
+})
+
 describe('computeMemoryFileRange（分卷边界对齐）', () => {
   const volumes = [
     { volumeNumber: 1, chapterStart: 1, chapterEnd: 15 },

@@ -50,6 +50,20 @@ beforeEach(() => {
 })
 
 describe('generate-field 覆盖确认（线③）', () => {
+  it('生成返回前取消则不快照、不更新配置', async () => {
+    const controller = new AbortController()
+    class CancelledResultCommand extends GenerateFieldCommand {
+      protected async callLLM(): Promise<string> {
+        controller.abort()
+        return 'late result'
+      }
+    }
+    const command = new CancelledResultCommand('worldSetting')
+    await expect(command.execute({ ...params, context: { data: {}, cancelled: false, signal: controller.signal } })).rejects.toThrow()
+    expect(mockUpdate).not.toHaveBeenCalled()
+    expect(mockSnapshot).not.toHaveBeenCalled()
+  })
+
   it('字段已有内容 + 取消覆盖 → 返回空串、不写 store、不生成', async () => {
     mockConfirm.mockResolvedValue(false)
     const cmd = new GenerateFieldCommand('coreOutline')

@@ -155,6 +155,139 @@ describe('工作流历史结果持久化', () => {
     expect(useWorkflowStore.getState().activeRuns[0].status).toBe('paused')
     expect(h.seen).toEqual([])
   })
+  it('蓝图暂停会中断请求并保留已提交进度，关闭和再次恢复不丢断点', async () => {
+    let entered = false
+    const starting = useWorkflowStore.getState().startWorkflow({
+      type: 'directory', title: '暂停蓝图', rehydrateParams: { mode: 'full' }, steps: [{
+        name: '生成', description: '', executor: async (_step, context) => {
+          context.data.newBlueprints = [{ chapterNumber: 1, title: '已保存' }]
+          await context.checkpoint?.()
+          entered = true
+          await new Promise<void>((_resolve, reject) => context.signal!.addEventListener('abort', () => reject(new DOMException('暂停', 'AbortError')), { once: true }))
+        },
+      }],
+    })
+    await waitFor(() => entered)
+    const id = useWorkflowStore.getState().activeRuns[0].id
+    useWorkflowStore.getState().pauseWorkflow(id)
+    await starting
+    expect(useWorkflowStore.getState().activeRuns[0].status).toBe('paused')
+    expect(await useWorkflowStore.getState().prepareForClose()).toBe(true)
+    resetStore()
+    await useWorkflowStore.getState().restoreCheckpoint()
+    expect(useWorkflowStore.getState().activeRuns[0].status).toBe('paused')
+    await useWorkflowStore.getState().flushCheckpoint()
+    const cp = JSON.parse(h.dbMap.get('cp')!)
+    expect(cp.contextData[id].newBlueprints).toEqual([{ chapterNumber: 1, title: '已保存' }])
+  })
+
+  it('暂停恢复沿用断点上下文，连点继续只启动一次', async () => {
+    registerWorkflow('directory', () => ({ type: 'directory', title: '续跑', rehydrateParams: { mode: 'full' }, steps: [{
+      name: '生成', description: '', executor: async (_step, ctx) => {
+        h.seen.push('resume')
+        h.seenData.push({ ...ctx.data })
+      },
+    }] }))
+    h.dbMap.set('cp', JSON.stringify({ activeRuns: [makeRun('paused-dir', { type: 'directory', status: 'paused' })],
+      waitingRuns: {}, savedAt: '2026-11-10T00:00:00Z', runDefs: { 'paused-dir': { type: 'directory', params: { mode: 'full' } } },
+      contextData: { 'paused-dir': { newBlueprints: [{ chapterNumber: 1 }] } },
+    }))
+    await useWorkflowStore.getState().restoreCheckpoint()
+    expect(h.seen).toEqual([])
+    useWorkflowStore.getState().confirmContinue('paused-dir')
+    useWorkflowStore.getState().confirmContinue('paused-dir')
+    await waitFor(() => useWorkflowStore.getState().history.some(r => r.id === 'paused-dir'))
+    expect(h.seen).toEqual(['resume'])
+    expect(h.seenData[0].newBlueprints).toEqual([{ chapterNumber: 1 }])
+  })
+
+  it('重新生成等待旧请求收尾，使用新run且不沿用旧蓝图断点', async () => {
+    registerWorkflow('directory', () => ({ type: 'directory', title: '重生成', rehydrateParams: { mode: 'full' }, steps: [{
+      name: '生成', description: '', executor: async (_step, ctx) => { h.seenData.push({ ...ctx.data }) },
+    }] }))
+    let entered = false
+    const starting = useWorkflowStore.getState().startWorkflow({ type: 'directory', title: '旧任务', rehydrateParams: { mode: 'append' }, steps: [{
+      name: '生成', description: '', executor: async (_step, ctx) => {
+        ctx.data.newBlueprints = [{ chapterNumber: 1 }]
+        entered = true
+        await new Promise<void>((_resolve, reject) => ctx.signal!.addEventListener('abort', () => reject(new DOMException('停止', 'AbortError')), { once: true }))
+      },
+    }] })
+    await waitFor(() => entered)
+    const oldId = useWorkflowStore.getState().activeRuns[0].id
+    await useWorkflowStore.getState().restartWorkflow(oldId)
+    await starting
+    expect(h.seenData).toEqual([{}])
+    expect(useWorkflowStore.getState().history).toHaveLength(2)
+    expect(useWorkflowStore.getState().history[0].id).not.toBe(oldId)
+    expect(useWorkflowStore.getState().history[1].cancellationRequestedAt).toBeTruthy()
+  })
+
+  it('已终止历史蓝图继续复用同一任务，不读取其他任务的旧库进度', async () => {
+    const registry = await import('../services/workflows/workflow-registry')
+    const factory = vi.spyOn(registry, 'rehydrateWorkflow').mockImplementationOnce((_type, params) => ({ type: 'directory' as const, title: '继续', rehydrateParams: params,
+      steps: [{ name: 's', description: '', executor: async () => {} }],
+    }))
+    useWorkflowStore.setState({ history: [makeRun('cancelled-dir', { type: 'directory', status: 'failed', cancellationRequestedAt: '2026-11-10', rehydrateParams: { mode: 'full', count: 100 } })] })
+    await useWorkflowStore.getState().continueDirectory('cancelled-dir')
+    expect(factory).toHaveBeenCalledWith('directory', { mode: 'full', count: 100, continueSaved: false })
+    factory.mockRestore()
+    expect(useWorkflowStore.getState().history[0].status).toBe('completed')
+    expect(useWorkflowStore.getState().history[0].id).toBe('cancelled-dir')
+  })
+
+  it('删除历史持久化且只清输出，不删除蓝图正文', async () => {
+    useWorkflowStore.setState({ history: [makeRun('delete-me', { status: 'completed' })], selectedRunId: 'delete-me' })
+    await useWorkflowStore.getState().deleteHistory('delete-me')
+    expect(useWorkflowStore.getState().history).toEqual([])
+    expect(useWorkflowStore.getState().selectedRunId).toBeNull()
+    expect(h.invoke).toHaveBeenCalledWith('fs:workflow-output-delete-run', 'delete-me')
+    expect(h.invoke.mock.calls.some(c => /^db:(blueprint|draft|character).*delete/.test(String(c[0])))).toBe(false)
+    resetStore()
+    await useWorkflowStore.getState().restoreCheckpoint()
+    expect(useWorkflowStore.getState().history).toEqual([])
+  })
+  it('暂停活跃任务不可删除；持久化失败恢复历史且不清理输出', async () => {
+    useWorkflowStore.setState({ activeRuns: [makeRun('paused', { status: 'paused' })] })
+    await expect(useWorkflowStore.getState().deleteHistory('paused')).rejects.toThrow('不能删除')
+    useWorkflowStore.setState({ activeRuns: [], history: [makeRun('keep', { status: 'completed' })] })
+    h.invoke.mockImplementationOnce(async () => ({ success: false }))
+    await expect(useWorkflowStore.getState().deleteHistory('keep')).rejects.toThrow()
+    expect(useWorkflowStore.getState().history[0].id).toBe('keep')
+    expect(h.invoke.mock.calls.some(c => c[0] === 'fs:workflow-output-delete-run' && c[1] === 'keep')).toBe(false)
+  })
+
+  it('当前输出173章的完整行恢复到原任务，不把旧库300章当进度', async () => {
+    const directory = await import('../services/workflows/directory-workflow')
+    const parse = vi.spyOn(directory, 'parseTextBlueprints').mockReturnValueOnce([{ chapterNumber: 173, title: '完整章' }] as never)
+    const save = vi.spyOn(directory, 'saveAllBlueprints').mockResolvedValueOnce(undefined)
+    const registry = await import('../services/workflows/workflow-registry')
+    let received: Record<string, unknown> | undefined
+    const factory = vi.spyOn(registry, 'rehydrateWorkflow').mockImplementationOnce(() => ({ type: 'directory', title: '原任务', steps: [
+      { name: '读取', description: '', executor: async () => {} },
+      { name: '生成', description: '', executor: async (_step, ctx) => { received = ctx.data } },
+    ] }))
+    const old = makeRun('173-run', { type: 'directory', status: 'failed', steps: [
+      { id: 's0', name: '读取', description: '', status: 'completed', logs: [] },
+      { id: 's1', name: '生成', description: '', status: 'running', result: '| 173 | 完整章 | 发展 | 目的 | 人物 | 事件 | 悬念 |\n| 174 | 未完成', logs: [] },
+    ], resumeData: { architecture: 'world', newBlueprints: [{ chapterNumber: 172 }] } })
+    useWorkflowStore.setState({ history: [old] })
+    await useWorkflowStore.getState().continueDirectory('173-run')
+    expect((received?.newBlueprints as { chapterNumber: number }[]).map(b => b.chapterNumber)).toEqual([172, 173])
+    expect(parse.mock.calls[0][0]).not.toContain('174')
+    expect(h.invoke.mock.calls.some(c => c[0] === 'db:blueprint-get-all')).toBe(false)
+    expect(useWorkflowStore.getState().history[0].id).toBe('173-run')
+    parse.mockRestore(); save.mockRestore(); factory.mockRestore()
+  })
+
+  it('异常退出恢复的蓝图步骤不再显示运行且不自动调用模型', async () => {
+    h.dbMap.set('cp', JSON.stringify({ activeRuns: [makeRun('crash-dir', { type: 'directory', steps: [{ id: 's', name: 's', description: '', status: 'running', progress: 50, logs: [] }] })], waitingRuns: {}, savedAt: '2026-11-10' }))
+    await useWorkflowStore.getState().restoreCheckpoint()
+    expect(useWorkflowStore.getState().activeRuns[0].status).toBe('paused')
+    expect(useWorkflowStore.getState().activeRuns[0].steps[0].status).toBe('pending')
+    expect(h.seen).toEqual([])
+  })
+
   it('退出超时保持工作流禁入，重复关闭单飞并保存晚到尾文', async () => {
     let release!: () => void
     const gate = new Promise<void>(resolve => { release = resolve })

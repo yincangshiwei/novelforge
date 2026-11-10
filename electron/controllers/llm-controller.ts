@@ -329,6 +329,12 @@ export function registerLLMController() {
     const win = BrowserWindow.fromWebContents(event.sender)
 
     const provider = LLMFactory.getProvider(model)
+    let terminalSent = false
+    const sendError = (error: string) => {
+      if (terminalSent) return
+      terminalSent = true
+      win?.webContents.send('llm:stream-error', { requestId, error })
+    }
 
     // 使用并发控制器执行流式请求
     // 注意：流式请求的 execute 返回后流仍在进行，所以我们在内部获取槽位
@@ -339,12 +345,26 @@ export function registerLLMController() {
         // 检查请求是否已被取消（排队期间被取消：必须补发错误事件——
         // 渲染层监听器与 activeRequests 只在 onDone/onError 中清理，静默跳过会永久泄漏）
         if (abortController.signal.aborted) {
-          win?.webContents.send('llm:stream-error', { requestId, error: t('error.requestCancelled') })
-          activeStreams.delete(requestId)
+          sendError(t('error.requestCancelled'))
+          if (activeStreams.get(requestId) === abortController) activeStreams.delete(requestId)
           return { skipped: true }
         }
 
         return new Promise<void>((resolve, reject) => {
+          const cleanup = () => {
+            abortController.signal.removeEventListener('abort', onAbort)
+            if (activeStreams.get(requestId) === abortController) activeStreams.delete(requestId)
+          }
+          const onAbort = () => {
+            sendError(t('error.requestCancelled'))
+            cleanup()
+            resolve()
+          }
+          abortController.signal.addEventListener('abort', onAbort, { once: true })
+          if (abortController.signal.aborted) {
+            onAbort()
+            return
+          }
           provider.generateStream(model, request.messages, {
             temperature: request.temperature ?? DEFAULT_REQUEST_TEMPERATURE,
             maxTokens: resolveMaxTokens(request.maxTokens, model),
@@ -354,44 +374,40 @@ export function registerLLMController() {
             toolChoice: request.toolChoice,
             signal: abortController.signal,
             onChunk: (chunk: string) => {
-              if (!abortController.signal.aborted) {
+              if (!terminalSent && !abortController.signal.aborted) {
                 win?.webContents.send('llm:stream-chunk', { requestId, chunk })
               }
             },
             onDone: (fullText: string, usage?: { promptTokens: number; completionTokens: number; totalTokens: number; cachedTokens?: number }, step?: import('../../src/shared/llm-tool-protocol').LLMStepResult) => {
+              if (terminalSent) return
               if (abortController.signal.aborted) {
-                win?.webContents.send('llm:stream-error', { requestId, error: t('error.requestCancelled') })
-                activeStreams.delete(requestId)
-                resolve()
+                onAbort()
                 return
               }
               // usage 含真实缓存命中 token（provider 已解析），透传给渲染进程供费用统计
+              terminalSent = true
               win?.webContents.send('llm:stream-done', { requestId, fullText, usage, step })
-              activeStreams.delete(requestId)
+              cleanup()
               resolve()
             },
             onError: (error: string) => {
-              win?.webContents.send('llm:stream-error', { requestId, error })
-              activeStreams.delete(requestId)
+              if (terminalSent) return
+              sendError(error)
+              cleanup()
               reject(new Error(error))
             },
           }).catch(error => {
-            if (activeStreams.has(requestId)) {
-              win?.webContents.send('llm:stream-error', { requestId, error: String(error) })
-              activeStreams.delete(requestId)
-            }
+            if (terminalSent) return
+            sendError(safeErrorMessage(error))
+            cleanup()
             reject(error)
           })
         }).catch(() => { /* 错误已发送给请求所属窗口 */ })
       },
-      { priority: request.priority ?? 10, timeoutMs: 0 },
+      { priority: request.priority ?? 10, timeoutMs: 0, signal: abortController.signal },
     ).catch((error) => {
-      // 用 error.name 判断取消（此前依赖 locale 文案 '请求已取消' 字符串比较，
-      // en-US/ru-RU 语言下失效且是死分支——取消路径实际已被 skipped 分支/onError 处理）
-      if (!(error instanceof Error && error.name === 'AbortError')) {
-        win?.webContents.send('llm:stream-error', { requestId, error: safeErrorMessage(error) })
-        activeStreams.delete(requestId)
-      }
+      sendError(abortController.signal.aborted ? t('error.requestCancelled') : safeErrorMessage(error))
+      if (activeStreams.get(requestId) === abortController) activeStreams.delete(requestId)
     })
 
     return { requestId, started: true }

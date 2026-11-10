@@ -6,6 +6,20 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const workflowTexts = {
+  'workflow.deleteHistory': { 'zh-CN': '删除历史记录', 'en-US': 'Delete history', 'ru-RU': 'Удалить запись' },
+  'workflow.deleteHistoryConfirm': { 'zh-CN': '删除该任务的历史记录和输出文件？不会删除蓝图、正文或其他作品内容，但将失去从该任务继续生成的入口。', 'en-US': 'Delete this task history and output files? Novel content is kept, but this task can no longer be resumed.', 'ru-RU': 'Удалить историю и вывод задачи? Содержимое произведения сохранится, но продолжить эту задачу будет нельзя.' },
+  'workflow.deleteHistoryBusy': { 'zh-CN': '运行中或暂停任务不能删除，请先终止并等待停止', 'en-US': 'Stop the running or paused task before deleting', 'ru-RU': 'Перед удалением остановите задачу' },
+  'workflow.backToTasks': { 'zh-CN': '返回任务列表', 'en-US': 'Back to tasks', 'ru-RU': 'К списку задач' },
+  'workflow.taskList': { 'zh-CN': '任务列表', 'en-US': 'Tasks', 'ru-RU': 'Задачи' },
+  'workflow.continueBlueprint': { 'zh-CN': '继续生成（保留已保存蓝图，补齐未完成章节）', 'en-US': 'Continue generation (keep saved blueprints)', 'ru-RU': 'Продолжить создание (сохранить готовые планы)' },
+  'workflow.fullscreen': { 'zh-CN': '全屏展示工作流输出', 'en-US': 'Expand workflow output', 'ru-RU': 'Развернуть вывод процесса' },
+  'workflow.exitFullscreen': { 'zh-CN': '退出全屏（Esc）', 'en-US': 'Exit expanded view (Esc)', 'ru-RU': 'Выйти из полного экрана (Esc)' },
+  'workflow.stoppingBlueprint': { 'zh-CN': '正在停止…', 'en-US': 'Stopping…', 'ru-RU': 'Остановка…' },
+  'workflow.pausedBlueprint': { 'zh-CN': '已暂停，已保存批次保留；继续时重做未完成批次', 'en-US': 'Paused. Saved batches kept; the unfinished batch restarts on resume.', 'ru-RU': 'Пауза. Готовые пакеты сохранены; незавершённый будет создан заново.' },
+  'workflow.pauseBlueprint': { 'zh-CN': '暂停', 'en-US': 'Pause', 'ru-RU': 'Пауза' },
+  'workflow.pauseBlueprintHint': { 'zh-CN': '保留已保存批次；未完成批次在继续时重新生成', 'en-US': 'Keep saved batches; regenerate the unfinished batch when resuming', 'ru-RU': 'Сохранить готовые пакеты; незавершённый пакет будет создан заново' },
+  'workflow.restartBlueprint': { 'zh-CN': '重新生成', 'en-US': 'Start over', 'ru-RU': 'Начать заново' },
+  'workflow.restartBlueprintConfirm': { 'zh-CN': '从第1章重新生成蓝图？成功批次覆盖同章号旧蓝图，不删除正文或生成范围外的蓝图。', 'en-US': 'Regenerate blueprints from chapter 1? Saved batches replace matching blueprints. Drafts and blueprints outside the range are kept.', 'ru-RU': 'Создать планы заново с главы 1? Готовые пакеты заменят планы этих глав. Тексты и планы вне диапазона сохраняются.' },
   'audit.waterPassed': { 'zh-CN': '水文与重复结构检查通过', 'en-US': 'Repetition check passed', 'ru-RU': 'Проверка повторов пройдена' },
   'audit.waterFound': { 'zh-CN': '发现 {n} 处水文/重复信号（词频/句子重复/句式单调）', 'en-US': '{n} repetition signals found (word frequency / repeated sentences / monotonous sentence starts)', 'ru-RU': 'Найдено {n} сигналов повторов (частота слов / повтор предложений / однообразие начал)' },
   'audit.wordRepeat': { 'zh-CN': '「{word}」出现 {n} 次，建议同义替换', 'en-US': '"{word}" appears {n} times — consider synonyms', 'ru-RU': '«{word}» встречается {n} раз — используйте синонимы' },

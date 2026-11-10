@@ -58,6 +58,24 @@ const volumeFile = (volumeNumber: number, range: string, entries: { n: number; t
   ]),
 ].join('\n')
 
+describe('全书记忆取消边界', () => {
+  it('预取消不启动全书读取或检查点重建', async () => {
+    await expect(rebuildBookState({ cancelled: true })).rejects.toMatchObject({ name: 'AbortError' })
+    await expect(maybeTriggerBookState({ cancelled: true })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(mockInvoke).not.toHaveBeenCalled()
+  })
+  it('卷计数读取期间取消，不启动全书重建', async () => {
+    const context = { cancelled: false }
+    mockInvoke.mockImplementationOnce(async () => {
+      context.cancelled = true
+      return [1, 2, 3].map(n => ({ file: `volume-${n}.md`, kind: 'volume', stale: false }))
+    })
+    await expect(maybeTriggerBookState(context)).rejects.toMatchObject({ name: 'AbortError' })
+    expect(mockInvoke).toHaveBeenCalledOnce()
+    expect(memoryFiles.size).toBe(0)
+  })
+})
+
 describe('buildBookSummaryFile（聚合纯函数）', () => {
   it('frontmatter 含 updatedAt 与卷范围', () => {
     const content = buildBookSummaryFile([{ volumeNumber: 1, range: '1-15' }], [])

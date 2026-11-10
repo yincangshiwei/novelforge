@@ -5,6 +5,7 @@ import { useProjectStore } from './project-store'
 import { renderLog } from '../services/render-logger'
 import { toast } from '../components/ui/Toast'
 import { ipc } from '../services/ipc-client'
+import { drainLLMRequests } from '../services/llm/request-drain'
 import { CLOSE_DRAIN_TIMEOUT_MS, waitForCloseResult } from '../shared/close-deadline'
 import { isCloseCoordinating } from '../shared/close-coordinator'
 import { sanitizeCheckpointData, cleanupMessageText } from '../services/agent/conversation-recovery'
@@ -44,9 +45,9 @@ async function saveCheckpoint(state: WorkflowState, required = false): Promise<v
         ]),
       ),
       contextData: Object.fromEntries(
-        [...activeContexts]
-          .filter(([id]) => active.some(r => r.id === id))
-          .map(([id, ctx]): [string, Record<string, unknown>] => [id, ctx.data]),
+        active.map((r): [string, Record<string, unknown>] => [
+          r.id, activeContexts.get(r.id)?.data ?? resumeContextData.get(r.id) ?? {},
+        ]),
       ),
     }
     const snapshot = JSON.parse(JSON.stringify(data)) as CheckpointData
@@ -136,6 +137,9 @@ export interface WorkflowRun {
   /** 启动意图先落盘；尚未执行的意图恢复后不自动运行。 */
   startupState?: 'intent' | 'started' | 'cancelled' | 'failed'
   cancellationRequestedAt?: string
+  pauseRequested?: boolean
+  stepByStep?: boolean
+  resumeData?: Record<string, unknown>
 }
 
 export interface WorkflowStartOptions {
@@ -172,6 +176,8 @@ export interface WorkflowContext {
   data: Record<string, unknown>
   /** 是否已取消 */
   cancelled: boolean
+  signal?: AbortSignal
+  checkpoint?: () => Promise<void>
 }
 
 /** 步骤回调 */
@@ -255,6 +261,10 @@ interface WorkflowState {
   confirmContinue: (runId?: string) => void
   /** 取消工作流（传 runId 取消指定，不传取消全部） */
   cancelWorkflow: (runId?: string) => void
+  pauseWorkflow: (runId: string) => void
+  restartWorkflow: (runId: string) => Promise<void>
+  continueDirectory: (runId: string) => Promise<void>
+  deleteHistory: (runId: string) => Promise<void>
   flushCheckpoint: () => Promise<boolean>
   prepareForClose: () => Promise<boolean>
   /** 添加全局日志 */
@@ -276,6 +286,9 @@ interface WorkflowState {
 
 /** 工作流上下文实例 Map（runId → context） */
 const activeContexts = new Map<string, WorkflowContext>()
+const runControllers = new Map<string, AbortController>()
+const runExecutions = new Map<string, Promise<void>>()
+const resumingRuns = new Set<string>()
 /** 步进模式：存储「等待用户确认」的 Promise resolve（runId → resolve） */
 const continueResolveRefs = new Map<string, () => void>()
 /** L2：run 可重建参数快照（type + params → rehydrateWorkflow；Task 5 saveCheckpoint 消费，本任务先引入） */
@@ -393,7 +406,7 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
   selectedRunId: null,
   selectRun: (runId) => set({ selectedRunId: runId }),
   resetProject: () => {
-    if (get().activeRuns.length > 0) throw new Error(t('workflow.projectBusy'))
+    if (get().activeRuns.length > 0 || runExecutions.size > 0 || startupReceipts.size > 0) throw new Error(t('workflow.projectBusy'))
     runDefs.clear()
     resumeContextData.clear()
     set({ activeRuns: [], history: [], globalLogs: [], waitingRuns: {}, selectedRunId: null, ...computeCompat([], {}) })
@@ -432,7 +445,30 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
   confirmContinue: (runId) => {
     // 如果未指定 runId，使用第一个等待中的
     const targetId = runId ?? Object.keys(get().waitingRuns).find(id => get().waitingRuns[id]?.waitingForConfirm)
-    if (!targetId) return
+    if (!targetId || closingWorkflows || resumingRuns.has(targetId)) return
+    const paused = get().activeRuns.find(r => r.id === targetId && r.status === 'paused')
+    if (paused) {
+      resumingRuns.add(targetId)
+      void (async () => {
+        await runExecutions.get(targetId)
+        const current = get().activeRuns.find(r => r.id === targetId)
+        if (!current || current.cancellationRequestedAt || closingWorkflows) return
+        const m = await import('../services/workflows/workflow-registry')
+        const def = m.rehydrateWorkflow(current.type, current.rehydrateParams ?? {})
+        if (!def) throw new Error('无法恢复此工作流，请重新生成')
+        updateRunById(set, targetId, { pauseRequested: false })
+        const waitIndex = get().waitingRuns[targetId]?.waitingAfterStepIndex
+        set(s => {
+          const waitingRuns = { ...s.waitingRuns }
+          delete waitingRuns[targetId]
+          return { waitingRuns, ...computeCompat(s.activeRuns, waitingRuns) }
+        })
+        await executeRunFromIndex({ ...current, pauseRequested: false }, def,
+          waitIndex === undefined ? current.currentStepIndex : waitIndex + 1,
+          resumeContextData.get(targetId) ?? {}, current.stepByStep)
+      })().catch(error => toast.error(String(error))).finally(() => resumingRuns.delete(targetId))
+      return
+    }
     const resolve = continueResolveRefs.get(targetId)
     if (resolve) {
       // 进程内步进等待：内存 resolve（现状语义不变），continueResolveRefs 保持进程内语义
@@ -467,6 +503,10 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
   startWorkflow: async (definition, stepByStep = false, options) => {
     if (closingWorkflows || isCloseCoordinating()) throw new Error('正在保存退出，不启动新工作流')
     checkStartSignal(options)
+    if (definition.type === 'directory' && (get().activeRuns.some(r => r.type === 'directory')
+      || [...runExecutions.keys()].some(id => get().history.some(r => r.id === id && r.type === 'directory')))) {
+      throw new Error('已有蓝图任务或请求正在收尾，请继续、终止或等待它停止后再生成')
+    }
     const operationKey = options?.operationId ? JSON.stringify([options.scope, options.operationId]) : undefined
     if (operationKey) {
       const pendingReceipt = startupReceipts.get(operationKey)
@@ -506,6 +546,7 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
         logs: [],
       })),
       rehydrateParams: definition.rehydrateParams ?? {},
+      stepByStep,
       operationId: options?.operationId,
       scope: options?.scope,
       startupState: 'intent',
@@ -568,12 +609,78 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
     }
   },
 
+  pauseWorkflow: (runId) => {
+    const run = get().activeRuns.find(r => r.id === runId)
+    if (!run || run.type !== 'directory' || run.status === 'paused') return
+    flushAllPendingAppends()
+    updateRunById(set, runId, { status: 'paused', pauseRequested: true })
+    const ctx = activeContexts.get(runId)
+    if (ctx) {
+      resumeContextData.set(runId, ctx.data)
+      ctx.cancelled = true
+    }
+    runControllers.get(runId)?.abort()
+    continueResolveRefs.get(runId)?.()
+    continueResolveRefs.delete(runId)
+    void saveCheckpoint(get())
+  },
+
+  restartWorkflow: async (runId) => {
+    const run = [...get().activeRuns, ...get().history].find(r => r.id === runId)
+    if (!run || run.type !== 'directory') return
+    const scope = useProjectStore.getState().currentProject?.path
+    get().cancelWorkflow(runId)
+    await runExecutions.get(runId)
+    const m = await import('../services/workflows/workflow-registry')
+    const def = m.rehydrateWorkflow('directory', { ...run.rehydrateParams, mode: 'full', continueSaved: false, startChapter: undefined, count: undefined })
+    if (!def) throw new Error('无法重新生成蓝图')
+    if (scope !== useProjectStore.getState().currentProject?.path) throw new Error('项目已切换，取消重新生成')
+    await get().startWorkflow(def, run.stepByStep, { scope })
+  },
+
+  continueDirectory: async (runId) => {
+    if (closingWorkflows || isCloseCoordinating() || resumingRuns.has(runId)) return
+    const run = [...get().activeRuns, ...get().history].find(r => r.id === runId)
+    if (!run || run.type !== 'directory' || run.status === 'completed') return
+    const scope = useProjectStore.getState().currentProject?.path
+    resumingRuns.add(runId)
+    try {
+      await runExecutions.get(runId)
+      if (scope !== useProjectStore.getState().currentProject?.path) throw new Error('项目已切换，取消继续生成')
+      if (get().activeRuns.some(r => r.type === 'directory' && r.id !== runId)) throw new Error('已有蓝图任务，请先停止该任务')
+      const current = [...get().activeRuns, ...get().history].find(r => r.id === runId) ?? run
+      const data = { ...(resumeContextData.get(runId) ?? current.resumeData ?? {}) }
+      const directory = await import('../services/workflows/directory-workflow')
+      const generationIndex = current.steps.length > 1 ? 1 : 0
+      const output = await readStepOutputTail(runId, generationIndex, { full: true })
+      const text = output.exists && output.content ? output.content : current.steps[generationIndex]?.result ?? ''
+      const completeRows = text.split('\n').filter(line => /^\s*\|\s*\d+\s*\|/.test(line) && /\|\s*$/.test(line)).join('\n')
+      const end = useProjectStore.getState().currentProject?.novelConfig.totalChapters ?? Number.MAX_SAFE_INTEGER
+      const parsed = completeRows ? directory.parseTextBlueprints(completeRows, 1, end) : []
+      const committed = new Map(((data.newBlueprints ?? []) as import('../services/workflows/directory-workflow').ChapterBlueprint[]).map(b => [b.chapterNumber, b]))
+      for (const blueprint of parsed) committed.set(blueprint.chapterNumber, blueprint)
+      data.newBlueprints = [...committed.values()].sort((a, b) => a.chapterNumber - b.chapterNumber)
+      const m = await import('../services/workflows/workflow-registry')
+      const def = m.rehydrateWorkflow('directory', { ...current.rehydrateParams, continueSaved: false })
+      if (!def) throw new Error('无法继续生成蓝图')
+      if (scope !== useProjectStore.getState().currentProject?.path) throw new Error('项目已切换，取消继续生成')
+      if (parsed.length) await directory.saveAllBlueprints(parsed)
+      const resumed: WorkflowRun = { ...current, status: 'paused', cancellationRequestedAt: undefined, completedAt: undefined, pauseRequested: false,
+        resumeData: data, steps: current.steps.map((step, index) => index >= generationIndex ? { ...step, status: 'pending', error: undefined, completedAt: undefined } : step) }
+      set(s => ({ activeRuns: [...s.activeRuns.filter(r => r.id !== runId), resumed], history: s.history.filter(r => r.id !== runId), selectedRunId: runId }))
+      resumeContextData.set(runId, data)
+      await saveCheckpoint(get(), true)
+      await executeRunFromIndex(resumed, def, data.architecture ? generationIndex : 0, data, current.stepByStep)
+    } finally { resumingRuns.delete(runId) }
+  },
+
   cancelWorkflow: (runId) => {
     if (runId) {
       flushAllPendingAppends()
       // 取消指定工作流
       const ctx = activeContexts.get(runId)
       if (ctx) ctx.cancelled = true
+      runControllers.get(runId)?.abort()
       // 如果在步进等待，解除 Promise
       const resolve = continueResolveRefs.get(runId)
       if (resolve) { resolve(); continueResolveRefs.delete(runId) }
@@ -584,7 +691,7 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
         const newWaiting = { ...s.waitingRuns }
         delete newWaiting[runId]
         const newHistory = targetRun
-          ? [{ ...targetRun, status: 'failed' as const, cancellationRequestedAt: new Date().toISOString(), completedAt: new Date().toISOString() }, ...s.history].slice(0, 50)
+          ? [{ ...targetRun, resumeData: ctx?.data ?? targetRun.resumeData, status: 'failed' as const, cancellationRequestedAt: new Date().toISOString(), completedAt: new Date().toISOString() }, ...s.history].slice(0, 50)
           : s.history
         return {
           activeRuns: newRuns,
@@ -603,6 +710,7 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
       flushAllPendingAppends()
       for (const [id, ctx] of activeContexts) {
         ctx.cancelled = true
+        runControllers.get(id)?.abort()
         const resolve = continueResolveRefs.get(id)
         if (resolve) { resolve(); continueResolveRefs.delete(id) }
       }
@@ -630,13 +738,41 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
     try { await saveCheckpoint(get(), true) } catch { return false }
     return checkpointError === undefined
   },
+  deleteHistory: async (runId) => {
+    if (closingWorkflows || isCloseCoordinating() || get().activeRuns.some(r => r.id === runId)
+      || runExecutions.has(runId) || resumingRuns.has(runId)) throw new Error('任务尚未停止或正在恢复，不能删除')
+    const run = get().history.find(r => r.id === runId)
+    if (!run) return
+    resumingRuns.add(runId)
+    const scope = useProjectStore.getState().currentProject?.path
+    const selected = get().selectedRunId
+    try {
+      set(s => ({ history: s.history.filter(r => r.id !== runId), selectedRunId: s.selectedRunId === runId ? null : s.selectedRunId }))
+      try { await saveCheckpoint(get(), true) } catch (error) {
+        if (scope === useProjectStore.getState().currentProject?.path) {
+          set(s => ({ history: [run, ...s.history.filter(r => r.id !== runId)], selectedRunId: selected }))
+        }
+        throw error
+      }
+      runDefs.delete(runId)
+      resumeContextData.delete(runId)
+      if (scope === useProjectStore.getState().currentProject?.path) {
+        await ipc.invoke('fs:workflow-output-delete-run', runId)
+      }
+    } finally { resumingRuns.delete(runId) }
+  },
+
   prepareForClose: async () => {
     if (!workflowCloseDrain) {
       closingWorkflows = true
       ++workflowCloseEpoch
       workflowCloseDrain = Promise.resolve().then(async () => {
-        get().cancelWorkflow()
+        for (const run of [...get().activeRuns]) {
+          if (run.type === 'directory') get().pauseWorkflow(run.id)
+          else get().cancelWorkflow(run.id)
+        }
         await Promise.allSettled([...executingRuns, ...startupReceipts.values()])
+        await drainLLMRequests(id => ipc.invoke('llm:cancel', id).then(() => {}))
         flushAllPendingAppends()
         return await get().flushCheckpoint()
       }).catch(error => {
@@ -691,6 +827,14 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
     // 不计 completed/不触发 onComplete → run 永久 stuck running（final review Finding 2）。
     const runningReplays: Array<{ rr: WorkflowRun; def: WorkflowDefinition; startIndex: number }> = []
     for (const r of cp.activeRuns) {
+      resumeContextData.set(r.id, cp.contextData?.[r.id] ?? {})
+      if (r.status === 'paused' || r.type === 'directory') {
+        restored.push({ ...r, status: 'paused', pauseRequested: false,
+          steps: r.steps.map(step => step.status === 'running' ? { ...step, status: 'pending' as const, progress: 0 } : step),
+          rehydrateParams: cp.runDefs?.[r.id]?.params ?? r.rehydrateParams })
+        if (interruptedWaitingIds.has(r.id)) keptWaitingIds.push(r.id)
+        continue
+      }
       if (r.operationId || r.startupState === 'intent' || r.startupState === 'failed' || r.startupState === 'cancelled') {
         restored.push({ ...r, status: 'paused' })
         continue
@@ -857,9 +1001,20 @@ export async function executeRunFromIndex(
   const state = useWorkflowStore.getState()
   if (closingWorkflows || isCloseCoordinating() || run.cancellationRequestedAt || state.history.some(r => r.id === run.id)
     || !state.activeRuns.some(r => r.id === run.id)) return
+  if (state.activeRuns.find(r => r.id === run.id)?.pauseRequested) {
+    updateRunById(useWorkflowStore.setState, run.id, { status: 'paused', pauseRequested: false })
+    await saveCheckpoint(useWorkflowStore.getState())
+    return
+  }
+  if (runExecutions.has(run.id)) return
   const execution = executeRunBody(run, definition, startIndex, contextData, stepByStep)
+  runExecutions.set(run.id, execution)
   executingRuns.add(execution)
-  try { await execution } finally { executingRuns.delete(execution) }
+  try { await execution } finally {
+    executingRuns.delete(execution)
+    runExecutions.delete(run.id)
+    runControllers.delete(run.id)
+  }
 }
 
 async function executeRunBody(
@@ -873,9 +1028,13 @@ async function executeRunBody(
   const get = () => useWorkflowStore.getState()
 
   // 重建执行上下文（模块级进程内 Map 语义）
+  const controller = new AbortController()
+  runControllers.set(run.id, controller)
   const context: WorkflowContext = {
     data: contextData,
     cancelled: !!get().history.find(r => r.id === run.id)?.cancellationRequestedAt,
+    signal: controller.signal,
+    checkpoint: () => saveCheckpoint(get(), true),
   }
   activeContexts.set(run.id, context)
 
@@ -898,7 +1057,7 @@ async function executeRunBody(
     const stepDef = definition.steps[i]
 
     // 标记当前步骤为运行中
-    updateStepById(set, run.id, i, { status: 'running', startedAt: new Date().toISOString() })
+    updateStepById(set, run.id, i, { status: 'running', progress: 0, error: undefined, completedAt: undefined, startedAt: new Date().toISOString() })
     updateRunById(set, run.id, { currentStepIndex: i })
     get().addLog('info', `[${definition.title}] ${stepDef.name}`)
 
@@ -924,6 +1083,7 @@ async function executeRunBody(
       const result = await stepDef.executor(run.steps[i], context, callbacks)
       // 刷新该步骤流式缓冲残留（立即写入，避免 timer 晚于步骤完成）
       flushAppendTextNow(`${run.id}:${i}`)
+      if (context.cancelled) break
       updateStepById(set, run.id, i, {
         status: 'completed',
         completedAt: new Date().toISOString(),
@@ -941,12 +1101,14 @@ async function executeRunBody(
           return { waitingRuns: newWaiting, ...computeCompat(s.activeRuns, newWaiting) }
         })
         get().addLog('info', `[${definition.title}] Waiting: step ${i + 2} — ${definition.steps[i + 1].name}`)
+        void saveCheckpoint(get())
         await new Promise<void>((resolve) => { continueResolveRefs.set(run.id, resolve) })
         if (context.cancelled) break
         updateRunById(set, run.id, { status: 'running' })
       }
     } catch (error) {
       flushAppendTextNow(`${run.id}:${i}`)
+      if (context.cancelled) break
       const errorMsg = error instanceof Error ? error.message : String(error)
       updateStepById(set, run.id, i, {
         status: 'failed',
@@ -962,6 +1124,21 @@ async function executeRunBody(
       get().addLog('error', `[${definition.title}] ${stepDef.name} — FAIL: ${errorMsg}`)
       break
     }
+  }
+
+  if (get().activeRuns.find(r => r.id === run.id)?.pauseRequested) {
+    resumeContextData.set(run.id, context.data)
+    activeContexts.delete(run.id)
+    clearAppendBuffers(run.id)
+    const pausedRun = get().activeRuns.find(r => r.id === run.id)
+    if (pausedRun?.steps[pausedRun.currentStepIndex]?.status === 'running') {
+      updateStepById(set, run.id, pausedRun.currentStepIndex, { status: 'pending' })
+    }
+    updateRunById(set, run.id, { status: 'paused', pauseRequested: false })
+    try { await saveCheckpoint(get(), true) } catch {
+      get().addLog('error', '暂停进度保存失败，请重试保存后再退出。')
+    }
+    return
   }
 
   // 检查是否全部完成
@@ -998,7 +1175,7 @@ async function executeRunBody(
     const newWaiting = { ...s.waitingRuns }
     delete newWaiting[run.id]
     const newHistory = completedRun
-      ? [completedRun, ...s.history].slice(0, 50)
+      ? [{ ...completedRun, resumeData: completedRun.type === 'directory' && completedRun.status !== 'completed' ? context.data : undefined }, ...s.history].slice(0, 50)
       : s.history
     return {
       activeRuns: newRuns,

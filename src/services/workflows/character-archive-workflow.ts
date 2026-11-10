@@ -12,9 +12,9 @@ import {
   type RoleContextSegment,
 } from '../character-archive'
 import { parseAliases } from '../character-normalize'
-import { runPostProcessPipeline, readPostProcessStatus, getFailedStepLabels, type PostProcessStep } from './workflow-utils'
+import { runPostProcessPipeline, settleWorkflowStream, throwIfWorkflowCancelled, readPostProcessStatus, getFailedStepLabels, type PostProcessStep } from './workflow-utils'
 import { registerWorkflow } from './workflow-registry'
-import type { StepCallbacks, WorkflowDefinition } from '../../stores/workflow-store'
+import type { StepCallbacks, WorkflowDefinition, WorkflowContext } from '../../stores/workflow-store'
 import type { CharacterData } from '../../../electron/repositories/character-repository'
 
 /**
@@ -40,21 +40,21 @@ export const ARCHIVE_BATCH_WINDOW_CHARS = 600
 export const ARCHIVE_BATCH_MAX_SEGMENTS = 3
 
 /** 单次 LLM 流式调用（JSON 模式；流式内容同步到 AI 输出面板） */
-async function callLLMForArchive(builder: { build: () => string; getSystemRole: () => string }, callbacks: StepCallbacks): Promise<string> {
+async function callLLMForArchive(builder: { build: () => string; getSystemRole: () => string }, callbacks: StepCallbacks, context?: WorkflowContext): Promise<string> {
+  throwIfWorkflowCancelled(context)
   const llmStore = useLLMStore.getState()
   if (!llmStore.defaultModelId) throw new Error(t('error.noDefaultModel'))
   let full = ''
-  await new Promise<void>((resolve, reject) => {
-    llmStore.generateStream(
-      [
-        { role: 'system', content: builder.getSystemRole() },
-        { role: 'user', content: builder.build() },
-      ],
-      { onChunk: c => { full += c; callbacks.appendText(c) }, onDone: () => resolve(), onError: e => reject(new Error(e)) },
-      undefined,
-      { responseFormat: { type: 'json_object' } },
-    )
-  })
+  await settleWorkflowStream<void>(streamCallbacks => llmStore.generateStream(
+    [
+      { role: 'system', content: builder.getSystemRole() },
+      { role: 'user', content: builder.build() },
+    ],
+    { ...streamCallbacks, onDone: () => streamCallbacks.onDone(undefined) },
+    undefined,
+    { responseFormat: { type: 'json_object' } },
+  ), c => { full += c; callbacks.appendText(c) }, id => llmStore.cancelGeneration(id), context)
+  throwIfWorkflowCancelled(context)
   return full
 }
 
@@ -64,7 +64,9 @@ async function extractBatch(
   chapters: ChapterContent[],
   registryNames: string[],
   callbacks: StepCallbacks,
+  context?: WorkflowContext,
 ): Promise<void> {
+  throwIfWorkflowCancelled(context)
   // 1. 逐角色抽取上下文（批量模式缩减窗口/段数预算，别名+前缀碰撞过滤）
   const items: Array<{ char: CharacterData; segments: RoleContextSegment[] }> = []
   for (const char of batch) {
@@ -92,7 +94,7 @@ async function extractBatch(
   const builder = new PostProcessPromptBuilder(template).withCharactersSegments(segText)
 
   // 3. 一次 LLM 调用提取整批
-  const raw = await callLLMForArchive(builder, callbacks)
+  const raw = await callLLMForArchive(builder, callbacks, context)
   const results = parseBatchArchiveJson(raw, items.map(i => i.char))
 
   // 4. 逐角色写库（仅填空）
@@ -102,6 +104,7 @@ async function extractBatch(
       callbacks.log(t('log.archiveParseFailed').replace('{name}', item.name))
       continue
     }
+    throwIfWorkflowCancelled(context)
     try {
       const result = await ipc.invoke('db:character-merge-fields', item.name, item.archive)
       if (!result.success) {
@@ -136,7 +139,8 @@ export function createCharacterArchiveWorkflow(params: CharacterArchiveWorkflowP
     steps: [{
       name: t('workflow.archiveSteps'),
       description: t('workflow.archiveStepsDesc'),
-      executor: async (_step, _ctx, callbacks) => {
+      executor: async (_step, context, callbacks) => {
+        throwIfWorkflowCancelled(context)
         const allChars = (await ipc.invoke('db:character-get-all')) as unknown as CharacterData[]
         const targets = nameFilter ? allChars.filter(c => c.name === nameFilter) : allChars
         const pending = targets.filter(c => hasBlankArchiveFields(c as unknown as Record<string, unknown>))
@@ -154,6 +158,7 @@ export function createCharacterArchiveWorkflow(params: CharacterArchiveWorkflowP
         const chapterNumbers = (await ipc.invoke('db:draft-get-all-chapter-numbers')) as number[]
         const chapters: ChapterContent[] = []
         for (const n of [...chapterNumbers].sort((a, b) => a - b)) {
+          throwIfWorkflowCancelled(context)
           const meta = await ipc.invoke('db:draft-get-finalized', n) as { id: number; content?: string } | null
           if (!meta) continue
           const full = await ipc.invoke('db:draft-get-full', meta.id) as { content?: string } | null
@@ -175,14 +180,16 @@ export function createCharacterArchiveWorkflow(params: CharacterArchiveWorkflowP
             label: t('workflow.archiveBatch').replace('{n}', String(batchNo)).replace('{total}', String(total)),
             critical: false,
             dependsOn: batchNo > 1 ? [`archive_batch_${batchNo - 1}`] : [],
-            executor: async (cb) => { await extractBatch(batch, chapters, registryNames, cb) },
+            executor: async (cb, batchContext) => { await extractBatch(batch, chapters, registryNames, cb, batchContext) },
           })
         }
 
         // 接入后处理管线：run 落库 + 每批重试 2 次 + 失败标记
         await runPostProcessPipeline(projectPath, ARCHIVE_SCOPE, t('workflow.archiveTitle'), batchSteps, callbacks, {
           retryCount: 2,
+          context,
         })
+        throwIfWorkflowCancelled(context)
 
         // 失败批次汇总日志（可诊断：失败角色仍在 pending，下次运行自动重试）
         const status = await readPostProcessStatus(projectPath, ARCHIVE_SCOPE)

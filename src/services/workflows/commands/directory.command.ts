@@ -5,6 +5,7 @@ import { getPromptTemplate } from '../../prompt-templates'
 import { DirectoryPromptBuilder } from '../../prompts/prompt-builder'
 import { DirectoryWorkflowParams, ChapterBlueprint, parseTextBlueprints, parseTextBlueprintsFromParsed, saveAllBlueprints } from '../directory-workflow'
 import { stripThinkingTags, extractAndRepairJSON } from '../workflow-utils'
+import { ipc } from '../../ipc-client'
 
 /**
  * 为 Prompt 注入清洗蓝图内容：
@@ -39,7 +40,7 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
     let endChapter = totalChapters
 
     if (this.params.mode === 'append') {
-      startChapter = this.params.startChapter || (existingBlueprints.length + 1)
+      startChapter = Number(context.data.directoryStart) || this.params.startChapter || (Math.max(0, ...existingBlueprints.map(b => b.chapterNumber)) + 1)
       if (this.params.count && this.params.count > 0) {
         endChapter = startChapter + this.params.count - 1
       }
@@ -47,6 +48,8 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       endChapter = Math.min(this.params.count, totalChapters)
     }
 
+    context.data.directoryStart = startChapter
+    context.data.directoryEnd = endChapter
     callbacks.log(t('log.directory.generating').replace('{start}', String(startChapter)).replace('{end}', String(endChapter)))
 
     // 从当前默认模型获取 maxTokens，动态计算每批次章节数
@@ -65,17 +68,41 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       callbacks.log(t('log.directory.batchMode').replace('{size}', String(batchSize)))
     }
 
-    const newBlueprints: ChapterBlueprint[] = []
-    // 使用游标追踪生成进度，支持 AI 超额返回时智能跳过后续批次
-    let cursor = startChapter
+    const newBlueprints = (context.data.newBlueprints ?? []) as ChapterBlueprint[]
+    context.data.newBlueprints = newBlueprints
+    context.data.existingBlueprints = existingBlueprints
+    const ensureActive = () => {
+      if (context.cancelled || context.signal?.aborted) throw new DOMException('工作流已停止', 'AbortError')
+      if (useProjectStore.getState().currentProject?.path !== project.path) throw new Error('项目已切换，停止蓝图写入')
+    }
+    if (this.params.continueSaved) {
+      ensureActive()
+      const saved = await ipc.invoke('db:blueprint-get-all') as ChapterBlueprint[]
+      ensureActive()
+      const committed = new Map(newBlueprints.map(b => [b.chapterNumber, b]))
+      for (const blueprint of saved) {
+        if (blueprint.chapterNumber >= startChapter && blueprint.chapterNumber <= endChapter) committed.set(blueprint.chapterNumber, blueprint)
+      }
+      newBlueprints.splice(0, newBlueprints.length, ...committed.values())
+      await context.checkpoint?.()
+    }
+    const nextMissing = () => {
+      const saved = new Set(newBlueprints.map(b => b.chapterNumber))
+      let chapter = startChapter
+      while (chapter <= endChapter && saved.has(chapter)) chapter++
+      return chapter
+    }
+    let cursor = nextMissing()
     // 多级重试策略：本地修复 → 中批次(5章) → 单章
     let consecutiveParseFailures = 0
     const MAX_CONSECUTIVE_FAILURES = 5  // 增加容错次数（修复不算新 LLM 调用）
     // 动态批次大小
     let effectiveBatchSize = batchSize
 
-    while (cursor <= endChapter) {
-      if (context.cancelled) { callbacks.log(t('log.directory.cancelled')); break }
+    while (true) {
+      ensureActive()
+      cursor = nextMissing()
+      if (cursor > endChapter) break
 
       const batchEnd = Math.min(cursor + effectiveBatchSize - 1, endChapter)
       if (effectiveBatchSize < batchSize) {
@@ -137,18 +164,25 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       // ① 批次间 system 前缀完全稳定 → API 前缀缓存命中（长链路输入费用减半）
       // ② system 消息遵从度更高 → 50 章级长输出中后段不偏离架构（降幻觉）
       // 注意：必须传注入后的 prompt 字符串而非 builder（callLLMWithBuilder 内部重 build 会丢注入）
-      const resultText = await this.callLLM(prompt, systemRole, callbacks, { staticContext: architecture, purpose: 'blueprint_gen' })
+      const resultText = await this.callLLM(prompt, systemRole, callbacks, { staticContext: architecture, purpose: 'blueprint_gen' }, context)
+      ensureActive()
 
       // 接受 AI 返回的从 cursor 到 endChapter 范围内的所有有效章节
       // AI 可能一次性返回超出本批次（batchEnd）的章节，全部保留（single 模式：省调用）
       // batch 模式：严格按批 —— 程序接受范围与模板输出纪律（≤ {{m}}）双保险，杜绝越界输出
+      const savedNumbers = new Set(newBlueprints.map(b => b.chapterNumber))
       const parsed = parseTextBlueprints(resultText, cursor,
         this.params.generationMode === 'batch' ? batchEnd : endChapter)
-      newBlueprints.push(...parsed)
-
+        .filter(b => !savedNumbers.has(b.chapterNumber))
       // 批次入库
       if (parsed.length > 0) {
+        ensureActive()
         await saveAllBlueprints(parsed)
+        const committed = new Map(newBlueprints.map(b => [b.chapterNumber, b]))
+        for (const b of parsed) committed.set(b.chapterNumber, b)
+        newBlueprints.splice(0, newBlueprints.length, ...committed.values())
+        await context.checkpoint?.()
+        ensureActive()
         useProjectStore.getState().refreshFileTree()
       }
 
@@ -207,9 +241,15 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
             // 在 repair 后被接受入库，破坏「严格按批」双保险）
             const repairedBlueprints = parseTextBlueprintsFromParsed(repairResult.parsed, cursor,
               this.params.generationMode === 'batch' ? batchEnd : endChapter)
+              .filter(b => !savedNumbers.has(b.chapterNumber))
             if (repairedBlueprints.length > 0) {
-              newBlueprints.push(...repairedBlueprints)
+              ensureActive()
               await saveAllBlueprints(repairedBlueprints)
+              const committed = new Map(newBlueprints.map(b => [b.chapterNumber, b]))
+              for (const b of repairedBlueprints) committed.set(b.chapterNumber, b)
+              newBlueprints.splice(0, newBlueprints.length, ...committed.values())
+              await context.checkpoint?.()
+              ensureActive()
               useProjectStore.getState().refreshFileTree()
               consecutiveParseFailures = 0
               effectiveBatchSize = batchSize

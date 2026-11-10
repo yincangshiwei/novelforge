@@ -10,13 +10,16 @@ import { ipc } from '../../ipc-client'
 
 import {
   runPostProcessPipeline,
+  settleWorkflowStream,
+  throwIfWorkflowCancelled,
+  isWorkflowAbortError,
   getChapterFinalizeScope,
   stripThinkingTags,
   type PostProcessStep,
 } from '../workflow-utils'
 import type { ChapterInfo } from '../chapter-workflow'
 import type { CharacterData } from '../../../../electron/repositories/character-repository'
-import type { StepCallbacks } from '../../../stores/workflow-store'
+import type { StepCallbacks, WorkflowContext } from '../../../stores/workflow-store'
 import { isNoChangeValue, normalizeCharacterRole, normalizeCharacterTier, normalizeTagsValue, matchCharacterName, stripNameAlias } from '../../character-normalize'
 import { buildNamePositions, hasProximity, closestNamePair, hasDialogueMarker } from '../relation-utils'
 
@@ -37,7 +40,9 @@ async function callLLMForPostProcess(
   builder: { build: () => string; getSystemRole: () => string },
   callbacks: { appendText: (text: string) => void },
   options?: { responseFormat?: { type: string } },
+  context?: WorkflowContext,
 ): Promise<string> {
+  throwIfWorkflowCancelled(context)
   const llmStore = useLLMStore.getState()
   if (!llmStore.defaultModelId) throw new Error(t('error.noDefaultModel'))
 
@@ -61,43 +66,41 @@ async function callLLMForPostProcess(
     }).catch(() => { })
   }
 
-  return new Promise<string>((resolve, reject) => {
-    let fullContent = ''
-    llmStore.generateStream(
+  let fullContent = ''
+  const result = await settleWorkflowStream<{ text: string; usage?: import('../../../shared/ipc-channels').TokenUsage }>(streamCallbacks => llmStore.generateStream(
       [
         { role: 'system', content: builder.getSystemRole() },
         { role: 'user', content: builder.build() },
       ],
       {
-        onChunk: (chunk) => { fullContent += chunk; callbacks.appendText(chunk) },
-        onDone: (text, usage) => {
-          if (usage) {
-            ipc.invoke('db:log-llm-call', {
-              model_id: modelId,
-              model_name: model?.name ?? model?.modelName ?? '',
-              purpose: 'post_process',
-              prompt_tokens: usage.promptTokens,
-              completion_tokens: usage.completionTokens,
-              total_tokens: usage.totalTokens,
-              cached_tokens: usage.cachedTokens ?? 0,
-              duration_ms: Date.now() - startTime,
-              success: 1,
-            }).catch(() => { })
-          } else {
-            logLLMCall(true)
-          }
-          const raw = text || fullContent
-          resolve(stripThinkingTags(raw))
-        },
-        onError: (err) => {
-          logLLMCall(false, err || t('log.render.llmStreamFailed'))
-          reject(new Error(err || t('log.render.llmStreamFailed')))
-        },
+        onChunk: streamCallbacks.onChunk,
+        onDone: (text, usage) => streamCallbacks.onDone({ text, usage }),
+        onError: streamCallbacks.onError,
       },
       undefined,
       options,
-    )
-  })
+    ), chunk => { fullContent += chunk; callbacks.appendText(chunk) }, id => llmStore.cancelGeneration(id), context)
+    .catch(error => {
+      if (!isWorkflowAbortError(error)) logLLMCall(false, String(error))
+      throw error
+    })
+  throwIfWorkflowCancelled(context)
+  if (result.usage) {
+    ipc.invoke('db:log-llm-call', {
+      model_id: modelId,
+      model_name: model?.name ?? model?.modelName ?? '',
+      purpose: 'post_process',
+      prompt_tokens: result.usage.promptTokens,
+      completion_tokens: result.usage.completionTokens,
+      total_tokens: result.usage.totalTokens,
+      cached_tokens: result.usage.cachedTokens ?? 0,
+      duration_ms: Date.now() - startTime,
+      success: 1,
+    }).catch(() => { })
+  } else {
+    logLLMCall(true)
+  }
+  return stripThinkingTags(result.text || fullContent)
 }
 
 
@@ -129,7 +132,8 @@ export function buildFinalizePostProcessSteps(
     label: t('workflow.importKB'),
     critical: true,
     dependsOn: [],
-    executor: async (callbacks) => {
+    executor: async (callbacks, context) => {
+      throwIfWorkflowCancelled(context)
       const contentFileName = chapterTitle
         ? `第${chapterNumber}章 ${chapterTitle}.txt`
         : `chapter_${chapterNumber}.txt`
@@ -150,15 +154,17 @@ export function buildFinalizePostProcessSteps(
       label: t('workflow.chapterKeyPoints'),
       critical: true,
       dependsOn: ['kb_import'],
-      executor: async (callbacks) => {
+      executor: async (callbacks, context) => {
+        throwIfWorkflowCancelled(context)
         const notesBuilder = new PostProcessPromptBuilder(notesTemplate)
           .withChapterContent(draftContent)
           .withChapterNumber(chapterNumber)
           .withChapterTitle(chapterTitle)
 
-        const cleanNotes = await callLLMForPostProcess(notesBuilder, callbacks)
+        const cleanNotes = await callLLMForPostProcess(notesBuilder, callbacks, undefined, context)
 
         // 写入蓝图 JSON 的 notes 字段
+        throwIfWorkflowCancelled(context)
         await ipc.invoke('db:blueprint-update-notes', chapterNumber, cleanNotes)
         callbacks.log(t('log.finalize.notesDone'))
       },
@@ -173,7 +179,8 @@ export function buildFinalizePostProcessSteps(
       label: t('workflow.characterStateUpdate'),
       critical: false,
       dependsOn: ['kb_import'],  // 仅依赖 KB 导入完成，可与 chapter_notes 并行
-      executor: async (callbacks) => {
+      executor: async (callbacks, context) => {
+        throwIfWorkflowCancelled(context)
         // 读取现有角色卡
         const allChars = (await ipc.invoke('db:character-get-all')) as unknown as CharacterData[]
         const simpleCards = allChars.map((c) => ({ name: c.name, role: c.role }))
@@ -196,7 +203,7 @@ export function buildFinalizePostProcessSteps(
           .withChapterNumber(chapterNumber)
           .withExistingCardsJson(simpleCards)
 
-        const cardsResult = await callLLMForPostProcess(cardBuilder, callbacks)
+        const cardsResult = await callLLMForPostProcess(cardBuilder, callbacks, undefined, context)
 
         // 解析 Markdown 表格格式的角色状态更新（比 JSON 更稳定）
         const { parseMarkdownTable, robustParseJSON, splitCharacterUpdateSections } = await import('../workflow-utils')
@@ -303,6 +310,7 @@ export function buildFinalizePostProcessSteps(
                 updatedAtChapter: chapterNumber,
               }
               // 标签/核心动机：有更新才覆盖（COALESCE），LLM 输出"无"变体保留旧值
+              throwIfWorkflowCancelled(context)
               await ipc.invoke('db:character-update-state', dbChar.name, newState, {
                 tags: normalizeTagsValue(row.tags ?? '') || null,
                 motivation: cleanOptional(row.motivation ?? ''),
@@ -327,6 +335,7 @@ export function buildFinalizePostProcessSteps(
             newCharCount++
             // ⚠️ P1 加固：role 枚举归一化（'Protagonist' 大写入库此前绕过 tier 推导/排序/UI 分级）
             const role = normalizeCharacterRole(row.role)
+            throwIfWorkflowCancelled(context)
             await ipc.invoke('db:character-upsert', {
               name: name,
               role,
@@ -365,7 +374,8 @@ export function buildFinalizePostProcessSteps(
     label: t('workflow.relationDetect'),
     critical: false,
     dependsOn: ['character_cards'],
-    executor: async (callbacks: StepCallbacks) => {
+    executor: async (callbacks: StepCallbacks, context?: WorkflowContext) => {
+      throwIfWorkflowCancelled(context)
       callbacks.log(t('log.finalize.detectingRelations'))
       try {
         const allChars = await ipc.invoke('db:character-get-all') as CharacterData[]
@@ -440,6 +450,7 @@ export function buildFinalizePostProcessSteps(
           // 仅在确有变更时 upsert；**全量回填所有字段**——此前 payload 只带 7 个字段，
           // 仓库 upsert 是全列覆盖 → gender/age/appearance/.../notes（含 [VOICE:] 块）/currentState 全被清空
           if (chapsChanged || detectedForChar > 0) {
+            throwIfWorkflowCancelled(context)
             await ipc.invoke('db:character-upsert', {
               ...char,
               name: char.name,
@@ -457,6 +468,8 @@ export function buildFinalizePostProcessSteps(
         if (detected > 0) callbacks.log(t('log.finalize.relationsDetected').replace('{count}', String(detected)))
         else callbacks.log(t('log.finalize.noRelations'))
       } catch (e) {
+        throwIfWorkflowCancelled(context)
+        if (isWorkflowAbortError(e)) throw e
         callbacks.log(t('log.finalize.relationDetectFailed').replace('{error}', () => String(e)))
       }
     },
@@ -469,12 +482,13 @@ export function buildFinalizePostProcessSteps(
       label: t('workflow.styleLearning'),
       critical: false,
       dependsOn: ['kb_import'],
-      executor: async (callbacks) => {
+      executor: async (callbacks, context) => {
+        throwIfWorkflowCancelled(context)
         callbacks.log(t('log.finalize.styleLearning'))
         const { AnalyzeWritingStyleCommand } = await import('./analyze-style.command')
         await new AnalyzeWritingStyleCommand().execute({
           step: { id: '', name: '', description: '', status: 'pending' as const, logs: [] },
-          context: { data: {}, cancelled: false },
+          context: context ?? { data: {}, cancelled: false },
           callbacks,
         })
         callbacks.log(t('log.finalize.styleDone'))
@@ -489,16 +503,22 @@ export function buildFinalizePostProcessSteps(
     label: t('workflow.foreshadowScan'),
     critical: false,
     dependsOn: ['kb_import'],
-    executor: async (callbacks: StepCallbacks) => {
+    executor: async (callbacks: StepCallbacks, context?: WorkflowContext) => {
+      throwIfWorkflowCancelled(context)
       try {
         const { scanNewForeshadowing, detectResolvedForeshadowing, loadAllForeshadowing, saveForeshadowing } = await import('../../foreshadowing-manager')
         const all = await loadAllForeshadowing()
         const news = scanNewForeshadowing(draftContent, chapterNumber)
         const done = detectResolvedForeshadowing(draftContent, all, chapterNumber)
         const merged = [...all.filter(i => !done.some(d => d.id === i.id)), ...news]
+        throwIfWorkflowCancelled(context)
         await saveForeshadowing(merged)
         if (news.length) callbacks.log(t('log.finalize.foreshadow').replace('{added}', String(news.length)).replace('{resolved}', String(done.length)))
-      } catch (e) { callbacks.log(t('log.finalize.foreshadowFailed').replace('{error}', () => String(e))) }
+      } catch (e) {
+        throwIfWorkflowCancelled(context)
+        if (isWorkflowAbortError(e)) throw e
+        callbacks.log(t('log.finalize.foreshadowFailed').replace('{error}', () => String(e)))
+      }
     },
   })
 
@@ -509,7 +529,8 @@ export function buildFinalizePostProcessSteps(
     label: t('workflow.contentAudit'),
     critical: false,
     dependsOn: ['kb_import'],
-    executor: async (callbacks: StepCallbacks) => {
+    executor: async (callbacks: StepCallbacks, context?: WorkflowContext) => {
+      throwIfWorkflowCancelled(context)
       // ===== 审计上下文（跨章基线/细纲锚点/豁免词/白名单）——与终审自省共用收集 =====
       const { collectAuditContext, auditText } = await import('../../audit/audit-context')
       const ctx = await collectAuditContext(chapterNumber)
@@ -532,24 +553,30 @@ export function buildFinalizePostProcessSteps(
     label: t('workflow.chapterMemory'),
     critical: false,
     dependsOn: ['kb_import'],
-    executor: async (callbacks: StepCallbacks) => {
+    executor: async (callbacks: StepCallbacks, context?: WorkflowContext) => {
+      throwIfWorkflowCancelled(context)
       try {
         const { generateChapterSummary, computeMemoryFileRange, upsertChapterMemory, ensureVolumeSummary } = await import('../../memory/chapter-memory')
         const volumes = (await ipc.invoke('db:volume-get-all')) as { volumeNumber: number; title: string; chapterStart: number; chapterEnd: number }[]
         const { file } = computeMemoryFileRange(chapterNumber, volumes)
         const modelId = useLLMStore.getState().defaultModelId ?? ''
-        const entry = await generateChapterSummary({ chapterNumber, chapterTitle, draftContent, modelId })
-        const result = await upsertChapterMemory(entry, file)
+        throwIfWorkflowCancelled(context)
+        const entry = await generateChapterSummary({ chapterNumber, chapterTitle, draftContent, modelId }, context)
+        throwIfWorkflowCancelled(context)
+        const result = await upsertChapterMemory(entry, file, context)
         if (result.success) {
           callbacks.log(t('log.finalize.memoryDone').replace('{file}', file))
           // 卷级聚合：upsert 成功后检查所在卷（已闭合卷且卷内章节条目完整 → 生成 volume-NNN.md；否则静默跳过）
           const vol = volumes.find(v => entry.chapterNumber >= v.chapterStart && (v.chapterEnd === 0 || entry.chapterNumber <= v.chapterEnd))
-          if (vol) await ensureVolumeSummary(vol)
+          throwIfWorkflowCancelled(context)
+          if (vol) await ensureVolumeSummary(vol, context)
         } else {
           // F8：模板含 {error} 占位，未 replace 会显示字面量——upsert 失败无错误对象，清空占位
           callbacks.log(t('log.finalize.memoryFailed').replace('{error}', () => ''))
         }
       } catch (e) {
+        throwIfWorkflowCancelled(context)
+        if (isWorkflowAbortError(e)) throw e
         callbacks.log(t('log.finalize.memoryFailed').replace('{error}', () => String(e)))
       }
     },
@@ -561,7 +588,8 @@ export function buildFinalizePostProcessSteps(
     label: t('workflow.voiceAnalysis'),
     critical: false,
     dependsOn: ['kb_import'],
-    executor: async (callbacks: StepCallbacks) => {
+    executor: async (callbacks: StepCallbacks, context?: WorkflowContext) => {
+      throwIfWorkflowCancelled(context)
       callbacks.log(t('log.finalize.analyzingVoice'))
       try {
         const { analyzeCharacterVoice, upsertVoiceProfile } = await import('../../character-voice-analyzer')
@@ -578,6 +606,7 @@ export function buildFinalizePostProcessSteps(
             if (profile.topWords.length > 0) {
               // upsert：剥离旧 VOICE 块 → 合并新旧档案 → 单块写回（防止 notes 膨胀 + 读端取到旧档案）
               const updatedNotes = upsertVoiceProfile(existing.notes || '', profile)
+              throwIfWorkflowCancelled(context)
               await ipc.invoke('db:character-upsert', {
                 ...existing,
                 name: existing.name,
@@ -586,10 +615,15 @@ export function buildFinalizePostProcessSteps(
               } as never)
               analyzed++
             }
-          } catch { /* skip */ }
+          } catch (error) {
+            throwIfWorkflowCancelled(context)
+            if (isWorkflowAbortError(error)) throw error
+          }
         }
         callbacks.log(t('log.finalize.voiceDone').replace('{done}', String(analyzed)).replace('{total}', String(characters.length)))
       } catch (e) {
+        throwIfWorkflowCancelled(context)
+        if (isWorkflowAbortError(e)) throw e
         callbacks.log(t('log.finalize.voiceFailed').replace('{error}', () => String(e)))
       }
     },
@@ -605,7 +639,8 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
     super()
   }
 
-  async execute({ callbacks }: CommandExecuteParams): Promise<void> {
+  async execute({ callbacks, context }: CommandExecuteParams): Promise<void> {
+    throwIfWorkflowCancelled(context)
     const project = useProjectStore.getState().currentProject
     if (!project) throw new Error(t('error.noProject'))
 
@@ -630,7 +665,9 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
 
     // wordCount 用统一"有效字数"口径（汉字 + 英文单词）
     const novelWordCount = computeTextStats(refinedDraftText).novelWordCount
+    throwIfWorkflowCancelled(context)
     await ipc.invoke('db:draft-update-content', dbDraft.id, refinedDraftText, novelWordCount)
+    throwIfWorkflowCancelled(context)
     await ipc.invoke('db:draft-update-status', dbDraft.id, 'finalized', novelWordCount)
 
     // 【重要】：除了写入 DB，对于已定稿的章节需要实体化为物理文件放在根目录，供外部系统读取或备份
@@ -647,9 +684,12 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
       const contentToWrite = titleLine + refinedDraftText.replace(/^#+ .*\n*/, '')
       // L4 S5：写通道返回 {success:false} 而不抛错 —— 不检查就会在物理文件写失败后
       //   仍然往下 log「已写入」（下方 :644），并把失败伪装成成功。
+      throwIfWorkflowCancelled(context)
       const writeRes = await ipc.invoke('fs:write-file', physicalPath, contentToWrite)
       if (!writeRes.success) throw new Error(writeRes.error ?? t('status.unknown'))
     } catch (e) {
+      throwIfWorkflowCancelled(context)
+      if (isWorkflowAbortError(e)) throw e
       callbacks.log(t('log.finalize.fileWriteFailed').replace('{error}', () => String(e)))
     }
 
@@ -669,7 +709,8 @@ export class FinalizeChapterCommand extends BaseWorkflowCommand<void> {
       refinedDraftText,
     )
 
-    await runPostProcessPipeline(project.path, scope, sourceLabel, steps, callbacks)
+    await runPostProcessPipeline(project.path, scope, sourceLabel, steps, callbacks, { context })
+    throwIfWorkflowCancelled(context)
 
     callbacks.log(t('log.finalize.allDone').replace('{chapter}', String(this.params.chapterNumber)))
     useProjectStore.getState().refreshFileTree()

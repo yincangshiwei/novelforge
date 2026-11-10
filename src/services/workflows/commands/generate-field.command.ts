@@ -39,7 +39,8 @@ export class GenerateFieldCommand extends BaseWorkflowCommand<string> {
     super()
   }
 
-  async execute({ callbacks }: CommandExecuteParams): Promise<string> {
+  async execute({ context, callbacks }: CommandExecuteParams): Promise<string> {
+    this.throwIfCancelled(context)
     const project = useProjectStore.getState().currentProject
     if (!project) throw new Error(t('error.noProject'))
 
@@ -53,6 +54,7 @@ export class GenerateFieldCommand extends BaseWorkflowCommand<string> {
         t('field.overwriteWarning').replace('{label}', label),
         { title: t('field.overwriteTitle'), confirmText: t('dialog.confirmOverwrite'), cancelText: t('action.cancel') },
       )
+      this.throwIfCancelled(context)
       if (!ok) {
         callbacks.log(t('log.generateField.cancelled').replace('{label}', label))
         return ''
@@ -62,12 +64,13 @@ export class GenerateFieldCommand extends BaseWorkflowCommand<string> {
     callbacks.log(t('log.generateField.generating').replace('{label}', label))
 
     // 构建上下文摘要（已填写的字段作为参考）
-    const context = this.buildContext(config)
+    const configContext = this.buildContext(config)
     // 构建针对性 prompt
-    const prompt = this.buildPrompt(config, context)
+    const prompt = this.buildPrompt(config, configContext)
     const systemPrompt = t('role.configDesigner')
 
-    const result = await this.callLLM(prompt, systemPrompt, callbacks, { purpose: 'architecture_gen' })
+    const result = await this.callLLM(prompt, systemPrompt, callbacks, { purpose: 'architecture_gen' }, context)
+    this.throwIfCancelled(context)
     const cleanResult = this.stripThinkingTags(result).trim()
 
     if (!cleanResult) {
@@ -80,6 +83,7 @@ export class GenerateFieldCommand extends BaseWorkflowCommand<string> {
     snapshotNovelConfig()
     updateNovelConfig({ [this.fieldKey]: cleanResult })
     await saveProject()
+    this.throwIfCancelled(context)
     callbacks.log(t('log.generateField.saved').replace('{label}', label))
     toast.show({
       type: 'ai',

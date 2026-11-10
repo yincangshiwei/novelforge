@@ -61,6 +61,12 @@ export abstract class BaseWorkflowCommand<TResult = string> {
    * - 传 purpose → getModelForPurpose(purpose)：用户配置了对应层路由则用路由模型
    * - 不传 purpose → 走 standard 层（default 用途）；路由未配置 → 用户默认模型
    */
+  protected throwIfCancelled(context?: WorkflowContext): void {
+    if (context?.cancelled || context?.signal?.aborted) {
+      throw new Error(t('error.workflowCancelled'))
+    }
+  }
+
   protected async callLLM(
     prompt: string,
     systemPrompt: string,
@@ -68,6 +74,7 @@ export abstract class BaseWorkflowCommand<TResult = string> {
     options?: { responseFormat?: { type: string }; thinking?: boolean; cacheScope?: CacheScope; staticContext?: string; purpose?: CallPurpose; temperature?: number },
     context?: WorkflowContext
   ): Promise<string> {
+    this.throwIfCancelled(context)
     const llmStore = useLLMStore.getState()
     if (!llmStore.defaultModelId) throw new Error(t('error.noDefaultModel'))
 
@@ -98,24 +105,34 @@ export abstract class BaseWorkflowCommand<TResult = string> {
       let streamRequestId = ''
       this.lastStreamText = ''
 
-      // 取消监听：轮询 context.cancelled，主动中断 LLM 流
+      let settled = false
+      let cancellationRequested = false
       let cancelCheckTimer: ReturnType<typeof setInterval> | null = null
-      if (context) {
-        cancelCheckTimer = setInterval(() => {
-          if (context.cancelled && streamRequestId) {
-            clearInterval(cancelCheckTimer!)
-            cancelCheckTimer = null
-            llmStore.cancelGeneration(streamRequestId).catch(() => { })
-            reject(new Error(t('error.workflowCancelled')))
-          }
-        }, 200)
-      }
-
+      const isCancelled = () => !!(context?.cancelled || context?.signal?.aborted)
       const cleanup = () => {
         if (cancelCheckTimer) {
           clearInterval(cancelCheckTimer)
           cancelCheckTimer = null
         }
+        context?.signal?.removeEventListener('abort', onAbort)
+      }
+      const onAbort = () => {
+        if (settled) return
+        cancellationRequested = true
+        settled = true
+        cleanup()
+        if (streamRequestId) llmStore.cancelGeneration(streamRequestId).catch(() => { })
+        reject(new Error(t('error.workflowCancelled')))
+      }
+      context?.signal?.addEventListener('abort', onAbort, { once: true })
+      if (context) {
+        cancelCheckTimer = setInterval(() => {
+          if (isCancelled()) onAbort()
+        }, 200)
+      }
+      if (isCancelled()) {
+        onAbort()
+        return
       }
 
       const logLLMCall = (success: boolean, errorMessage?: string, usage?: { promptTokens: number; completionTokens: number; totalTokens: number; cachedTokens?: number }) => {
@@ -166,13 +183,17 @@ export abstract class BaseWorkflowCommand<TResult = string> {
         {
           onChunk: (chunk) => {
             // 取消后不再追加输出
-            if (context?.cancelled) return
+            if (isCancelled()) onAbort()
+            if (settled) return
             fullContent += chunk
             // 保留含 <think> 的流式原文（返回值仍是清洗后文本）——供步骤产出展示思考（issue #34）
             this.lastStreamText = fullContent
             callbacks.appendText(chunk)
           },
           onDone: (text, usage) => {
+            if (isCancelled()) onAbort()
+            if (settled) return
+            settled = true
             cleanup()
             // 费用追踪（真实缓存命中 = API 返回 cachedTokens > 0，非"启用了缓存机制"）
             if (usage && model) {
@@ -182,19 +203,14 @@ export abstract class BaseWorkflowCommand<TResult = string> {
                 .replace('{cost}', cost.totalCost.toFixed(4))
                 .replace('{cacheStatus}', cost.cached ? t('log.llm.cacheHit') : t('log.llm.fullPrice')))
               // 记录到全局用量 Store
-              import('../../../stores/usage-store').then(m =>
+              import('../../../stores/usage-store').then(m => {
+                if (isCancelled()) return
                 m.useUsageStore.getState().recordCall({
                   model, promptTokens: usage.promptTokens,
                   completionTokens: usage.completionTokens,
                   cacheHit,
                 })
-              ).catch(() => {})
-            }
-            // 取消后不 resolve，让 reject 生效
-            if (context?.cancelled) {
-              logLLMCall(false, t('error.workflowCancelled'))
-              reject(new Error(t('error.workflowCancelled')))
-              return
+              }).catch(() => {})
             }
             // 更新 token 用量（如果 provider 提供了 usage）
             if (usage) {
@@ -208,6 +224,9 @@ export abstract class BaseWorkflowCommand<TResult = string> {
             resolve(cleaned)
           },
           onError: (err) => {
+            if (isCancelled()) onAbort()
+            if (settled) return
+            settled = true
             cleanup()
             logLLMCall(false, err || t('log.render.llmStreamFailed'))
             reject(new Error(err || t('log.render.llmStreamFailed')))
@@ -217,14 +236,16 @@ export abstract class BaseWorkflowCommand<TResult = string> {
         { ...options, temperature }
       ).then(reqId => {
         streamRequestId = reqId
-        // 如果在 generateStream 返回前已经取消
-        if (context?.cancelled) {
+        if (isCancelled() && !settled) {
+          onAbort()
+          return
+        }
+        if (cancellationRequested && reqId) {
           llmStore.cancelGeneration(reqId).catch(() => { })
-          cleanup()
-          logLLMCall(false, t('error.workflowCancelled'))
-          reject(new Error(t('error.workflowCancelled')))
         }
       }).catch(err => {
+        if (settled) return
+        settled = true
         cleanup()
         logLLMCall(false, String(err))
         reject(err)
