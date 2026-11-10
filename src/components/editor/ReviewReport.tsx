@@ -116,7 +116,7 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
     setActionError('')
     setShowRefineDialog(false)
     try {
-      const { useWorkflowStore } = await import('../../stores/workflow-store')
+      const { startWithReceipt } = await import('../../services/workflows/workflow-starter')
       const { createRefineFromReviewWorkflow, parseDraftMeta } = await import('../../services/workflows/chapter-workflow')
       const { ipc } = await import('../../services/ipc-client')
       const { useEditorStore } = await import('../../stores/editor-store')
@@ -129,7 +129,7 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
       if (!activeIssues.length) return
       if (chosen) locateReviewEdits(full.content, chosen)
       const filteredReport = JSON.stringify({ ...JSON.parse(reportText), items: activeIssues })
-      useWorkflowStore.getState().startWorkflow(createRefineFromReviewWorkflow({
+      await startWithReceipt(createRefineFromReviewWorkflow({
         chapterNumber: meta.chapterNumber,
         chapterTitle: meta.chapterTitle || t('chapter.nLabel').replace('{n}', String(meta.chapterNumber)),
         draftPath,
@@ -138,12 +138,33 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
         reviewFileName: '',
         localOnly: !!chosen,
         userRefinePrompt: userRefinePrompt.trim() || undefined,
-      }), false)
+      }))
     } catch (error) {
       setActionError(t('review.fixError').replace('{error}', String(error)))
     } finally {
       setProcessing(false)
     }
+  }
+
+  const reviewAgain = async () => {
+    if (!draftPath || processing) return
+    setProcessing(true)
+    setActionError('')
+    try {
+      const { parseDraftMeta, createReviewOnlyWorkflow } = await import('../../services/workflows/chapter-workflow')
+      const { startWithReceipt } = await import('../../services/workflows/workflow-starter')
+      const { ipc } = await import('../../services/ipc-client')
+      const { useEditorStore } = await import('../../stores/editor-store')
+      if (useEditorStore.getState().tabs.some(tab => tab.filePath === draftPath && tab.dirty)) throw new Error(t('tool.draftDirty'))
+      const meta = await parseDraftMeta(draftPath)
+      if (!meta) throw new Error(t('error.noBaseDraft'))
+      const full = await ipc.invoke('db:draft-get-full', meta.id)
+      if (!full?.content?.trim()) throw new Error(t('error.noDraft'))
+      await startWithReceipt(createReviewOnlyWorkflow({ chapterNumber: meta.chapterNumber, chapterTitle: meta.chapterTitle || '', draftPath, draftContent: full.content }))
+      setActionError(t('review.started'))
+    } catch (error) {
+      setActionError(t('error.reviewFailed').replace('{error}', String(error)))
+    } finally { setProcessing(false) }
   }
 
   const SeverityIcon = ({ severity }: { severity: string }) => {
@@ -338,7 +359,12 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
       </div>
         {canRefine && (
           <div className="shrink-0 border-t border-[var(--color-border)] bg-[var(--color-bg-elevated)] px-4 py-3 shadow-[0_-4px_12px_rgba(0,0,0,0.08)] z-10">
-            {actionError && <p role="alert" className="max-w-2xl mx-auto mb-2 text-sm text-[var(--color-error)]">{actionError}</p>}
+            {actionError && (
+              <div className="max-w-2xl mx-auto mb-2 flex items-center gap-2">
+                <p role="alert" className="flex-1 text-sm text-[var(--color-error)]">{actionError}</p>
+                <Button size="sm" variant="outline" disabled={processing} onClick={() => void reviewAgain()}>{t('review.reviewAgain')}</Button>
+              </div>
+            )}
             <div className="max-w-2xl mx-auto flex items-center justify-center gap-3">
               <Button variant="ai" className="flex-1 min-w-0" disabled={processing || !rawIssues.some(item => selected.has(reviewIssueKey(item)) && !ignored.has(reviewIssueKey(item)))}
                 onClick={() => void doRefineFromReview(rawIssues.filter(item => selected.has(reviewIssueKey(item)) && !ignored.has(reviewIssueKey(item))))}>

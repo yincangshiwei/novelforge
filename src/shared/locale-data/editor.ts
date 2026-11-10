@@ -6,6 +6,9 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const editorTexts = {
+  'review.started': { 'zh-CN': 'AI审稿已启动，请查看任务面板中的进度。', 'en-US': 'AI review started. See progress in Tasks.', 'ru-RU': 'Рецензия запущена. Смотрите задачи.' },
+  'review.reviewAgain': { 'zh-CN': '重新AI审稿', 'en-US': 'Review again', 'ru-RU': 'Повторить рецензию' },
+  'review.hashUnavailable': { 'zh-CN': '当前运行环境无法计算正文指纹，审稿未启动。请检查应用运行环境。', 'en-US': 'Content fingerprint unavailable; review not started. Check the application runtime.', 'ru-RU': 'Отпечаток текста недоступен; рецензия не запущена.' },
   'review.localFixSystem': { 'zh-CN': '你是精准小说编辑。只修改JSON中excerpt的内容以解决指定issue。前后context只供参考，不得输出或修改。保留剧情事实、人物声音与必要伏笔，不添加新剧情。不扩写其他内容。只输出替换片段纯文本，不要解释或Markdown。', 'en-US': 'Edit only the JSON excerpt to address its issue. Context is reference only; never output it. Preserve plot facts, voice and clues. Return only replacement prose, no commentary or Markdown.', 'ru-RU': 'Правьте только excerpt по issue. Контекст не выводить. Сохраняйте сюжет, голос и подсказки. Только заменяющий текст, без пояснений.' },
   'review.fixOne': { 'zh-CN': 'AI修复此项', 'en-US': 'Fix this issue', 'ru-RU': 'Исправить пункт' },
   'review.fixSelected': { 'zh-CN': 'AI修复选中项（精确局部）', 'en-US': 'Fix selected excerpts', 'ru-RU': 'Исправить выбранные фрагменты' },

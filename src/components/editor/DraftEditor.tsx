@@ -85,7 +85,9 @@ export default function DraftEditor({ filePath, content }: Props) {
 
   const activeRuns = useWorkflowStore(s => s.activeRuns)
   const activeChapterRun = activeRuns.find(r =>
-    r.type === 'chapter_creation' && meta && (r.title.includes(`第${meta.chapterNumber}章`) || r.title.includes(`第 ${meta.chapterNumber} 章`))
+    r.type === 'chapter_creation' && (r.status === 'running' || r.status === 'paused') && meta
+      && (Number(r.rehydrateParams?.chapterNumber) === meta.chapterNumber
+        || r.title.includes(`第${meta.chapterNumber}章`) || r.title.includes(`第 ${meta.chapterNumber} 章`))
   )
   const isChapterBusy = !!activeChapterRun
 
@@ -201,18 +203,22 @@ export default function DraftEditor({ filePath, content }: Props) {
 
   /** AI 审稿 */
   const doReview = async () => {
-    if (!currentProject || !meta) return
     try {
-      const { useWorkflowStore } = await import('../../stores/workflow-store')
+      if (!currentProject) throw new Error(t('error.noProject'))
+      if (!meta) throw new Error(t('error.noBaseDraft'))
+      if (useEditorStore.getState().tabs.some(tab => tab.filePath === filePath && tab.dirty)) throw new Error(t('tool.draftDirty'))
+      const { startWithReceipt } = await import('../../services/workflows/workflow-starter')
       const { createReviewOnlyWorkflow } = await import('../../services/workflows/chapter-workflow')
       const body = await readDraftBody(filePath)
-      useWorkflowStore.getState().startWorkflow(createReviewOnlyWorkflow({
+      if (!body.trim()) throw new Error(t('error.noDraft'))
+      await startWithReceipt(createReviewOnlyWorkflow({
         chapterNumber: meta.chapterNumber,
         chapterTitle: meta.chapterTitle ?? t('editor.unknownTitle'),
         draftPath: filePath,
         draftContent: body,
         reviewFocus: getReviewDims(t).filter(d => reviewDims[d.key]).map(d => d.label).join('、') || undefined,
-      }), false)
+      }))
+      toast.info(t('review.started'))
     } catch (e) {
       toast.error(t('error.reviewFailed').replace('{error}', String(e)))
     }

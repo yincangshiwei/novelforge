@@ -72,7 +72,7 @@ function getWorkflowDisplayName(workflow: string): string {
  * run 一开始就 resolve runId，不等整个 run 跑完。run 体晚到的 rejection 在此吞掉
  * （run 失败已由 workflow-store 的状态呈现），避免 unhandledrejection。
  */
-function startWithReceipt(definition: WorkflowDefinition, context?: ToolExecutionContext): Promise<string> {
+export function startWithReceipt(definition: WorkflowDefinition, context?: ToolExecutionContext): Promise<string> {
   checkStartup(context)
   return new Promise<string>((resolve, reject) => {
     useWorkflowStore.getState().startWorkflow(definition, false, {

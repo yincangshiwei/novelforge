@@ -3,7 +3,8 @@ import { parseReport, type ReviewIssue } from '../components/editor/review-repor
 import { t } from '../shared/locale'
 
 export async function reviewContentHash(content: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content))
+  if (!globalThis.crypto?.subtle?.digest) throw new Error(t('review.hashUnavailable'))
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(content))
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
 }
 

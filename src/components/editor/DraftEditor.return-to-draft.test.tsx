@@ -79,6 +79,14 @@ afterEach(() => {
 })
 
 describe('数据库正式稿退回草稿 UI', () => {
+  it('失败或完成的任务记录不锁住重新审稿按钮', async () => {
+    mock.status = 'draft'
+    useWorkflowStore.setState({ activeRuns: [{ id: 'failed-review', type: 'chapter_creation', title: '第3章 审稿', status: 'failed', rehydrateParams: { chapterNumber: 3 }, steps: [] } as never] })
+    await render('vela://draft/42')
+    const review = [...container.querySelectorAll('button')].find(b => b.textContent?.includes('AI 审稿') || b.textContent?.includes('AI审稿'))
+    expect(review).toBeTruthy()
+    expect(review!.disabled).toBe(false)
+  })
   it.each(['vela://draft/42', 'vela://manuscript/42'])('%s 使用状态编辑器；只读期间禁止快捷键/自动保存', async path => {
     await render(path)
     expect(button('退回草稿')).toBeTruthy()

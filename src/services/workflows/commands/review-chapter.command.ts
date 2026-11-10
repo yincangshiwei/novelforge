@@ -25,6 +25,8 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
 
     const draft = this.params.draftContent
     if (!draft) throw new Error(t('error.noDraft'))
+    const { reviewContentHash } = await import('../../review-actions')
+    const baseContentHash = await reviewContentHash(draft)
 
     callbacks.log(t('log.review.starting'))
     callbacks.log(t('log.review.loadingSettings'))
@@ -173,7 +175,7 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
       ...mergeAiFlavorReview(parsedResult, flavorAudit, draft),
       baseDraftId: baseDraft.id,
       baseVersion,
-      baseContentHash: await (await import('../../review-actions')).reviewContentHash(draft),
+      baseContentHash,
     }
     await ipc.invoke('db:review-create', {
       baseDraftId: baseDraft.id,
