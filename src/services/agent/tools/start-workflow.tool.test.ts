@@ -3,6 +3,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { startWorkflowTool } from './start-workflow.tool'
 import { startChapterWorkflow, startBlueprintWorkflow, WorkflowStartError } from '../../workflows/workflow-starter'
 import { t } from '../../../shared/locale'
+import { useProjectStore } from '../../../stores/project-store'
+import { useWorkflowStore, type WorkflowRun } from '../../../stores/workflow-store'
+import { executeTool, restoreUnknownExecutions } from '../tool-execution'
 
 // 工具层触发由 workflow-starter 驱动——mock 掉全部启动入口（仅保留 WorkflowStartError 等真实导出）
 vi.mock('../../workflows/workflow-starter', async (importOriginal) => {
@@ -16,6 +19,44 @@ vi.mock('../../workflows/workflow-starter', async (importOriginal) => {
 })
 
 const mockStartChapter = vi.mocked(startChapterWorkflow)
+
+describe('start_workflow 未知启动核对', () => {
+  it.each(['started', 'failed', 'missing'] as const)('归档恢复按原操作ID核对 %s 状态', async startupState => {
+    vi.clearAllMocks()
+    const previousProject = useProjectStore.getState().currentProject
+    const previousRuns = useWorkflowStore.getState()
+    const scope = crypto.randomUUID()
+    const operationId = crypto.randomUUID()
+    const args = { workflow: 'generate_blueprint', chapter_number: 1, chapter_end: 368 }
+    const context = { signal: new AbortController().signal, scope, turnId: 'retry', step: 1, callId: 'retry', operationId: crypto.randomUUID() }
+    useProjectStore.setState({ currentProject: { ...previousProject, path: scope, novelConfig: { ...previousProject?.novelConfig, totalChapters: 1632 } } as never })
+    const run = { id: 'original-run', type: 'directory', title: '生成蓝图（第 1–368 章）', status: 'failed', startupState,
+      operationId, scope, rehydrateParams: { mode: 'append', startChapter: 1, count: 368 }, steps: [{ status: 'pending', logs: [] }] } as unknown as WorkflowRun
+    useWorkflowStore.setState({ activeRuns: [], history: startupState === 'missing' ? [] : [run] })
+    restoreUnknownExecutions([{ id: operationId, toolName: 'start_workflow', arguments: args, status: 'failed',
+      receipt: { turnId: 'original', callId: operationId, step: 1, toolName: 'start_workflow', target: 'workflow:generate_blueprint:1:368', outcome: 'unknown', verified: false } }], scope)
+    vi.mocked(startBlueprintWorkflow).mockResolvedValue({ runId: 'new-run', displayName: '生成蓝图', chapterNumber: 1, chapterEnd: 368 })
+    try {
+      if (startupState === 'missing') {
+        await expect(executeTool(startWorkflowTool, args, context, 1000)).rejects.toMatchObject({ unknown: true })
+        expect(startBlueprintWorkflow).not.toHaveBeenCalled()
+      } else {
+        const result = await executeTool(startWorkflowTool, args, context, 1000)
+        expect(result.success).toBe(true)
+        if (startupState === 'started') {
+          expect(result.content).toContain('未重复执行')
+          expect(result.artifacts?.[0].metadata?.runId).toBe('original-run')
+          expect(startBlueprintWorkflow).not.toHaveBeenCalled()
+        } else {
+          expect(startBlueprintWorkflow).toHaveBeenCalledOnce()
+        }
+      }
+    } finally {
+      useProjectStore.setState({ currentProject: previousProject })
+      useWorkflowStore.setState({ activeRuns: previousRuns.activeRuns, history: previousRuns.history })
+    }
+  })
+})
 
 describe('start_workflow 取消上下文', () => {
   it('预取消不启动；区间在首个启动回执后取消不得启动后续章节', async () => {
@@ -156,12 +197,31 @@ describe('start_workflow 区间（chapter_end，2026-10-02 方案 B 配套）', 
     expect(mockStartChapter).toHaveBeenCalledTimes(2) // 5 已启动、6 失败即止（7 未触达）
   })
 
-  it('非章节工作流携带 chapter_end → 忽略（不报错，按原路径执行）', async () => {
-    vi.mocked(startBlueprintWorkflow).mockResolvedValue({ runId: 'rb', displayName: t('tool.wfBlueprint') })
+  it('蓝图区间 1–368 完整透传，不受正文的20章限制，回执包含实际范围', async () => {
+    vi.mocked(startBlueprintWorkflow).mockResolvedValue({ runId: 'rb', displayName: t('tool.wfBlueprint'), chapterNumber: 1, chapterEnd: 368 })
 
-    const r = await startWorkflowTool.execute({ workflow: 'generate_blueprint', chapter_end: 9 })
+    const r = await startWorkflowTool.execute({ workflow: 'generate_blueprint', chapter_number: 1, chapter_end: 368 })
 
+    expect(startBlueprintWorkflow).toHaveBeenCalledWith(undefined, { chapterNumber: 1, chapterEnd: 368 })
     expect(r.success).toBe(true)
+    expect(r.content).toContain('1–368')
+    expect(r.artifacts?.[0].metadata).toEqual({ runId: 'rb', workflow: 'generate_blueprint', chapterNumber: 1, chapterEnd: 368 })
+  })
+
+  it('蓝图未传起始章及null参数均透传为undefined，由启动器解析范围', async () => {
+    vi.mocked(startBlueprintWorkflow).mockResolvedValue({ runId: 'rb', displayName: t('tool.wfBlueprint'), chapterNumber: 1, chapterEnd: 9 })
+    await startWorkflowTool.execute({ workflow: 'generate_blueprint', chapter_number: null, chapter_end: 9 })
+    expect(startBlueprintWorkflow).toHaveBeenLastCalledWith(undefined, { chapterNumber: undefined, chapterEnd: 9 })
+    await startWorkflowTool.execute({ workflow: 'generate_blueprint', chapter_number: null, chapter_end: null })
+    expect(startBlueprintWorkflow).toHaveBeenLastCalledWith(undefined, { chapterNumber: undefined, chapterEnd: undefined })
+  })
+
+  it('蓝图启动器拒绝非法范围时，工具返回失败而非成功回执', async () => {
+    vi.mocked(startBlueprintWorkflow).mockRejectedValueOnce(new WorkflowStartError('ERR_GUARD', t('tool.wfBlueprintRangeInvalid')))
+    const r = await startWorkflowTool.execute({ workflow: 'generate_blueprint', chapter_number: 9, chapter_end: 1 })
+    expect(r.success).toBe(false)
+    expect(r.error).toBe(t('tool.wfBlueprintRangeInvalid'))
+    expect(r.artifacts).toBeUndefined()
   })
 
   it('区间过大（> 20 章）→ wfRangeTooLarge（不启动任何工作流；I1）', async () => {

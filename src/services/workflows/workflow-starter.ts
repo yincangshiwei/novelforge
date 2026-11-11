@@ -140,8 +140,20 @@ export async function startChapterWorkflow(
 // ===== 蓝图/架构工作流入口 =====
 
 /** 启动蓝图（目录）工作流——guard 失败 throw ERR_GUARD */
-export async function startBlueprintWorkflow(context?: ToolExecutionContext): Promise<{ runId: string; displayName: string }> {
+export async function startBlueprintWorkflow(
+  context?: ToolExecutionContext,
+  range: { chapterNumber?: number; chapterEnd?: number } = {},
+): Promise<{ runId: string; displayName: string; chapterNumber: number; chapterEnd: number }> {
   context = captureContext(context)
+  const totalChapters = useProjectStore.getState().currentProject?.novelConfig.totalChapters
+  const hasRange = range.chapterNumber != null || range.chapterEnd != null
+  const chapterNumber = range.chapterNumber ?? 1
+  const chapterEnd = range.chapterEnd ?? (hasRange ? chapterNumber : totalChapters)
+  if (!Number.isInteger(chapterNumber) || typeof chapterEnd !== 'number' || !Number.isInteger(chapterEnd)
+    || chapterNumber < 1 || chapterEnd < chapterNumber || typeof totalChapters !== 'number' || !Number.isInteger(totalChapters)
+    || chapterEnd > totalChapters) {
+    throw new WorkflowStartError('ERR_GUARD', t('tool.wfBlueprintRangeInvalid'))
+  }
   const displayName = getWorkflowDisplayName('generate_blueprint')
   const { guardDirectoryGeneration } = await import('./workflow-guards')
   checkStartup(context)
@@ -152,8 +164,13 @@ export async function startBlueprintWorkflow(context?: ToolExecutionContext): Pr
   }
   const { createDirectoryWorkflow } = await import('./directory-workflow')
   checkStartup(context)
-  const runId = await startWithReceipt(createDirectoryWorkflow({ mode: 'full' }), context)
-  return { runId, displayName }
+  const definition = createDirectoryWorkflow({
+    mode: hasRange ? 'append' : 'full',
+    startChapter: chapterNumber,
+    count: chapterEnd - chapterNumber + 1,
+  })
+  const runId = await startWithReceipt(definition, context)
+  return { runId, displayName, chapterNumber, chapterEnd }
 }
 
 /** 启动架构生成工作流——guard 失败 throw ERR_GUARD */

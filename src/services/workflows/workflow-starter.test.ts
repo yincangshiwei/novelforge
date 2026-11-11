@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { WorkflowStartError, startChapterWorkflow } from './workflow-starter'
+import { WorkflowStartError, startChapterWorkflow, startBlueprintWorkflow } from './workflow-starter'
 import { useProjectStore } from '../../stores/project-store'
 import { useWorkflowStore } from '../../stores/workflow-store'
 import { t } from '../../shared/locale'
@@ -16,6 +16,8 @@ let draftGetFinalizedResult: unknown
 
 const mockInvoke = vi.fn(async (ch: string) => {
   switch (ch) {
+    case 'db:project-core-get':
+      return { premise: 'story '.repeat(20) }
     case 'db:blueprint-get-all':
       return blueprintGetAll
     case 'db:character-get-all':
@@ -72,6 +74,42 @@ beforeEach(() => {
     },
   })
   useWorkflowStore.setState({ startWorkflow: startWorkflowMock as never })
+})
+
+describe('蓝图工作流范围', () => {
+  beforeEach(() => {
+    const project = useProjectStore.getState().currentProject!
+    useProjectStore.setState({ currentProject: { ...project, novelConfig: { ...project.novelConfig, totalChapters: 1632 } } })
+  })
+
+  it.each([
+    [{ chapterNumber: 1, chapterEnd: 368 }, 1, 368, 'append'],
+    [{ chapterNumber: 188, chapterEnd: 368 }, 188, 368, 'append'],
+    [{ chapterEnd: 368 }, 1, 368, 'append'],
+    [{ chapterNumber: 368 }, 368, 368, 'append'],
+    [{}, 1, 1632, 'full'],
+  ] as const)('将 %j 转换为明确范围并持久化', async (range, start, end, mode) => {
+    const result = await startBlueprintWorkflow(undefined, range)
+    expect(result).toMatchObject({ runId: 'run-1-test', chapterNumber: start, chapterEnd: end })
+    expect(startWorkflowMock.mock.calls[0][0]).toMatchObject({
+      type: 'directory',
+      title: t('tool.wfBlueprintRangeTitle').replace('{start}', String(start)).replace('{end}', String(end)),
+      rehydrateParams: { mode, startChapter: start, count: end - start + 1 },
+    })
+  })
+
+  it.each([
+    { chapterNumber: 0, chapterEnd: 368 },
+    { chapterNumber: 1.5, chapterEnd: 368 },
+    { chapterNumber: 1, chapterEnd: 368.5 },
+    { chapterNumber: 368, chapterEnd: 1 },
+    { chapterNumber: 1, chapterEnd: 1633 },
+    { chapterNumber: NaN },
+    { chapterEnd: Infinity },
+  ])('拒绝非法范围 %j，不启动任务', async range => {
+    await expect(startBlueprintWorkflow(undefined, range)).rejects.toThrow(t('tool.wfBlueprintRangeInvalid'))
+    expect(startWorkflowMock).not.toHaveBeenCalled()
+  })
 })
 
 describe('workflow-starter', () => {

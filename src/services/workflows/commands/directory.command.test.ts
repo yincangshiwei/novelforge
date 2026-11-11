@@ -28,6 +28,28 @@ import { GenerateDirectoryCommand } from './directory.command'
 const callbacks = { log: vi.fn(), setProgress: vi.fn(), appendText: vi.fn() }
 
 describe('蓝图取消与已保存批次恢复', () => {
+  it('全书1632章但任务限定1–368，最后一批止于368且不会调用369章', async () => {
+    h.totalChapters = 1632
+    h.callLLM.mockReset().mockResolvedValue('batch')
+    h.save.mockReset()
+    h.parse.mockReset().mockImplementation((_text: string, start: number, end: number) =>
+      Array.from({ length: Math.min(12, end - start + 1) }, (_, i) => ({ chapterNumber: start + i, title: 'chapter', keyEvents: '' })))
+    h.n.mockClear()
+    h.m.mockClear()
+    callbacks.log.mockClear()
+    try {
+      const context: WorkflowContext = { data: { architecture: 'world' }, cancelled: false }
+      const result = await new GenerateDirectoryCommand({ mode: 'append', startChapter: 1, count: 368 }).execute({ step: {}, context, callbacks })
+      expect(context.data.directoryStart).toBe(1)
+      expect(context.data.directoryEnd).toBe(368)
+      expect(callbacks.log).toHaveBeenCalledWith(expect.stringContaining('1–368'))
+      expect(result).toHaveLength(368)
+      expect(h.n).toHaveBeenLastCalledWith(361)
+      expect(h.m).toHaveBeenLastCalledWith(368)
+      expect(h.callLLM).toHaveBeenCalledTimes(31)
+      expect(h.save.mock.calls.flatMap(call => call[0]).every(b => b.chapterNumber <= 368)).toBe(true)
+    } finally { h.totalChapters = 3 }
+  })
   it('长篇首批提示词明确限定范围，流失败保留章节与原始原因', async () => {
     h.totalChapters = 1632
     h.n.mockClear()

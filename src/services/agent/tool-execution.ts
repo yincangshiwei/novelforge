@@ -14,6 +14,8 @@ const unresolved = new Map<string, { context: ToolExecutionContext; args: string
 export function restoreUnknownExecutions(calls: readonly ToolCallInfo[], scope: string, conversationId?: string): void {
   for (const call of calls) {
     if (call.receipt?.outcome !== 'unknown') continue
+    if (call.error?.includes('先前写入状态未知，已阻止重复写入；必须核对实际状态后再处理')
+      || call.error?.includes('写入核对已中断或超时，执行状态仍未知，禁止重试')) continue
     const key = `${scope}:${call.toolName}:${call.receipt.target}`
     if (!unresolved.has(key)) unresolved.set(key, {
       args: canonicalJson(call.arguments),
@@ -40,6 +42,7 @@ export async function executeTool(
         tool.reconcile(JSON.parse(previous.args), {
           ...previous.context, signal: checking.signal, toolName: tool.name,
           callId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+          originalOperationId: previous.context.operationId,
         }), checking.signal,
       ) : undefined)
     } catch {

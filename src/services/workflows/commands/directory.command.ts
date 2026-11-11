@@ -133,7 +133,10 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
         if (!template) throw new Error(t('error.templateMissing'))
 
         // 构建上下文章节列表（清洗 + 截断，防止 prompt 膨胀）
-        const prevAll = [...existingBlueprints, ...newBlueprints]
+        const prevAll = Array.from(new Map([...existingBlueprints, ...newBlueprints]
+          .filter(c => c.chapterNumber < cursor)
+          .map(c => [c.chapterNumber, c])).values())
+          .sort((a, b) => a.chapterNumber - b.chapterNumber)
         // 最多取最近 20 章，防止超出上下文窗口
         const chapterList = prevAll.slice(-20).map(c =>
           t('inject.directory.chapterLine')

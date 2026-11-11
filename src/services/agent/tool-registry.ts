@@ -79,6 +79,7 @@ export interface ToolExecutionContext {
   callId: string
   step: number
   operationId: string
+  originalOperationId?: string
   scope?: string
   toolName?: string
   conversationId?: string

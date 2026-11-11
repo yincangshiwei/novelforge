@@ -67,14 +67,22 @@ export const startWorkflowTool = buildAgentTool({
     const start = Number(args.chapter_number)
     const end = Number(args.chapter_end)
     if (ranged && (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end - start + 1 > MAX_RANGE_CHAPTERS)) return undefined
-    const operations = ranged ? Array.from({ length: end - start + 1 }, (_, i) => `${context.operationId}:chapter:${start + i}`) : [context.operationId]
+    const originalOperationId = context.originalOperationId ?? context.operationId
+    const operations = ranged ? Array.from({ length: end - start + 1 }, (_, i) => `${originalOperationId}:chapter:${start + i}`) : [originalOperationId]
     const runs = operations.map(id => findWorkflowOperation(id, context.scope))
+    if (runs.every(run => run && ['cancelled', 'failed'].includes(run.startupState ?? '')
+      && run.steps.every(step => step.status === 'pending' && step.logs.length === 0))) {
+      return { success: false, executionState: 'not_committed', content: '已核验原工作流启动失败，未执行任何步骤，可重新发起。' }
+    }
     if (runs.some(run => !run || run.startupState !== 'started')) return undefined
     return {
       success: true,
       executionState: 'committed',
-      content: '已核验原操作对应工作流启动记录；不重复启动。\n' + runs.map((run, index) => `${ranged ? `第${start + index}章：` : ''}${run!.id}，状态=${run!.status}`).join('\n'),
-      artifacts: runs.map((run, index) => ({ type: 'workflow_started' as const, name: run!.title, metadata: { runId: run!.id, workflow, operationId: run!.operationId, status: run!.status, ...(ranged ? { chapterNumber: start + index } : {}) } })),
+      content: '已核验原操作对应工作流启动记录；不重复启动。\n' + runs.map((run, index) => `${ranged ? `第${start + index}章：` : ''}${run!.title}，${run!.id}，状态=${run!.status}`).join('\n'),
+      artifacts: runs.map((run, index) => ({ type: 'workflow_started' as const, name: run!.title, metadata: { runId: run!.id, workflow, operationId: run!.operationId, status: run!.status, ...(workflow === 'generate_blueprint' ? {
+        chapterNumber: run!.rehydrateParams?.startChapter ?? 1,
+        chapterEnd: Number(run!.rehydrateParams?.startChapter ?? 1) + Number(run!.rehydrateParams?.count ?? project.novelConfig.totalChapters) - 1,
+      } : ranged ? { chapterNumber: start + index } : {}) } })),
       persistence: { target: `workflow:${workflow}`, verified: true, projectPath: project.path },
     }
   },
@@ -203,12 +211,14 @@ export const startWorkflowTool = buildAgentTool({
           }
         }
         case 'generate_blueprint': {
-          const result = await startBlueprintWorkflow(context)
+          const result = await startBlueprintWorkflow(context, { chapterNumber, chapterEnd })
+          const rangeTitle = t('tool.wfBlueprintRangeTitle')
+            .replace('{start}', String(result.chapterNumber)).replace('{end}', String(result.chapterEnd))
           return {
             success: true,
             executionState: 'committed',
-            content: t('tool.workflowStartedNoChapter').replace('{name}', result.displayName),
-            artifacts: [{ type: 'workflow_started', name: result.displayName, metadata: { runId: result.runId, workflow } }],
+            content: t('tool.workflowStartedNoChapter').replace('{name}', rangeTitle),
+            artifacts: [{ type: 'workflow_started', name: rangeTitle, metadata: { runId: result.runId, workflow, chapterNumber: result.chapterNumber, chapterEnd: result.chapterEnd } }],
           }
         }
         case 'generate_architecture': {

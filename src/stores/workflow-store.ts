@@ -13,6 +13,7 @@ import { CLOSE_DRAIN_TIMEOUT_MS, waitForCloseResult } from '../shared/close-dead
 import { isCloseCoordinating } from '../shared/close-coordinator'
 import { sanitizeCheckpointData, cleanupMessageText } from '../services/agent/conversation-recovery'
 import { mirrorStepAppend, deleteRunOutput, readStepOutputTail } from '../services/workflow-output'
+import { ToolExecutionInterrupted } from '../services/agent/tool-execution'
 
 // ===== 工作流 Checkpoint 持久化 =====
 
@@ -507,12 +508,8 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
   },
 
   startWorkflow: async (definition, stepByStep = false, options) => {
-    if (closingWorkflows || isCloseCoordinating()) throw new Error('正在保存退出，不启动新工作流')
+    if (closingWorkflows || isCloseCoordinating()) throw new ToolExecutionInterrupted('正在保存退出，本次工作流未启动', false)
     checkStartSignal(options)
-    if (definition.type === 'directory' && (get().activeRuns.some(r => r.type === 'directory')
-      || [...runExecutions.keys()].some(id => get().history.some(r => r.id === id && r.type === 'directory')))) {
-      throw new Error('已有蓝图任务或请求正在收尾，请继续、终止或等待它停止后再生成')
-    }
     const operationKey = options?.operationId ? JSON.stringify([options.scope, options.operationId]) : undefined
     if (operationKey) {
       const pendingReceipt = startupReceipts.get(operationKey)
@@ -530,6 +527,10 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
         options?.onStarted?.(existing.id)
         return existing.id
       }
+    }
+    if (definition.type === 'directory' && (get().activeRuns.some(r => r.type === 'directory')
+      || [...runExecutions.keys()].some(id => get().history.some(r => r.id === id && r.type === 'directory')))) {
+      throw new ToolExecutionInterrupted('已有蓝图任务或请求正在收尾，本次工作流未启动；请终止旧任务并等待它停止后再生成', false)
     }
     let resolveReceipt: (id: string) => void = () => {}
     let rejectReceipt: (error: unknown) => void = () => {}

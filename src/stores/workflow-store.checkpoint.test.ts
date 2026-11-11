@@ -206,6 +206,27 @@ describe('工作流历史结果持久化', () => {
     expect(h.seenData[0].newBlueprints).toEqual([{ chapterNumber: 1 }])
   })
 
+  it('蓝图冲突明确未启动，旧请求停止后可重新启动；同操作可核验回执', async () => {
+    let entered = false
+    let finish!: () => void
+    const definition = { type: 'directory' as const, title: '旧任务', steps: [{ name: '生成', description: '', executor: async () => {
+      entered = true
+      await new Promise<void>(resolve => { finish = resolve })
+    } }] }
+    const starting = useWorkflowStore.getState().startWorkflow(definition, false, { operationId: 'original' })
+    await waitFor(() => entered)
+    const oldId = useWorkflowStore.getState().activeRuns[0].id
+    expect(await useWorkflowStore.getState().startWorkflow(definition, false, { operationId: 'original' })).toBe(oldId)
+    await expect(useWorkflowStore.getState().startWorkflow(definition)).rejects.toMatchObject({ unknown: false })
+    expect(useWorkflowStore.getState().activeRuns).toHaveLength(1)
+    useWorkflowStore.getState().cancelWorkflow(oldId)
+    await expect(useWorkflowStore.getState().startWorkflow(definition)).rejects.toMatchObject({ unknown: false })
+    finish()
+    await starting
+    const newId = await useWorkflowStore.getState().startWorkflow({ type: 'directory', title: '新任务', steps: [] })
+    expect(newId).not.toBe(oldId)
+  })
+
   it('重新生成等待旧请求收尾，使用新run且不沿用旧蓝图断点', async () => {
     registerWorkflow('directory', () => ({ type: 'directory', title: '重生成', rehydrateParams: { mode: 'full' }, steps: [{
       name: '生成', description: '', executor: async (_step, ctx) => { h.seenData.push({ ...ctx.data }) },

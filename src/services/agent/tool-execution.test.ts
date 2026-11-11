@@ -59,6 +59,7 @@ describe('工具中断与未知写入', () => {
     const write = buildAgentTool({ name: 'p2_write', description: '', source: 'builtin', inputSchema: { type: 'object', properties: {} },
       requiresConfirmation: false, isReadOnly: false, execute,
       reconcile: async (args, ctx) => {
+        expect(ctx.originalOperationId).toBe(mode === '归档恢复' ? 'old-call' : c.operationId)
         const result = await createToolIpc(ctx).invoke('fs:read-file', String(args.path))
         return result.success ? { success: true, executionState: 'committed', content: result.content ?? '' } : undefined
       },
@@ -109,6 +110,21 @@ describe('工具中断与未知写入', () => {
     expect(cancelled.has(first.callId)).toBe(true)
     expect(writes).toBe(2)
     expect(effects).toBe(1)
+  })
+
+  it('仅被门禁阻止的归档重试不是新的未知写入，原始未知记录仍需核对', async () => {
+    const c = context(); c.scope = crypto.randomUUID()
+    const execute = vi.fn(async () => ({ success: true, content: 'ok' }))
+    const write = tool(execute)
+    restoreUnknownExecutions([{ id: 'blocked', toolName: write.name, arguments: { path: 'a' }, status: 'failed',
+      error: '执行异常：先前写入状态未知，已阻止重复写入；必须核对实际状态后再处理',
+      receipt: { turnId: 't', callId: 'blocked', step: 1, toolName: write.name, target: 'a', outcome: 'unknown', verified: false } }], c.scope)
+    expect((await executeTool(write, { path: 'a' }, c, 100)).success).toBe(true)
+    expect(execute).toHaveBeenCalledOnce()
+    restoreUnknownExecutions([{ id: 'real-unknown', toolName: write.name, arguments: { path: 'a' }, status: 'failed',
+      error: '执行超时', receipt: { turnId: 't', callId: 'real-unknown', step: 1, toolName: write.name, target: 'a', outcome: 'unknown', verified: false } }], c.scope)
+    await expect(executeTool(write, { path: 'a' }, c, 100)).rejects.toMatchObject({ unknown: true })
+    expect(execute).toHaveBeenCalledOnce()
   })
 
   it('未知操作核对挂起也超时，不放行写入', async () => {

@@ -334,11 +334,15 @@ export function createDirectoryWorkflow(params: DirectoryWorkflowParams = { mode
   return {
     type: 'directory',
     rehydrateParams: { ...params },
-    title: params.mode === 'append'
-      ? (params.startChapter
-        ? t('workflow.dirTitleAppendFrom').replace('{n}', String(params.startChapter))
-        : t('workflow.dirTitleAppend'))
-      : t('workflow.dirTitleFull'),
+    title: params.startChapter && params.count
+      ? t('tool.wfBlueprintRangeTitle')
+        .replace('{start}', String(params.startChapter))
+        .replace('{end}', String(params.startChapter + params.count - 1))
+      : params.mode === 'append'
+        ? (params.startChapter
+          ? t('workflow.dirTitleAppendFrom').replace('{n}', String(params.startChapter))
+          : t('workflow.dirTitleAppend'))
+        : t('workflow.dirTitleFull'),
     steps: [
       {
         name: t('workflow.dirReadArch'),

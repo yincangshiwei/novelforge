@@ -35,6 +35,16 @@ describe('workflow rehydrate（重建 definition，L2 任务6 修复 round 1）'
     expectSameSteps(rehydrateWorkflow('directory', params), createDirectoryWorkflow(params as unknown as DirectoryWorkflowParams))
   })
 
+  it('directory：恢复后仍保留1–368范围、合并保存模式及范围标题', () => {
+    const params: DirectoryWorkflowParams = { mode: 'append', startChapter: 1, count: 368 }
+    const restored = rehydrateWorkflow('directory', { ...params })
+    const direct = createDirectoryWorkflow(params)
+    expectSameSteps(restored, direct)
+    expect(restored!.rehydrateParams).toEqual(params)
+    expect(restored!.title).toBe(direct.title)
+    expect(restored!.title).toContain('1–368')
+  })
+
   it('novel_import：rehydrate 重建 steps 与 createImportWorkflow 一致', () => {
     const params = { chapters: [{ number: 1, title: 'a', content: 'c', wordCount: 1 }] }
     expectSameSteps(rehydrateWorkflow('novel_import', params), createImportWorkflow(params as unknown as ImportWorkflowParams))
