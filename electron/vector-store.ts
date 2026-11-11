@@ -1012,6 +1012,7 @@ export async function searchWithScope(
  */
 export async function listDocuments(
   projectPath: string,
+  strict = false,
 ): Promise<DocumentInfo[]> {
   try {
     const db = await getConnection(projectPath)
@@ -1027,8 +1028,18 @@ export async function listDocuments(
       chunkCount: r.chunkCount,
       filePath: r.filePath || '',
     }))
-  } catch {
+  } catch (error) {
+    if (strict) throw error
     return []
+  }
+}
+
+export async function relocateDocumentPaths(projectPath: string, paths: Record<string, string>): Promise<void> {
+  const db = await getConnection(projectPath)
+  if (!(await db.tableNames()).includes(DOCS_TABLE_NAME)) return
+  const table = await db.openTable(DOCS_TABLE_NAME)
+  for (const [id, filePath] of Object.entries(paths)) {
+    await table.update({ where: `id = '${id.replace(/'/g, "''")}'`, values: { filePath } })
   }
 }
 

@@ -84,8 +84,11 @@ export const ipc = {
     }
     let result: AllInvokeChannels[C]['return']
     try {
-      result = await Promise.race([
-        getAPI().invoke(channel, ...args) as Promise<AllInvokeChannels[C]['return']>,
+      const invocation = getAPI().invoke(channel, ...args) as Promise<AllInvokeChannels[C]['return']>
+      result = channel === 'project:export-package' || channel === 'project:restore-package'
+        ? await invocation
+        : await Promise.race([
+        invocation,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new IPCTimeoutError(channel, IPC_TIMEOUT_MS)), IPC_TIMEOUT_MS)
         }),

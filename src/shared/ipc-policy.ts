@@ -68,6 +68,8 @@ export const IPC_EVENT_CHANNELS = [
  * 通道 → 策略。S2 阶段只填 authority；pathArgs 由 S8 补齐。
  */
 export const IPC_CHANNEL_POLICY: Record<InvokeChannel, ChannelPolicy> = {
+  'project:export-package': { authority: 'dialog' },
+  'project:restore-package': { authority: 'dialog' },
   'attention:register': { authority: 'write-global' },
   'attention:clear': { authority: 'write-global' },
   'agent:operation-invoke': { authority: 'write-project' },

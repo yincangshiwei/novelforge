@@ -6,6 +6,7 @@ import { registerAttentionController } from './controllers/attention-controller'
 import { registerAgentOperationController } from './controllers/agent-operation-controller'
 import { registerConfigController } from './controllers/config-controller'
 import { registerProjectController } from './controllers/project-controller'
+import { registerProjectPackageController } from './controllers/project-package-controller'
 import { registerFSController } from './controllers/fs-controller'
 import { registerLLMController } from './controllers/llm-controller'
 // 模型管理 v3 T1：凭据层三通道（credential:describe/set/unset）——紧邻 LLM 控制器注册，
@@ -44,6 +45,7 @@ export function registerIPCHandlers() {
   registerAgentOperationController()
   registerConfigController()
   registerProjectController()
+  registerProjectPackageController()
   registerFSController()
   registerLLMController()
   registerCredentialController() // 模型管理 v3 T1：密钥本体（describe/set/unset）

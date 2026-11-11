@@ -109,6 +109,14 @@ export interface GlobalConfig {
 
 // ===== 项目管理 =====
 export interface ProjectChannels {
+  'project:export-package': {
+    args: []
+    return: { success: boolean; cancelled?: boolean; path?: string; warnings?: string[]; error?: string }
+  }
+  'project:restore-package': {
+    args: []
+    return: { success: boolean; cancelled?: boolean; projectPath?: string; warnings?: string[]; error?: string }
+  }
   'project:create': {
     args: [config: { name: string; path: string; genre: string; targetAudience: string }]
     return: { success: boolean; projectId: string; projectPath?: string; error?: string }

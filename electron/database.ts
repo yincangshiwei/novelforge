@@ -121,7 +121,7 @@ export function getProjectDb(): BetterSqlite3.Database | null {
 
 // ===== Schema 版本管理 =====
 /** 当前数据库 schema 版本号（v18：写作自动化三表——D 档） */
-const CURRENT_SCHEMA_VERSION = 24
+export const CURRENT_SCHEMA_VERSION = 24
 
 /** 检查并执行 schema 迁移（仅在版本号低于当前版本时运行） */
 function ensureSchemaVersion(db: BetterSqlite3.Database): void {

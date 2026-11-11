@@ -7,6 +7,7 @@ import { trustWebContents, untrustWebContents } from './security/ipc-guard'
 // （main.ts 已通过 ipc-handlers 传递依赖该模块，此处直接引用不引入循环）
 import { TITLEBAR_OVERLAY_HEIGHT } from './controllers/config-controller'
 import { closeProjectDatabase } from './database'
+import { isProjectTransferLocked } from './services/project-transfer-lock'
 import { installGlobalErrorHandlers, logger, detectLogEnvironment, LogEnvironment } from './utils/logger'
 import { migrateLegacyDirs } from './utils/config-utils'
 import { runCredentialMigration } from './credentials/migrate'
@@ -244,6 +245,7 @@ function createWindow() {
   win.on('close', async (e) => {
     if (allowClose) return
     e.preventDefault()
+    if (isProjectTransferLocked()) return
     if (checkingClose) return
     checkingClose = true
     try {

@@ -6,6 +6,19 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const projectTexts = {
+  'package.export': { 'zh-CN': '打包项目', 'en-US': 'Package project', 'ru-RU': 'Упаковать проект' },
+  'package.restore': { 'zh-CN': '恢复项目包', 'en-US': 'Restore project package', 'ru-RU': 'Восстановить пакет проекта' },
+  'package.destination': { 'zh-CN': '选择恢复位置（自动创建新项目目录）', 'en-US': 'Choose destination (a new project folder will be created)', 'ru-RU': 'Выберите место (будет создана новая папка проекта)' },
+  'package.busy': { 'zh-CN': '正在迁移项目，请等待完成，不要关闭应用。', 'en-US': 'Transferring project. Please wait and keep the app open.', 'ru-RU': 'Перенос проекта. Дождитесь завершения и не закрывайте приложение.' },
+  'package.unsaved': { 'zh-CN': '请先保存编辑器和角色卡的修改，再迁移项目。', 'en-US': 'Save editor and character changes before transferring.', 'ru-RU': 'Сохраните изменения редактора и персонажей перед переносом.' },
+  'package.exported': { 'zh-CN': '项目包已保存：{path}', 'en-US': 'Project package saved: {path}', 'ru-RU': 'Пакет проекта сохранён: {path}' },
+  'package.restored': { 'zh-CN': '项目已恢复：{path}', 'en-US': 'Project restored: {path}', 'ru-RU': 'Проект восстановлен: {path}' },
+  'package.dependencies': { 'zh-CN': '请在新电脑配置模型供应商和 API Key；本地模型、用户级技能及 MCP 工具需另行安装。项目包不携带全局配置或凭据，历史中的临时工具结果文件也不迁移。', 'en-US': 'Configure providers and API keys on this computer. Install local models, user skills and MCP tools separately. Global configuration, credentials and temporary tool result files are not transferred.', 'ru-RU': 'Настройте провайдеров и API-ключи. Локальные модели, пользовательские навыки и MCP-инструменты установите отдельно. Глобальные настройки, ключи и временные результаты инструментов не переносятся.' },
+  'package.missingSource': { 'zh-CN': '知识库原文件不存在，已保留索引但无法迁移原文件：{path}', 'en-US': 'Knowledge index retained, but source file is missing: {path}', 'ru-RU': 'Индекс сохранён, но исходный файл отсутствует: {path}' },
+  'package.noProject': { 'zh-CN': '请先打开要打包的项目。', 'en-US': 'Open the project to package first.', 'ru-RU': 'Сначала откройте проект для упаковки.' },
+  'package.outsideProject': { 'zh-CN': '请将项目包保存到项目目录之外。', 'en-US': 'Save the package outside the project folder.', 'ru-RU': 'Сохраните пакет вне папки проекта.' },
+  'package.saveFailed': { 'zh-CN': '保存尚未确认完成，已取消打包。', 'en-US': 'Saving was not confirmed; packaging cancelled.', 'ru-RU': 'Сохранение не подтверждено; упаковка отменена.' },
+  'package.hint': { 'zh-CN': '用于跨电脑迁移，包含项目数据、会话和可找到的知识库源文件，不含全局凭据。', 'en-US': 'Move project data, sessions and available knowledge sources between computers. Global credentials are excluded.', 'ru-RU': 'Перенос данных проекта, диалогов и доступных исходных файлов между компьютерами. Глобальные ключи исключены.' },
   'version.noContent': { 'zh-CN': '（章节尚无内容）', 'en-US': '(No content in this chapter)', 'ru-RU': '(В главе нет содержимого)' },
   'version.noDraft': { 'zh-CN': '本章还没有草稿，无法对比', 'en-US': 'No draft for this chapter yet — nothing to compare', 'ru-RU': 'В этой главе ещё нет черновика — нечего сравнивать' },
   'import.summaryLine': { 'zh-CN': '类型: {genre} | 子类型: {subGenre} | 受众: {audience}\n大纲: {outline}\n世界观: {world}\n金手指: {goldenFinger}\n主角: {protagonist}', 'en-US': 'Genre: {genre} | Subgenre: {subGenre} | Audience: {audience}\nOutline: {outline}\nWorld setting: {world}\nGolden finger: {goldenFinger}\nProtagonist: {protagonist}', 'ru-RU': 'Жанр: {genre} | Поджанр: {subGenre} | Аудитория: {audience}\nПлан: {outline}\nМир: {world}\nКозырь: {goldenFinger}\nГерой: {protagonist}' },

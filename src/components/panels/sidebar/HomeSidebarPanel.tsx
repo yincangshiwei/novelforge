@@ -6,13 +6,20 @@
  * 按钮列在「打开项目」下方新增「导入小说」入口（= 既有 ImportNovelDialog）。
  */
 
+import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { BookOpen, Clock, Trash2 } from 'lucide-react'
+import { useAgentStore } from '../../../stores/agent-store'
+import { useWorkflowStore } from '../../../stores/workflow-store'
+import { useCharacterStore } from '../../../stores/character-store'
+import { useEditorStore } from '../../../stores/editor-store'
+import { toast } from '../../ui/Toast'
 import { useProjectStore } from '../../../stores/project-store'
 import { useLayoutStore } from '../../../stores/layout-store'
 import { ipc } from '../../../services/ipc-client'
 import { Button } from '../../ui/Button'
 import MenuRow from '../../ui/MenuRow'
-import { confirmDeleteProject } from '../../ui/Confirm'
+import { alertError, confirmDeleteProject } from '../../ui/Confirm'
 import { useTranslation } from '../../../hooks/useTranslation'
 
 export default function HomeSidebarPanel() {
@@ -22,6 +29,49 @@ export default function HomeSidebarPanel() {
   const recentProjects = useProjectStore(s => s.recentProjects)
   const deleteProjectFolder = useProjectStore(s => s.deleteProjectFolder)
   const removeRecentProject = useProjectStore(s => s.removeRecentProject)
+  const [transferring, setTransferring] = useState(false)
+  useEffect(() => {
+    if (!transferring) return
+    const blockKeys = (event: KeyboardEvent) => { event.preventDefault(); event.stopImmediatePropagation() }
+    window.addEventListener('keydown', blockKeys, true)
+    return () => window.removeEventListener('keydown', blockKeys, true)
+  }, [transferring])
+
+  const transfer = async (mode: 'export' | 'restore') => {
+    if (transferring) return
+    if (useProjectStore.getState().loading || useAgentStore.getState().generating || useWorkflowStore.getState().hasActiveRun() || useCharacterStore.getState().saving) {
+      toast.warning(t('workflow.projectBusy'))
+      return
+    }
+    if (useEditorStore.getState().tabs.some(tab => tab.dirty) || useCharacterStore.getState().dirty) {
+      toast.warning(t('package.unsaved'))
+      return
+    }
+    setTransferring(true)
+    try {
+      const agent = useAgentStore.getState()
+      const saved = await Promise.all(agent.conversations.map(c => agent.persistCurrent(c.id)))
+      if (saved.some(ok => !ok) || !await agent.flushArchives() || !await useWorkflowStore.getState().flushCheckpoint()) throw new Error(t('package.saveFailed'))
+      if (mode === 'export') {
+        if (!await useProjectStore.getState().saveProject()) throw new Error(t('package.saveFailed'))
+        const result = await ipc.invoke('project:export-package')
+        if (result.cancelled) return
+        if (!result.success) throw new Error(result.error)
+        toast.success(t('package.exported').replace('{path}', result.path ?? ''))
+        if (result.warnings?.length) await alertError(result.warnings.join('\n'), { title: t('package.export') })
+      } else {
+        const result = await ipc.invoke('project:restore-package')
+        if (result.cancelled) return
+        if (!result.success || !result.projectPath) throw new Error(result.error)
+        toast.success(t('package.restored').replace('{path}', result.projectPath))
+        await openProject(result.projectPath)
+        await useAgentStore.getState().restoreArchives()
+        if (result.warnings?.length) await alertError(result.warnings.join('\n'), { title: t('package.restore') })
+      }
+    } catch (error) {
+      await alertError(String(error), { title: t(mode === 'export' ? 'package.export' : 'package.restore') })
+    } finally { setTransferring(false) }
+  }
 
   // 最近项目：排除当前项目（与 LT 栏方块列表同口径——上方已有「当前项目」卡，重复出现只是占位）
   const recentTargets = recentProjects.filter(p => p.path !== currentProject?.path)
@@ -35,6 +85,13 @@ export default function HomeSidebarPanel() {
 
   return (
     <div className="px-3 py-2 text-sm">
+      {transferring && createPortal(
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50" role="dialog" aria-modal="true" aria-label={t('package.busy')}>
+          <div className="rounded-lg p-6 text-sm" style={{ backgroundColor: 'var(--color-bg)', color: 'var(--color-text)' }}>
+            <p role="status">{t('package.busy')}</p>
+          </div>
+        </div>, document.body,
+      )}
       {/* 当前项目信息 */}
       {currentProject && (
         <div
@@ -83,6 +140,15 @@ export default function HomeSidebarPanel() {
           onClick={() => useLayoutStore.getState().openImportNovel()}
         >
           {t('welcome.importNovel')}</Button>
+        {currentProject && (
+          <Button variant="outline" className="w-full" disabled={transferring} onClick={() => void transfer('export')}>
+            {t('package.export')}
+          </Button>
+        )}
+        <Button variant="outline" className="w-full" disabled={transferring} onClick={() => void transfer('restore')}>
+          {t('package.restore')}
+        </Button>
+        <p className="text-micro px-1" style={{ color: 'var(--color-text-muted)' }}>{t('package.hint')}</p>
       </div>
 
       {/* 最近项目（2026-09-28 自欢迎页迁入）——行片形态（MenuRow 为唯一实现）；

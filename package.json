@@ -19,7 +19,9 @@
     "eventsource-parser": "^4.1.2",
     "flatbuffers": "^25.9.23",
     "jieba-wasm": "^2.4.0",
-    "undici": "^8.12.3"
+    "undici": "^8.12.3",
+    "yauzl": "3.2.0",
+    "yazl": "3.3.1"
   },
   "scripts": {
     "dev": "node scripts/dev-utf8.cjs && vite",

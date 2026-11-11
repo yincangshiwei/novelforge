@@ -22,6 +22,7 @@ import { IPC_CHANNEL_POLICY } from '../../src/shared/ipc-policy'
 import type { InvokeChannel } from '../../src/shared/ipc-channels'
 import { logger } from '../utils/logger'
 import { isIpcMetricsEnabled, recordIpcCall } from '../dev/ipc-metrics'
+import { enterProjectCall } from '../services/project-transfer-lock'
 
 /** 与 `ipcMain.handle` 一致的回调签名（刻意不改，见文件头） */
 export type GuardedHandler = (event: IpcMainInvokeEvent, ...args: never[]) => unknown
@@ -173,16 +174,18 @@ export function guardedHandle(channel: InvokeChannel, handler: GuardedHandler): 
     //   ⚠️ 这条日志是「真机启动后 IPC 全被拒」时唯一的排查线索，字段必须齐全。
     assertTrustedIpcSender(event, channel)
     // S8 将在此前插入 assertPathArgs(channel, policy, args)
-    if (!isIpcMetricsEnabled()) return handler(event, ...(args as never[]))
-
+    const release = channel === 'log:write' ? () => {} : enterProjectCall()
+    const measured = isIpcMetricsEnabled()
     const started = performance.now()
     try {
       const result = await handler(event, ...(args as never[]))
-      recordIpcCall(channel, performance.now() - started)
+      if (measured) recordIpcCall(channel, performance.now() - started)
       return result
     } catch (error) {
-      recordIpcCall(channel, performance.now() - started, error)
+      if (measured) recordIpcCall(channel, performance.now() - started, error)
       throw error
+    } finally {
+      release()
     }
   })
   registeredHandlers.set(channel, handler)
