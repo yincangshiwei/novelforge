@@ -11,10 +11,11 @@ vi.mock('../../stores/workflow-store', () => {
   return { useWorkflowStore: store }
 })
 vi.mock('../../stores/layout-store', () => ({ useLayoutStore: { getState: () => ({ setAIPanelOpen: h.close }) } }))
-vi.mock('../../hooks/useTranslation', () => ({ useTranslation: () => ({ t: (key: string) => key }) }))
+vi.mock('../../hooks/useTranslation', () => ({ useTranslation: () => ({ t: (key: string) => key === 'workflow.blueprintResumeProgress' ? 'saved={count};last={last};next={next}' : key }) }))
 vi.mock('../ui/MarkdownContent', () => ({ default: () => null }))
 vi.mock('../../hooks/useOutputFileTail', () => ({ useOutputFileTail: () => ({ text: '', loading: false }) }))
 import AIOutputPanel from './AIOutputPanel'
+import { useWorkflowStore } from '../../stores/workflow-store'
 let cleanup: (() => void) | undefined
 afterEach(() => { cleanup?.(); document.body.innerHTML = ''; vi.clearAllMocks() })
 function render() {
@@ -25,6 +26,18 @@ function render() {
   cleanup = () => act(() => root.unmount())
   return container
 }
+it.each([undefined, 176])('输出停在175时按本任务断点显示179保存进度及真实缺章 %s', missing => {
+  const run = useWorkflowStore.getState().history[0]
+  const previous = run.resumeData
+  run.resumeData = { directoryStart: 1, directoryEnd: 368,
+    newBlueprints: Array.from({ length: 179 }, (_, i) => ({ chapterNumber: i + 1 })).filter(b => b.chapterNumber !== missing) }
+  try {
+    render()
+    const text = document.querySelector('[role="status"]')?.textContent
+    expect(text).toBe(missing ? 'saved=178;last=175;next=176' : 'saved=179;last=179;next=180')
+  } finally { run.resumeData = previous }
+})
+
 it('无生成正文时错误原因和诊断仍直接可见', () => {
   render()
   const alert = document.querySelector('[role="alert"]')!

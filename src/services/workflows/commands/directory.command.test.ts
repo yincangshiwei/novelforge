@@ -97,6 +97,21 @@ describe('蓝图取消与已保存批次恢复', () => {
     expect(result.map(b => b.chapterNumber)).toEqual([1, 2, 3])
     expect(checkpoint).toHaveBeenCalledOnce()
   })
+  it('已保存179章时提示下一缺章180，且不把旧蓝图库368章算作已完成', async () => {
+    h.totalChapters = 368
+    h.callLLM.mockReset().mockRejectedValueOnce(new Error('interrupted'))
+    callbacks.log.mockClear()
+    try {
+      const context: WorkflowContext = { data: { architecture: 'world',
+        newBlueprints: Array.from({ length: 179 }, (_, i) => ({ chapterNumber: i + 1, title: 'saved', keyEvents: '' })),
+        existingBlueprints: Array.from({ length: 368 }, (_, i) => ({ chapterNumber: i + 1, title: 'old', keyEvents: '' })),
+      }, cancelled: false }
+      await expect(new GenerateDirectoryCommand({ mode: 'append', startChapter: 1, count: 368 }).execute({ step: {}, context, callbacks })).rejects.toThrow('interrupted')
+      expect(callbacks.log).toHaveBeenCalledWith(expect.stringContaining('本任务已保存 179 章，连续保存至第 179 章；下一缺章为第 180 章'))
+      expect(h.n).toHaveBeenLastCalledWith(180)
+    } finally { h.totalChapters = 3 }
+  })
+
   it('恢复有缺口时不覆盖已保存章节，持续无新增结果会失败而非无限请求', async () => {
     h.save.mockReset()
     h.callLLM.mockReset().mockResolvedValue('duplicate')

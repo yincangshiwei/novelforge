@@ -306,10 +306,12 @@ describe('工作流历史结果持久化', () => {
   })
 
   it('异常退出恢复的蓝图步骤不再显示运行且不自动调用模型', async () => {
-    h.dbMap.set('cp', JSON.stringify({ activeRuns: [makeRun('crash-dir', { type: 'directory', steps: [{ id: 's', name: 's', description: '', status: 'running', progress: 50, logs: [] }] })], waitingRuns: {}, savedAt: '2026-11-10' }))
+    const resumeData = { directoryStart: 1, directoryEnd: 368, newBlueprints: Array.from({ length: 179 }, (_, i) => ({ chapterNumber: i + 1 })) }
+    h.dbMap.set('cp', JSON.stringify({ activeRuns: [makeRun('crash-dir', { type: 'directory', steps: [{ id: 's', name: 's', description: '', status: 'running', progress: 50, result: '第175章', logs: [] }] })], contextData: { 'crash-dir': resumeData }, waitingRuns: {}, savedAt: '2026-11-10' }))
     await useWorkflowStore.getState().restoreCheckpoint()
     expect(useWorkflowStore.getState().activeRuns[0].status).toBe('paused')
     expect(useWorkflowStore.getState().activeRuns[0].steps[0].status).toBe('pending')
+    expect(useWorkflowStore.getState().activeRuns[0].resumeData).toEqual(resumeData)
     expect(h.seen).toEqual([])
   })
 

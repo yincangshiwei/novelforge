@@ -94,6 +94,11 @@ export class GenerateDirectoryCommand extends BaseWorkflowCommand<ChapterBluepri
       return chapter
     }
     let cursor = nextMissing()
+    if (newBlueprints.length > 0) {
+      const savedCount = new Set(newBlueprints.filter(b => b.chapterNumber >= startChapter && b.chapterNumber <= endChapter).map(b => b.chapterNumber)).size
+      callbacks.log((cursor > endChapter ? t('workflow.blueprintResumeComplete') : t('workflow.blueprintResumeProgress'))
+        .replace('{count}', String(savedCount)).replace('{last}', String(cursor - 1)).replace('{next}', String(cursor)))
+    }
     // 多级重试策略：本地修复 → 中批次(5章) → 单章
     let consecutiveParseFailures = 0
     const MAX_CONSECUTIVE_FAILURES = 5  // 增加容错次数（修复不算新 LLM 调用）

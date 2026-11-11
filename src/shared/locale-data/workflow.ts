@@ -6,6 +6,8 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const workflowTexts = {
+  'workflow.blueprintResumeProgress': { 'zh-CN': '本任务已保存 {count} 章，连续保存至第 {last} 章；下一缺章为第 {next} 章。流式输出可能落后于保存进度。', 'en-US': 'This task saved {count} chapters, continuous through chapter {last}; next missing chapter: {next}. Streamed output may lag behind saved progress.', 'ru-RU': 'Задача сохранила {count} глав, непрерывно до главы {last}; следующая отсутствующая глава: {next}. Вывод может отставать от сохранения.' },
+  'workflow.blueprintResumeComplete': { 'zh-CN': '本任务范围内的 {count} 章蓝图均已保存；继续将完成后续处理，不会重新生成这些章节。', 'en-US': 'All {count} blueprints in this task range are saved; continue to finish remaining processing without regenerating them.', 'ru-RU': 'Все {count} планов в диапазоне сохранены; продолжение завершит обработку без повторной генерации.' },
   'audit.refinementUnchecked': { 'zh-CN': '修稿复查未完成，不能视为通过；候选正文仍予保留。', 'en-US': 'Revision audit incomplete; not a pass. Candidate prose is retained.', 'ru-RU': 'Проверка правки не завершена; это не успех. Текст сохранён.' },
   'audit.refinementReport': { 'zh-CN': '修稿 #{id} 候选复查（非合并结果）', 'en-US': 'Revision #{id} candidate audit (not merged prose)', 'ru-RU': 'Проверка кандидата #{id} (не итог слияния)' },
   'audit.mergedReport': { 'zh-CN': '合并正文专项复查', 'en-US': 'Merged prose audit', 'ru-RU': 'Проверка текста после слияния' },

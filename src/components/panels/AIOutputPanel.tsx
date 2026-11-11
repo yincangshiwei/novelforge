@@ -194,6 +194,18 @@ function ActiveRunView({
   // 提取当前步骤 + 内容
   const currentStep = run.steps[run.currentStepIndex] || run.steps[0]
   const rawText = currentStep?.result || ''
+  const resumeData = run.resumeData
+  const savedBlueprints = Array.isArray(resumeData?.newBlueprints) ? resumeData.newBlueprints : []
+  const rangeStart = Number(resumeData?.directoryStart ?? run.rehydrateParams?.startChapter ?? 1)
+  const rangeEnd = Number(resumeData?.directoryEnd ?? (rangeStart + Number(run.rehydrateParams?.count ?? 0) - 1))
+  const savedNumbers = new Set(savedBlueprints.map((b: { chapterNumber: number }) => b.chapterNumber)
+    .filter((n: number) => Number.isInteger(n) && n >= rangeStart && n <= rangeEnd))
+  let nextMissing = rangeStart
+  while (nextMissing <= rangeEnd && savedNumbers.has(nextMissing)) nextMissing++
+  const resumeProgress = isDirectory && !isActive && run.status !== 'completed' && resumeData && rangeEnd >= rangeStart
+    ? (nextMissing > rangeEnd ? t('workflow.blueprintResumeComplete') : t('workflow.blueprintResumeProgress'))
+      .replace('{count}', String(savedNumbers.size)).replace('{last}', String(nextMissing - 1)).replace('{next}', String(nextMissing))
+    : ''
 
   let content = rawText
   const segments = rawText.split(/<think>/)
@@ -278,6 +290,7 @@ function ActiveRunView({
       >
         {/* 步骤进度区及独立输出流 */}
         <div className="px-2 pt-2 pb-4">
+          {resumeProgress && <div role="status" className="text-xs px-2 py-2 mb-2 rounded" style={{ color: 'var(--color-text-muted)', backgroundColor: 'var(--color-hover)' }}>{resumeProgress}</div>}
           {run.steps.map((step, i) => (
             <StepOutputBlock
               key={step.id}

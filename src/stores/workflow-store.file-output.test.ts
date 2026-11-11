@@ -210,6 +210,20 @@ describe('崩溃恢复续读（hydrateInterruptedOutputs）', () => {
     expect(run!.steps[0]!.result).toBe('已完成步骤正文（checkpoint）')
   })
 
+  it.each([
+    ['第175章', '第175章\n第176章\n第179章', '第175章\n第176章\n第179章'],
+    ['第175章', '第180章新批次', '第175章'],
+    ['第175章', '第17', '第175章'],
+  ])('蓝图中断快照 %s 只接受同前缀的更完整文件', async (snapshot, file, expected) => {
+    tailFixture.set('blueprint-crash:0', { content: file })
+    useWorkflowStore.setState({ activeRuns: [{
+      id: 'blueprint-crash', type: 'directory', title: '蓝图', status: 'paused', currentStepIndex: 0,
+      createdAt: '2026-11-11T00:00:00Z', steps: [checkpointStep('s1', { result: snapshot })],
+    }] })
+    await useWorkflowStore.getState().hydrateInterruptedOutputs()
+    expect(useWorkflowStore.getState().activeRuns[0].steps[0].result).toBe(expected)
+  })
+
   it('running（未崩溃）run 不参与续读；文件不存在则不动', async () => {
     tailFixture.set('run-live:0', { content: '不应被读的内容' })
     useWorkflowStore.setState({

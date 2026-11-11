@@ -836,6 +836,7 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
       resumeContextData.set(r.id, cp.contextData?.[r.id] ?? {})
       if (r.status === 'paused' || r.type === 'directory') {
         restored.push({ ...r, status: 'paused', pauseRequested: false,
+          resumeData: cp.contextData?.[r.id] ?? r.resumeData,
           steps: r.steps.map(step => step.status === 'running' ? { ...step, status: 'pending' as const, progress: 0 } : step),
           rehydrateParams: cp.runDefs?.[r.id]?.params ?? r.rehydrateParams })
         if (interruptedWaitingIds.has(r.id)) keptWaitingIds.push(r.id)
@@ -895,16 +896,21 @@ export const useWorkflowStore = create<WorkflowState>()((set, get) => ({
     // 只处理崩溃恢复回来的暂停/失败 run（正常 run 不落此状态，文件在其结束时已被任务级清理）
     const runs = get().activeRuns.filter(r => r.status === 'paused' || r.status === 'failed')
     for (const run of runs) {
-      // 候选 = result 为空/缺失的步骤（文件存在才补——pending/未流式步骤无文件，天然跳过）
       const candidates = run.steps
         .map((step, index) => ({ index, step }))
-        .filter(({ step }) => typeof step.result !== 'string' || step.result === '')
+        .filter(({ step }) => !step.result || (run.type === 'directory' && step.status !== 'completed'))
       for (const { index } of candidates) {
         try {
           const tail = await readStepOutputTail(run.id, index, { full: true })
           if (!tail.success || !tail.exists || tail.content === '') continue
           // cleanupMessageText：与 restoreCheckpoint 同语义净化（半截 think/tool 残片）
-          updateStepById(set, run.id, index, { result: cleanupMessageText(tail.content) })
+          const content = cleanupMessageText(tail.content)
+          const current = get().activeRuns.find(r => r.id === run.id)
+          if (!current || (current.status !== 'paused' && current.status !== 'failed')) continue
+          const snapshot = current.steps[index]?.result ?? ''
+          if (snapshot && (!content.startsWith(snapshot) || content.length <= snapshot.length)) continue
+          if (current.steps[index]?.status === 'completed' && snapshot) continue
+          updateStepById(set, run.id, index, { result: content })
         } catch {
           // 单步补填失败不影响其余步骤/run
         }
