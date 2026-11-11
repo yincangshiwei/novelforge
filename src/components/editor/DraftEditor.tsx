@@ -8,6 +8,8 @@ import { useWorkflowStore } from '../../stores/workflow-store'
 import CodeMirrorEditor from './CodeMirrorEditor'
 import ThreeWayMerge from './ThreeWayMerge'
 import EditorToolbar from './EditorToolbar'
+import ReviewHistory from './ReviewHistory'
+import { globalEventBus } from '../../shared/event-bus'
 import AIActionDialog, { getReviewDims } from './AIActionDialog'
 import { VELA } from '../../services/vela-protocol'
 import { useAutoSave } from '../../hooks/useAutoSave'
@@ -47,6 +49,9 @@ export default function DraftEditor({ filePath, content }: Props) {
   const [meta, setMeta] = useState<(DraftMeta & { chapterTitle?: string; filePath?: string }) | null>(null)
   const [pendingRevisions, setPendingRevisions] = useState<RevisionEntry[]>([])
   const [reviewCount, setReviewCount] = useState(0)
+  const [reviewHistoryOpen, setReviewHistoryOpen] = useState(false)
+  const reviewProject = useProjectStore(s => s.currentProject)
+  const openReviewHistory = useCallback(() => setReviewHistoryOpen(true), [])
   const [mergeData, setMergeData] = useState<{
     originalContent: string
     modifiedContent: string
@@ -56,6 +61,9 @@ export default function DraftEditor({ filePath, content }: Props) {
 
   useEffect(() => {
     let cancelled = false
+    let request = 0
+    setReviewCount(0)
+    setReviewHistoryOpen(false)
     const load = async () => {
       const m = await parseDraftMeta(filePath)
       if (cancelled || !m) return
@@ -67,12 +75,27 @@ export default function DraftEditor({ filePath, content }: Props) {
       const chapterDir = `${VELA.DRAFT}ch${m.chapterNumber}`
       const pending = await getPendingRevisions(chapterDir, m.version)
       if (!cancelled) setPendingRevisions(pending)
+      const token = ++request
       const reviews = await getReviewsForVersion(chapterDir, m.version)
-      if (!cancelled) setReviewCount(reviews.length)
+      if (!cancelled && token === request) setReviewCount(reviews.length)
     }
-    load()
-    return () => { cancelled = true }
-  }, [filePath, t])
+    const reloadCount = async () => {
+      const token = ++request
+      try {
+        const m = await parseDraftMeta(filePath)
+        if (cancelled || !m) return
+        const reviews = await ipc.invoke('db:review-list', m.id)
+        if (!cancelled && token === request) setReviewCount(reviews.length)
+      } catch (e) {
+        if (!cancelled) renderLog('error', 'Review:History', String(e))
+      }
+    }
+    const off = globalEventBus.on('REFRESH_RESOURCE', ({ resources }) => {
+      if (resources.includes('reviews') || resources.includes('all')) void reloadCount()
+    })
+    void load().catch(e => { if (!cancelled) renderLog('error', 'Review:History', String(e)) })
+    return () => { cancelled = true; off() }
+  }, [filePath, t, reviewProject])
 
   const cachedDrafts = useDraftStore(s => s.draftsByChapter)
   const cachedMeta = meta ? cachedDrafts[meta.chapterNumber]?.find(d => d.id === meta.id) : undefined
@@ -329,27 +352,6 @@ export default function DraftEditor({ filePath, content }: Props) {
     }
   }
 
-  /** 打开最新审稿报告 */
-  const openLatestReview = useCallback(async () => {
-    if (!meta) return
-    const chapterDir = `${VELA.DRAFT}ch${meta.chapterNumber}`
-    const { getLatestReview } = await import('../../services/draft-index')
-    const latest = await getLatestReview(chapterDir, meta.version)
-    if (!latest) return
-    const reportContent = await readDraftBody(`${VELA.REVIEW}${latest.id}`)
-    if (!reportContent) return
-    useEditorStore.getState().openFile({
-      id: `review-report-${meta.chapterNumber}-${latest.id}`,
-      name: t('editor.reviewTab').replace('{version}', String(meta.version)),
-      type: 'review-report',
-      content: reportContent,
-      filePath,
-      reviewReport: reportContent,
-      chapterNumber: meta.chapterNumber,
-      chapterDir,
-    })
-  }, [meta, filePath, t])
-
   /** 正文翻译：目标语言 → LLM 翻译 → 新建 source='translation' 草稿 → 打开新 Tab（原文保留） */
   const doTranslate = useCallback(async (lang: 'zh' | 'en' | 'ru') => {
     const text = currentBodyRef.current
@@ -431,8 +433,15 @@ export default function DraftEditor({ filePath, content }: Props) {
         onRepairFinalize={doRepairFinalize}
         onReturnToDraft={doReturnToDraft}
         onOpenRevision={openPendingRevision}
-        onOpenReview={openLatestReview}
+        onOpenReview={openReviewHistory}
       />
+      {meta && meta.filePath === filePath && (
+        <ReviewHistory
+          open={reviewHistoryOpen} onOpenChange={setReviewHistoryOpen}
+          draftId={meta.id} version={meta.version} chapterNumber={meta.chapterNumber}
+          filePath={filePath} onCountChange={setReviewCount}
+        />
+      )}
 
       {/* 后处理状态面板 */}
       {status === 'finalized' && meta && (

@@ -100,6 +100,24 @@ export class ReviewRepository {
         return { ...meta, content: (row.body as string) ?? '' }
     }
 
+    static delete(id: number): void {
+        const db = getProjectDb()
+        if (!db) throw new Error(t('error.repoDbNotConnected').replace('{repo}', '[ReviewRepository]'))
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error('无效的审稿报告 ID')
+        db.transaction(() => {
+            const row = db.prepare('SELECT content_id FROM reviews WHERE id = ?').get(id) as { content_id: number } | undefined
+            if (!row) throw new Error('审稿报告不存在')
+            db.prepare('UPDATE revisions SET review_source_id = NULL WHERE review_source_id = ?').run(id)
+            db.prepare('DELETE FROM reviews WHERE id = ?').run(id)
+            db.prepare(`DELETE FROM contents WHERE id = ?
+                AND NOT EXISTS (SELECT 1 FROM drafts WHERE content_id = contents.id)
+                AND NOT EXISTS (SELECT 1 FROM draft_snapshots WHERE content_id = contents.id)
+                AND NOT EXISTS (SELECT 1 FROM revisions WHERE content_id = contents.id)
+                AND NOT EXISTS (SELECT 1 FROM reviews WHERE content_id = contents.id)
+                AND NOT EXISTS (SELECT 1 FROM scene_cards WHERE content_id = contents.id)`).run(row.content_id)
+        })()
+    }
+
     /** 获取下一个审稿序号 */
     static getNextIndex(baseDraftId: number): number {
         const db = getProjectDb()

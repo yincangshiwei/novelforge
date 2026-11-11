@@ -845,6 +845,7 @@ export interface DatabaseChannels {
   'db:review-list': { args: [baseDraftId: number]; return: ReviewMeta[] }
   'db:review-get-latest': { args: [baseDraftId: number]; return: ReviewFull | null }
   'db:review-get-full': { args: [id: number]; return: ReviewFull | null }
+  'db:review-delete': { args: [id: number]; return: { success: boolean; error?: string } }
   'db:review-next-index': { args: [baseDraftId: number]; return: number }
 
   // 互评评价

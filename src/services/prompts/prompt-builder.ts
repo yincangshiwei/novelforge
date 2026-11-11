@@ -49,7 +49,7 @@ export class BasePromptBuilder {
     result = result
       .replace(/(^|\n)★【[^】]*】★[：:]\s*\n?\s*$/gm, '')
       .replace(/(^|\n)【[^】]*（如有[^）]*）[^】]*】\s*\n?\s*$/gm, '')
-      .replace(/\n{3,}/g, '\n\n')
+
 
     // 防御性校验：检查是否有未处理的模板占位符
     const missing = result.match(/\{\{.*?\}\}/g)

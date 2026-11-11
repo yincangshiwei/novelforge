@@ -12,7 +12,7 @@ beforeEach(() => {
     CREATE TABLE revisions(id INTEGER PRIMARY KEY, base_draft_id INTEGER REFERENCES drafts(id) ON DELETE CASCADE, merged_to_draft_id INTEGER, content_id INTEGER REFERENCES contents(id) ON DELETE RESTRICT);
     CREATE TABLE reviews(id INTEGER PRIMARY KEY, base_draft_id INTEGER REFERENCES drafts(id) ON DELETE CASCADE, content_id INTEGER REFERENCES contents(id) ON DELETE RESTRICT);
     CREATE TABLE draft_branches(id INTEGER PRIMARY KEY, head_draft_id INTEGER, base_snapshot_id INTEGER);
-    CREATE TABLE scenes(id INTEGER PRIMARY KEY, content_id INTEGER);
+    CREATE TABLE scene_cards(id INTEGER PRIMARY KEY, content_id INTEGER);
     INSERT INTO contents VALUES(1,'draft'),(2,'snapshot'),(3,'revision'),(4,'review');
     INSERT INTO drafts VALUES(1,3,'archived',1);
     INSERT INTO draft_snapshots VALUES(1,1,2);
@@ -36,6 +36,14 @@ describe('归档草稿永久删除', () => {
     DraftRepository.deleteArchived(1, 3)
     expect(db.prepare('SELECT id FROM contents').all()).toEqual([{ id: 1 }])
     expect(db.prepare('SELECT id FROM drafts').all()).toEqual([{ id: 2 }])
+  })
+  it('场景卡引用的共享内容保留，其余无引用内容清理', () => {
+    db.exec('INSERT INTO scene_cards VALUES(1,4)')
+    DraftRepository.deleteArchived(1, 3)
+    expect(db.prepare('SELECT * FROM drafts').all()).toEqual([])
+    expect(db.prepare('SELECT * FROM reviews').all()).toEqual([])
+    expect(db.prepare('SELECT id FROM contents').all()).toEqual([{ id: 4 }])
+    expect(db.prepare('SELECT content_id FROM scene_cards').get()?.content_id).toBe(4)
   })
   it.each([0, -1, 1.5])('拒绝非法ID %s', id => {
     expect(() => DraftRepository.deleteArchived(id, 3)).toThrow()

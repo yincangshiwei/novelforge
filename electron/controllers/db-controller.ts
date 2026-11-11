@@ -718,6 +718,16 @@ export function registerDatabaseController() {
     return ReviewRepository.getFull(id)
   })
 
+  guardedHandle('db:review-delete', async (_event, id: number) => {
+    try {
+      ReviewRepository.delete(id)
+      return { success: true }
+    } catch (err) {
+      if (err instanceof Error && (err.name === 'AbortError' || isOperationRollback(err) || ('notCommitted' in err && err.notCommitted === true))) throw err
+      return { success: false, error: String(err) }
+    }
+  })
+
   guardedHandle('db:review-next-index', async (_event, baseDraftId: number) => {
     return ReviewRepository.getNextIndex(baseDraftId)
   })

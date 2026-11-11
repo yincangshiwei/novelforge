@@ -62,7 +62,7 @@ export class RefineFromReviewCommand extends BaseWorkflowCommand<string> {
       for (const span of spans) {
         this.throwIfCancelled(context)
         const request = JSON.stringify({
-          issue: span.issue, excerpt: span.quote,
+          issue: span.issue, issues: span.issues, excerpt: span.quote,
           contextBefore: full.content.slice(Math.max(0, span.start - 200), span.start),
           contextAfter: full.content.slice(span.end, span.end + 200),
           instruction: this.params.userRefinePrompt || '',
@@ -71,7 +71,7 @@ export class RefineFromReviewCommand extends BaseWorkflowCommand<string> {
           constraints + '\n\n' + request,
           t('review.localFixSystem'), callbacks, { purpose: 'refine_chapter' },
         )).trim()
-        if (!replacement || replacement.startsWith('```')) throw new Error(t('review.ambiguousQuote'))
+        if (!replacement || replacement.startsWith('```')) throw new Error(t('review.invalidReplacement'))
         edits.push({ start: span.start, end: span.end, replacement })
       }
       cleanRefined = applyReviewEdits(full.content, edits)

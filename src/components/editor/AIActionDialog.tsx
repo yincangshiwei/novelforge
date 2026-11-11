@@ -59,6 +59,7 @@ export interface AIActionDialogProps {
   onReviewDimToggle: (key: string) => void
   /** 确认执行 */
   onConfirm: () => void
+  confirmDisabled?: boolean
   /** 线③：修稿场景文案定制（审稿修稿复用本壳时传入） */
   refineCopy?: AIActionRefineCopy
   forceFullRefine?: boolean
@@ -75,6 +76,7 @@ export default memo(function AIActionDialog({
   onRefinePromptChange,
   onReviewDimToggle,
   onConfirm,
+  confirmDisabled = false,
   refineCopy,
   forceFullRefine,
   onForceFullRefineChange,
@@ -179,7 +181,7 @@ export default memo(function AIActionDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>{t('action.cancel')}</Button>
-          <Button variant="ai" onClick={onConfirm}>{action === 'refine' ? t(refineConfirmKey) : t('dialog.confirmExecute')}</Button>
+          <Button variant="ai" disabled={confirmDisabled} onClick={onConfirm}>{action === 'refine' ? t(refineConfirmKey) : t('dialog.confirmExecute')}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

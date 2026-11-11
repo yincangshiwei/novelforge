@@ -12,6 +12,8 @@ export interface ReviewIssue {
   description: string
   /** 引用的原文片段（有问题时提供） */
   quote?: string
+  quoteStart?: string
+  quoteEnd?: string
 }
 
 /** AI 返回的 JSON 审稿结构 */
@@ -21,6 +23,8 @@ interface ReviewJSON {
     severity: string
     description: string
     quote?: string
+    quoteStart?: string
+    quoteEnd?: string
   }>
   summary: string
 }
@@ -65,6 +69,8 @@ export function parseReport(text: string): { issues: ReviewIssue[]; summary: str
           severity: normalizeSeverity(item.severity),
           description: item.description || '',
           quote: item.quote || undefined,
+          quoteStart: item.quoteStart,
+          quoteEnd: item.quoteEnd,
         }))
         return { issues, summary: data.summary || '', parseFailed: false }
       }

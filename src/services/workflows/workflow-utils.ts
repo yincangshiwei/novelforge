@@ -58,6 +58,10 @@ export function stringifyField(val: unknown, joinBy: string = '、'): string {
 
 /** 表头别名映射：AI 可能使用中文/英文/缩写表头，统一映射到标准字段名 */
 const HEADER_ALIASES: Record<string, string> = {
+  'category': 'category', '分类': 'category', '检查维度': 'category', '维度': 'category',
+  'severity': 'severity', '严重程度': 'severity', '级别': 'severity',
+  'quote': 'quote', 'excerpt': 'quote', '原文引用': 'quote', '引用': 'quote', '原文': 'quote',
+  'description': 'description', '问题描述': 'description', '描述': 'description',
   // chapterNumber
   'chapterNumber': 'chapterNumber', 'chapternumber': 'chapterNumber',
   '章节': 'chapterNumber', '章节号': 'chapterNumber', '章': 'chapterNumber',

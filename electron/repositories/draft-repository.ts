@@ -345,7 +345,7 @@ export class DraftRepository {
                 AND NOT EXISTS (SELECT 1 FROM draft_snapshots WHERE content_id = contents.id)
                 AND NOT EXISTS (SELECT 1 FROM revisions WHERE content_id = contents.id)
                 AND NOT EXISTS (SELECT 1 FROM reviews WHERE content_id = contents.id)
-                AND NOT EXISTS (SELECT 1 FROM scenes WHERE content_id = contents.id)`)
+                AND NOT EXISTS (SELECT 1 FROM scene_cards WHERE content_id = contents.id)`)
             for (const content of contents) cleanup.run(content.content_id)
         })()
     }

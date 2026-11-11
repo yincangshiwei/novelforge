@@ -1,6 +1,7 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { useProjectStore } from '../../stores/project-store'
-import { getIgnoredReviewIssues, saveIgnoredReviewIssues, reviewIssueKey, isReviewCurrent, locateReviewEdits } from '../../services/review-actions'
+import { useWorkflowStore } from '../../stores/workflow-store'
+import { getIgnoredReviewIssues, saveIgnoredReviewIssues, reviewIssueKey, isReviewCurrent, locateReviewEdits, ReviewLocationError } from '../../services/review-actions'
 import { AlertTriangle, CheckCircle, Info, Sparkles, HelpCircle, Quote } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import { useTranslation } from '../../hooks/useTranslation'
@@ -83,6 +84,18 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
   const [ignored, setIgnored] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [actionError, setActionError] = useState('')
+  const launchLock = useRef(false)
+  const activeRuns = useWorkflowStore(state => state.activeRuns)
+  const hasActiveFix = (runs: typeof activeRuns) => runs.some(run =>
+    run.type === 'chapter_creation' && ['running', 'paused', 'waiting'].includes(run.status)
+    && run.rehydrateParams?.draftPath === draftPath && run.rehydrateParams?.__subflow === 'refine_from_review'
+  )
+  const fixRunning = hasActiveFix(activeRuns)
+  const fixBusy = processing || fixRunning
+  const reviewRunning = activeRuns.some(run =>
+    run.type === 'chapter_creation' && (run.status === 'running' || run.status === 'paused')
+    && run.rehydrateParams?.draftPath === draftPath && run.rehydrateParams?.__subflow === 'review'
+  )
   useEffect(() => {
     setIgnored(getIgnoredReviewIssues(reportText, projectId))
     setSelected(new Set())
@@ -111,7 +124,8 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
   const passCount = issues.filter((i) => i.severity === 'pass').length
 
   const doRefineFromReview = async (chosen?: ReviewIssue[]) => {
-    if (!draftPath || processing) return
+    if (!draftPath || processing || launchLock.current || hasActiveFix(useWorkflowStore.getState().activeRuns)) return
+    launchLock.current = true
     setProcessing(true)
     setActionError('')
     setShowRefineDialog(false)
@@ -127,8 +141,23 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
       if (!full || !await isReviewCurrent(reportText, meta.id, full.content)) throw new Error(t('review.staleReport'))
       const activeIssues = chosen ?? rawIssues.filter(item => item.severity !== 'pass' && !ignored.has(reviewIssueKey(item)))
       if (!activeIssues.length) return
-      if (chosen) locateReviewEdits(full.content, chosen)
-      const filteredReport = JSON.stringify({ ...JSON.parse(reportText), items: activeIssues })
+      let localOnly = !!chosen
+      if (chosen) {
+        try {
+          locateReviewEdits(full.content, chosen)
+        } catch (error) {
+          if (!(error instanceof ReviewLocationError)) throw error
+          const { confirm } = await import('../ui/Confirm')
+          const project = useProjectStore.getState().currentProject
+          const ok = await confirm(t('review.chapterFallback').replace('{reason}', error.message), {
+            title: t('review.aiFixTitle'), confirmText: t('review.aiFixBtn'),
+          })
+          if (!ok || useProjectStore.getState().currentProject !== project) return
+          localOnly = false
+        }
+      }
+      if (hasActiveFix(useWorkflowStore.getState().activeRuns)) return
+      const filteredReport = JSON.stringify({ ...JSON.parse(reportText), items: activeIssues, rawResponse: undefined })
       await startWithReceipt(createRefineFromReviewWorkflow({
         chapterNumber: meta.chapterNumber,
         chapterTitle: meta.chapterTitle || t('chapter.nLabel').replace('{n}', String(meta.chapterNumber)),
@@ -136,18 +165,19 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
         draftContent: full.content,
         reviewReport: filteredReport,
         reviewFileName: '',
-        localOnly: !!chosen,
+        localOnly,
         userRefinePrompt: userRefinePrompt.trim() || undefined,
       }))
     } catch (error) {
       setActionError(t('review.fixError').replace('{error}', String(error)))
     } finally {
+      launchLock.current = false
       setProcessing(false)
     }
   }
 
   const reviewAgain = async () => {
-    if (!draftPath || processing) return
+    if (!draftPath || fixBusy || launchLock.current || reviewRunning) return
     setProcessing(true)
     setActionError('')
     try {
@@ -325,15 +355,15 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
                           <div className="mt-2 ml-5 flex flex-wrap items-center gap-2">
                             <input type="checkbox" aria-label={t('review.fixSelected')}
                               checked={selected.has(reviewIssueKey(originalIssue(item)))}
-                              disabled={processing || ignored.has(reviewIssueKey(originalIssue(item)))}
+                              disabled={fixBusy || ignored.has(reviewIssueKey(originalIssue(item)))}
                               onChange={() => {
                                 const key = reviewIssueKey(originalIssue(item))
                                 setSelected(prev => { const next = new Set(prev); if (next.has(key)) next.delete(key); else next.add(key); return next })
                               }} />
-                            <Button size="sm" variant="ai" disabled={processing || ignored.has(reviewIssueKey(originalIssue(item))) || !item.quote}
+                            <Button size="sm" variant="ai" disabled={fixBusy || ignored.has(reviewIssueKey(originalIssue(item)))}
                               title={!item.quote ? t('review.noExactQuote') : undefined}
                               onClick={() => void doRefineFromReview([originalIssue(item)])}>{t('review.fixOne')}</Button>
-                            <Button size="sm" variant="ghost" disabled={processing} onClick={() => toggleIgnore(item)}>
+                            <Button size="sm" variant="ghost" disabled={fixBusy} onClick={() => toggleIgnore(item)}>
                               {t(ignored.has(reviewIssueKey(originalIssue(item))) ? 'review.restoreOne' : 'review.ignoreOne')}
                             </Button>
                           </div>
@@ -362,11 +392,13 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
             {actionError && (
               <div className="max-w-2xl mx-auto mb-2 flex items-center gap-2">
                 <p role="alert" className="flex-1 text-sm text-[var(--color-error)]">{actionError}</p>
-                <Button size="sm" variant="outline" disabled={processing} onClick={() => void reviewAgain()}>{t('review.reviewAgain')}</Button>
+                {!fixBusy && !reviewRunning && actionError !== t('review.started') && (
+                  <Button size="sm" variant="outline" onClick={() => void reviewAgain()}>{t('review.reviewAgain')}</Button>
+                )}
               </div>
             )}
             <div className="max-w-2xl mx-auto flex items-center justify-center gap-3">
-              <Button variant="ai" className="flex-1 min-w-0" disabled={processing || !rawIssues.some(item => selected.has(reviewIssueKey(item)) && !ignored.has(reviewIssueKey(item)))}
+              <Button variant="ai" className="flex-1 min-w-0" disabled={fixBusy || !rawIssues.some(item => selected.has(reviewIssueKey(item)) && !ignored.has(reviewIssueKey(item)))}
                 onClick={() => void doRefineFromReview(rawIssues.filter(item => selected.has(reviewIssueKey(item)) && !ignored.has(reviewIssueKey(item))))}>
                 {t('review.fixSelected')}
               </Button>
@@ -374,7 +406,7 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
                 variant="ai"
                 className="flex-1 min-w-0"
                 onClick={() => { setUserRefinePrompt(''); setShowRefineDialog(true) }}
-                disabled={processing}
+                disabled={fixBusy}
               >
                 <Sparkles size={14} className="mr-1" />
                 {t('review.aiFixBtn')}
@@ -391,7 +423,8 @@ export default function ReviewReport({ reportText, draftPath }: ReviewReportProp
         onClose={() => setShowRefineDialog(false)}
         onRefinePromptChange={setUserRefinePrompt}
         onReviewDimToggle={() => {}}
-        onConfirm={doRefineFromReview}
+        onConfirm={() => void doRefineFromReview()}
+        confirmDisabled={fixBusy}
         refineCopy={{
           titleKey: 'review.aiFixTitle',
           descKey: 'review.aiFixDesc2',

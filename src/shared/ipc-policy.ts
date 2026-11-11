@@ -178,6 +178,7 @@ export const IPC_CHANNEL_POLICY: Record<InvokeChannel, ChannelPolicy> = {
   'db:publication-list': { authority: 'read-project' },
   'db:publication-save': { authority: 'write-project' },
   'db:review-create': { authority: 'write-project' },
+  'db:review-delete': { authority: 'destructive' },
   'db:review-get-full': { authority: 'read-project' },
   'db:review-get-latest': { authority: 'read-project' },
   'db:review-list': { authority: 'read-project' },

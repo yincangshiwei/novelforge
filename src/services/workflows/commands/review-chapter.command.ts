@@ -177,19 +177,22 @@ export class ReviewChapterCommand extends BaseWorkflowCommand<string> {
       baseVersion,
       baseContentHash,
     }
-    await ipc.invoke('db:review-create', {
+    const saved = await ipc.invoke('db:review-create', {
       baseDraftId: baseDraft.id,
       reviewIndex: revIndex,
       content: JSON.stringify(dbContent, null, 2),
     })
+    if (!saved.success || !saved.id) throw new Error(saved.error || t('status.unknown'))
+    const { globalEventBus } = await import('../../../shared/event-bus')
+    globalEventBus.emit('REFRESH_RESOURCE', { resources: ['reviews'] })
 
     const reportContent = JSON.stringify(dbContent, null, 2)
 
     const { useEditorStore } = await import('../../../stores/editor-store')
-    const pseudoReviewPath = `vela://draft/ch${this.params.chapterNumber}/v${baseVersion}/review${revIndex}`
+    const pseudoReviewPath = `vela://review/${saved.id}`
     useEditorStore.getState().openFile({
-      id: `review-${this.params.draftPath}-${revIndex}`,
-      name: t('workflow.reviewReport').replace('{n}', String(this.params.chapterNumber)),
+      id: `review-report-${this.params.chapterNumber}-${saved.id}`,
+      name: t('editor.reviewLabel').replace('{version}', String(baseVersion)).replace('{index}', String(revIndex)),
       type: 'review-report',
       content: reportContent,
       filePath: this.params.draftPath,

@@ -35,6 +35,13 @@ describe('BasePromptBuilder.build', () => {
     expect(out.endsWith('[System] 请始终使用 中文 输出所有内容。Do not respond in any other language.')).toBe(true)
   })
 
+  it('正文中的多空行及CRLF保持逐字原样，不影响审稿引用', () => {
+    const builder = new BasePromptBuilder(makeTemplate({ content: '{{chapter_content}}' }))
+    const content = '甲\r\n\r\n\r\n乙\n\n\n\n丙'
+    builder['variables'] = { chapter_content: content }
+    expect(builder.build()).toContain(content)
+  })
+
   it('未赋值占位符警告但语言指令仍追加', () => {
     const builder = new BasePromptBuilder(makeTemplate())
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})

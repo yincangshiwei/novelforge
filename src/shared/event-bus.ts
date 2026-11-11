@@ -27,7 +27,7 @@ export type GlobalEventType =
 
 export interface EventPayloadMap {
   'REFRESH_RESOURCE': {
-    resources: Array<'fileTree' | 'characterCards' | 'drafts' | 'blueprints' | 'all'>
+    resources: Array<'fileTree' | 'characterCards' | 'drafts' | 'reviews' | 'blueprints' | 'all'>
   }
   'WORKFLOW_COMPLETE': {
     type: string

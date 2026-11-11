@@ -299,14 +299,15 @@ export const useDraftStore = create<DraftState>()((set, get) => ({
           const reportContent = JSON.stringify({ ...report, scope: 'merged_draft', revisionId: revPath, baseContentHash: await reviewContentHash(mergedText) })
           const reviewIndex = await ipc.invoke('db:review-next-index', targetDraftId)
           const saved = await ipc.invoke('db:review-create', { baseDraftId: targetDraftId, reviewIndex, content: reportContent })
-          if (!saved.success) throw new Error(saved.error)
+          if (!saved.success || !saved.id) throw new Error(saved.error)
+          globalEventBus.emit('REFRESH_RESOURCE', { resources: ['reviews'] })
           useEditorStore.getState().openFile({
-            id: `merged-audit-${targetDraftId}-${reviewIndex}`,
-            name: t('audit.mergedReport'),
+            id: `merged-audit-${targetDraftId}-${saved.id}`,
+            name: `${t('audit.mergedReport')} · ${t('editor.reviewLabel').replace('{version}', String(meta?.version ?? version)).replace('{index}', String(reviewIndex))}`,
             type: 'review-report',
             content: reportContent,
             chapterNumber,
-            reportPath: `vela://draft/${targetDraftId}/review${reviewIndex}`,
+            reportPath: `${VELA.REVIEW}${saved.id}`,
           })
         } catch (error) {
           console.warn(t('audit.refinementUnchecked'), error)

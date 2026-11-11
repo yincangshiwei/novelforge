@@ -762,17 +762,23 @@ export function aiFlavorAudit(text: string, whitelist?: AuditWhitelist): AuditRe
 
   // 4. 对话区台词复读检测（弥补 waterAudit stripDialogue 盲区）
   const dialogueFreq = new Map<string, number>()
+  const dialoguePositions = new Map<string, Set<number>>()
   for (const m of text.matchAll(/[“「]([^”」\n]{5,60})[”」]/g)) {
     const line = m[1].replace(/[，。！？…\s]+$/g, '').trim()
     if (line.length < 5) continue
     if (whitelist?.sentences?.includes(line)) continue
     dialogueFreq.set(line, (dialogueFreq.get(line) ?? 0) + 1)
+    const paragraphNumber = text.slice(0, m.index).split(/\n\s*\n+/).slice(0, -1).filter(p => p.trim()).length + 1
+    const positions = dialoguePositions.get(line) ?? new Set<number>()
+    positions.add(paragraphNumber)
+    dialoguePositions.set(line, positions)
   }
   for (const [line, count] of dialogueFreq.entries()) {
     if (count >= 3 || (line.length >= 12 && count >= 2)) {
       issues.push({
         kind: 'repetition',
         severity: 'warn',
+        position: [...(dialoguePositions.get(line) ?? [])].map(n => `第${n}段`).join('、'),
         message: t('audit.aiDialogueRepeat')
           .replace('{line}', line.length > 25 ? line.slice(0, 25) + '…' : line)
           .replace('{n}', String(count)),

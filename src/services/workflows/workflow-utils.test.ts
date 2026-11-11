@@ -12,6 +12,11 @@ import {
 
 describe('parseMarkdownTable', () => {
   describe('审稿表格解析 (Bug Fix)', () => {
+    it('中文和别名表头保留审稿原文引用', () => {
+      const result = parseMarkdownTable('| 分类 | 严重程度 | 原文引用 | 问题描述 |\n|---|---|---|---|\n| 剧情 | warning | 连续原文 | 衔接问题 |')
+      expect(result?.[0]).toEqual({ category: '剧情', severity: 'warning', quote: '连续原文', description: '衔接问题' })
+      expect(parseMarkdownTable('| category | severity | excerpt | description |\n|---|---|---|---|\n| 剧情 | warning | 原文 | 问题 |')?.[0].quote).toBe('原文')
+    })
     it('应正确解析标准 Markdown 审稿表格', () => {
       const input = `| category | severity | quote | description |
 |----------|----------|-------|-------------|
