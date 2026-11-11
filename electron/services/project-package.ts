@@ -168,18 +168,24 @@ export function relocateDatabasePaths(file: string, oldRoot: string, newRoot: st
       for (const { name } of tables) {
         if (name.includes('fts')) continue
         const columns = db.pragma(`table_info(${quote(name)})`) as Array<{ name: string; type: string }>
-        const rows = db.prepare(`SELECT rowid AS __transfer_rowid, * FROM ${quote(name)}`).iterate() as Iterable<Record<string, unknown>>
-        for (const row of rows) {
-          for (const column of columns) {
-            const text = row[column.name]
-            if (typeof text !== 'string') continue
-            let updated: unknown = text
-            if (column.name.toLowerCase().includes('path') || column.name === 'scope') updated = remapStructuredPaths(text, oldRoot, newRoot)
-            else if (/^[\[{]/.test(text.trim())) {
-              try { updated = JSON.stringify(remapStructuredPaths(JSON.parse(text), oldRoot, newRoot)) } catch { continue }
+        let offset = 0
+        const select = db.prepare(`SELECT rowid AS __transfer_rowid, * FROM ${quote(name)} ORDER BY rowid LIMIT 100 OFFSET ?`)
+        while (true) {
+          const rows = select.all(offset) as Record<string, unknown>[]
+          if (!rows.length) break
+          for (const row of rows) {
+            for (const column of columns) {
+              const text = row[column.name]
+              if (typeof text !== 'string') continue
+              let updated: unknown = text
+              if (column.name.toLowerCase().includes('path') || column.name === 'scope') updated = remapStructuredPaths(text, oldRoot, newRoot)
+              else if (/^[\[{]/.test(text.trim())) {
+                try { updated = JSON.stringify(remapStructuredPaths(JSON.parse(text), oldRoot, newRoot)) } catch { continue }
+              }
+              if (updated !== text) db.prepare(`UPDATE ${quote(name)} SET ${quote(column.name)} = ? WHERE rowid = ?`).run(updated, row.__transfer_rowid)
             }
-            if (updated !== text) db.prepare(`UPDATE ${quote(name)} SET ${quote(column.name)} = ? WHERE rowid = ?`).run(updated, row.__transfer_rowid)
           }
+          offset += rows.length
         }
       }
     })()
