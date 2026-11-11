@@ -18,6 +18,8 @@ import {
   type SubAgentSession, type SubAgentTask,
 } from './types'
 import type { AgentProgress } from '../progress-tracker'
+import type { AgentTaskBudget } from '../execution-budget'
+import { ActiveTimeout } from '../active-timeout'
 
 export interface SubAgentDeps {
   generate: LLMGenerateFn
@@ -27,6 +29,8 @@ export interface SubAgentDeps {
   confirm: (toolCall: ToolCallInfo, signal?: AbortSignal) => Promise<boolean>
   /** 父的取消信号（与父的 AbortController 绑定） */
   signal?: AbortSignal
+  taskBudget?: AgentTaskBudget
+  pauseExecutionTimeout?: () => () => void
   executionScope?: string
   conversationId?: string
   beforeExecute?: (session: SubAgentSession) => Promise<boolean>
@@ -107,7 +111,7 @@ export async function runSubAgent(task: SubAgentTask, deps: SubAgentDeps): Promi
   let finalized = false
   const active = (): boolean => !finalized && !controller.signal.aborted
   // 真实定时器是**兜底**：LLM 调用真的挂住时用它中断；正常路径由「跑完后的墙钟比对」判定
-  const timer = setTimeout(() => { timedOut = true; controller.abort() }, SUBAGENT_MAX_MS)
+  const executionTimeout = new ActiveTimeout(SUBAGENT_MAX_MS, () => { timedOut = true; controller.abort() }, now)
   const onParentAbort = (): void => controller.abort()
   deps.signal?.addEventListener('abort', onParentAbort, { once: true })
   if (deps.signal?.aborted) controller.abort()
@@ -152,10 +156,19 @@ export async function runSubAgent(task: SubAgentTask, deps: SubAgentDeps): Promi
       if (artifacts?.length) session.artifacts.push(...artifacts)
       emit()
     },
-    onToolCallConfirmRequired: (tc) => abortable(() => deps.confirm(tc, controller.signal)),
+    onToolCallConfirmRequired: async (tc) => {
+      const resume = executionTimeout.pause()
+      const resumeParent = deps.pauseExecutionTimeout?.()
+      try { return await abortable(() => deps.confirm(tc, controller.signal)) }
+      finally { resume(); resumeParent?.() }
+    },
     onDone: (fullText, toolCalls, artifacts, outcome) => {
       if (!active()) return
-      if (outcome && outcome.status !== 'completed') session.error = `任务未完成：${outcome.status}`
+      session.executionOutcome = outcome
+      if (outcome && outcome.status !== 'completed') session.error = outcome.stopReason === 'no_progress'
+        ? t('agent.noProgressStopped') : outcome.stopReason === 'budget_exhausted'
+          ? t('agent.maxStepsReached').replace('{maxSteps}', String(outcome.stepBudget))
+          : `任务未完成：${outcome.status}`
       // 用清洗后的全文**重写**最后一条 assistant 消息（跨 chunk 切开的标签只有这里能清干净）；
       // result 同样取清洗后文本 —— 父端 formatSubAgentResult 会把 result 灌回父上下文，DSML 原文不得外溢
       const cleanedFull = stripToolTags(fullText)
@@ -172,7 +185,7 @@ export async function runSubAgent(task: SubAgentTask, deps: SubAgentDeps): Promi
 
   /** 终态判定：超时 → failed（spec §3.9）；父取消 → cancelled；引擎报错 → failed；否则 completed */
   const settle = (): void => {
-    const elapsed = now() - startedAt
+    const elapsed = executionTimeout.elapsedMs
     if (timedOut || elapsed > SUBAGENT_MAX_MS) {
       session.status = 'failed'
       session.error = t('subagent.timeout')
@@ -190,7 +203,7 @@ export async function runSubAgent(task: SubAgentTask, deps: SubAgentDeps): Promi
     const systemPrompt = await abortable(() => deps.buildPrompt(task))
     await runAgentLoop(
       systemPrompt, [], task.prompt, task.modelId, generate, callbacks, controller.signal,
-      { allowedTools: task.allowedTools },
+      { allowedTools: task.allowedTools, taskBudget: deps.taskBudget },
       { allowedTools: task.allowedTools, executionScope: deps.executionScope, conversationId: deps.conversationId },
     )
     settle()
@@ -199,7 +212,7 @@ export async function runSubAgent(task: SubAgentTask, deps: SubAgentDeps): Promi
     settle()
   } finally {
     finalized = true
-    clearTimeout(timer)
+    executionTimeout.dispose()
     deps.signal?.removeEventListener('abort', onParentAbort)
     session.endedAt = now()
     session.toolCalls = sanitizeToolCalls(session.toolCalls)

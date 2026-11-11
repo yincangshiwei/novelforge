@@ -7,6 +7,7 @@ import { useProjectStore } from './project-store'
 import { renderLog } from '../services/render-logger'
 import { toast } from '../components/ui/Toast'
 import { ipc } from '../services/ipc-client'
+import { registerUserAttention } from '../services/user-attention'
 import { drainLLMRequests } from '../services/llm/request-drain'
 import { CLOSE_DRAIN_TIMEOUT_MS, waitForCloseResult } from '../shared/close-deadline'
 import { isCloseCoordinating } from '../shared/close-coordinator'
@@ -1108,7 +1109,14 @@ async function executeRunBody(
         })
         get().addLog('info', `[${definition.title}] Waiting: step ${i + 2} — ${definition.steps[i + 1].name}`)
         void saveCheckpoint(get())
-        await new Promise<void>((resolve) => { continueResolveRefs.set(run.id, resolve) })
+        const clearAttention = registerUserAttention('workflow', () => {
+          if (!get().waitingRuns[run.id]?.waitingForConfirm) return
+          get().selectRun(run.id)
+          useLayoutStore.getState().openBottomTab('tasks')
+          useLayoutStore.getState().openRightPanel('ai-output')
+        })
+        try { await new Promise<void>((resolve) => { continueResolveRefs.set(run.id, resolve) }) }
+        finally { clearAttention() }
         if (context.cancelled) break
         updateRunById(set, run.id, { status: 'running' })
       }

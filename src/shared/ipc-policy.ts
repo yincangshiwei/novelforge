@@ -53,6 +53,7 @@ export interface ChannelPolicy {
  * 新增事件通道时改这里 + `AllEventChannels`（类型侧）；parity 测试会校验两者一致。
  */
 export const IPC_EVENT_CHANNELS = [
+  'attention:activate',
   'llm:stream-chunk',
   'llm:stream-done',
   'llm:stream-error',
@@ -67,6 +68,8 @@ export const IPC_EVENT_CHANNELS = [
  * 通道 → 策略。S2 阶段只填 authority；pathArgs 由 S8 补齐。
  */
 export const IPC_CHANNEL_POLICY: Record<InvokeChannel, ChannelPolicy> = {
+  'attention:register': { authority: 'write-global' },
+  'attention:clear': { authority: 'write-global' },
   'agent:operation-invoke': { authority: 'write-project' },
   'agent:operation-cancel': { authority: 'write-project' },
   'agent:operation-list': { authority: 'read-project' },

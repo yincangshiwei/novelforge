@@ -337,6 +337,7 @@ app.on('before-quit', (e) => {
 })
 
 app.whenReady().then(async () => {
+  if (process.platform === 'win32') app.setAppUserModelId('com.novelforge.ide')
   // 全局目录迁移：~/.vela → ~/.novelforge（config.json 哨兵判定 + auto 形态新目录清理重试——
   // 失败静默、旧路径兜底读取；在 logger/ensureVelaHome 首次写入新目录之前执行，
   // 避免新目录固化出非 auto 形态后迁移永久搁浅）

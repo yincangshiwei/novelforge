@@ -13,6 +13,7 @@
 
 import { t } from '../../shared/locale'
 import { waitWithAbort } from './abort-wait'
+import { AgentTaskBudget, NoProgressGuard, executionResultKey, stableExecutionValue } from './execution-budget'
 import { executeTool, ToolExecutionInterrupted } from './tool-execution'
 import { validateToolCalls, type LLMChatMessage, type LLMStepResult } from '../../shared/llm-tool-protocol'
 import { toolRegistry, type AgentTool, type ToolArtifact } from './tool-registry'
@@ -37,16 +38,6 @@ import {
 } from './dsml-tool-calls'
 
 // ===== 常量 =====
-
-/**
- * 单次用户轮次（turn）内允许的**步骤（step）**上限（防止死循环）。
- *
- * 术语对齐 DSH `packages/core/agent-loop`：
- * - **turn / 轮次** = 一条用户输入驱动的整个过程（可含多个 step，到最终回复为止）；
- * - **step / 步骤** = 一次模型请求 + 该次回复里全部工具调用的执行与结果回填。
- * 同一步可包含**多个**工具调用（只读并行、写/确认串行）；本常量限制的是**步数**，不是调用个数。
- */
-const MAX_STEPS = 8
 
 /** Tool 执行超时（毫秒） */
 const TOOL_TIMEOUT_MS = 30_000
@@ -159,6 +150,7 @@ export interface AgentEngineOptions {
    * 工具不执行，注入「不在白名单」观察）。缺省 undefined = 全量，父 agent 行为与现状逐字一致。
    */
   allowedTools?: string[]
+  taskBudget?: AgentTaskBudget
 }
 
 /** LLM 消息格式 */
@@ -188,7 +180,7 @@ export type LLMGenerateFn = (
  * 1. 将系统提示（含 Tool 描述）+ 历史消息 + 用户消息发送给 LLM
  * 2. 解析 LLM 回复中的 <tool_call> 标签
  * 3. 如果有 tool_call → 执行 Tool → 将结果作为 observation 追加到消息历史 → 重新调用 LLM
- * 4. 循环直到 LLM 不再调用 Tool 或达到 MAX_STEPS（单步可含多个工具调用）
+ * 4. 正常连续执行，直到最终回复、任务总预算耗尽或重复无进展（单步可含多个工具调用）
  * 5. 返回最终文本回复
  */
 export async function runAgentLoop(
@@ -214,7 +206,16 @@ export async function runAgentLoop(
 
   // 初始化进度追踪
   const progress = new ProgressTracker()
-  progress.start(MAX_STEPS)
+  const taskBudget = options?.taskBudget ?? new AgentTaskBudget()
+  progress.start(taskBudget.maxSteps)
+  const noProgress = new NoProgressGuard()
+  let stopReason: ExecutionOutcome['stopReason']
+  const observeProgress = (keys: string[]): boolean => {
+    const action = noProgress.observe(keys)
+    if (action === 'adjust') messages.push({ role: 'user', content: t('agent.noProgressAdjust') })
+    if (action === 'stop') stopReason = 'no_progress'
+    return action === 'stop'
+  }
 
   let steps = 0
   let fullAssistantText = ''
@@ -238,9 +239,12 @@ export async function runAgentLoop(
     const receipts = calls.flatMap(call => call.receipt ? [call.receipt] : [])
     const outcome: ExecutionOutcome = {
       turnId,
-      status: abortSignal?.aborted ? 'cancelled' : steps >= MAX_STEPS ? 'exhausted' : mutationClaims.length || claims.length ? 'unverified'
+      status: abortSignal?.aborted ? 'cancelled' : stopReason ? 'exhausted' : mutationClaims.length || claims.length ? 'unverified'
         : calls.some(call => call.status === 'failed') ? 'partial' : 'completed',
       receipts,
+      stopReason,
+      stepsUsed: taskBudget.used,
+      stepBudget: taskBudget.maxSteps,
     }
     if (timeline.filter(block => block.kind === 'text').map(block => block.text).join('') !== finalText) {
       const toolBlocks = timeline.filter(block => block.kind === 'tools')
@@ -253,7 +257,7 @@ export async function runAgentLoop(
   }
 
   // 恢复阶梯状态（withhold-then-recover，P0-2）：可恢复错误先恢复后放行；
-  // 单次调用生命周期（跨调用持久化 deferred）；重试消耗 steps 计数（最多 3 次恢复，MAX_STEPS=8 仍剩 5 步工具循环）
+  // 恢复重试计入共享任务预算，不因降档或诊断重新获得额度。
   type RecoveryStage = 'none' | 'compacting' | 'meta-injected'
   let recoveryStage: RecoveryStage = 'none'
   let consecutiveRecoveryFailures = 0
@@ -268,14 +272,21 @@ export async function runAgentLoop(
     options?.modelContextWindow, options?.budgetPercent, options?.maxMessageBudgetTokens,
   )
 
-  while (steps < MAX_STEPS) {
+  while (!stopReason) {
     // 检查中止信号
     if (abortSignal?.aborted) {
       finish(fullAssistantText + '\n\n_' + t('agent.stoppedGenerating') + '_', allToolCalls, allArtifacts)
       return
     }
 
+    if (!taskBudget.consume()) {
+      stopReason = 'budget_exhausted'
+      break
+    }
     steps++
+    progress.stepCompleted()
+    progress.setPhase('thinking')
+    callbacks.onProgress?.(progress.getProgress())
 
     // 调用 LLM（支持流式：onChunk 实时推送文本，引擎收到流式文本后不再重复输出）
     // 发送前按当前预算压缩消息副本（完整 messages 仍保留给后处理使用）
@@ -319,9 +330,8 @@ export async function runAgentLoop(
       // 可恢复错误（上下文超限类）→ withhold-then-recover：降档压缩 → meta 注入 → 熔断放行。
       // 非可恢复错误直接放行（无额外调用 = 无额外费用）。
       const errText = String(error)
-      // 已到最后一步（steps >= MAX_STEPS）：continue 会退出循环 → 走 maxStepsReached
-      // 误报并吞掉真实错误——重试无意义时错误透传（final review 回归：工具循环后段超限错误最高发）
-      if (steps >= MAX_STEPS) {
+      // 预算耗尽时保留真实错误，不将失败伪装成安全停止。
+      if (taskBudget.remaining === 0) {
         callbacks.onError(t('agent.llmCallFailed').replace('{error}', errText))
         return
       }
@@ -407,6 +417,7 @@ export async function runAgentLoop(
           content: t('engine.parseDiagnosis').replace('{feedback}', errorFeedback),
         })
         console.warn('[AgentEngine] 注入解析错误反馈给 LLM，触发自我修正')
+        if (observeProgress(['parse:' + executionResultKey(errorFeedback)])) break
         continue
       }
       // 部分失败：解析诊断追加到本轮 observation 头部（toolCalls 继续正常执行）
@@ -458,7 +469,7 @@ export async function runAgentLoop(
 
     if (toolCalls.length === 0) {
       const mutationClaims = unsupportedMutationClaims(fullAssistantText, allToolCalls)
-      if (mutationClaims.length && !mutationClaimCorrectionUsed && steps < MAX_STEPS) {
+      if (mutationClaims.length && !mutationClaimCorrectionUsed && taskBudget.remaining > 0) {
         mutationClaimCorrectionUsed = true
         fullAssistantText = removeMutationClaims(fullAssistantText, mutationClaims)
         callbacks.onTextReplace?.(fullAssistantText)
@@ -467,7 +478,7 @@ export async function runAgentLoop(
         continue
       }
       const claims = unsupportedWorkflowClaims(fullAssistantText, claimEvidence)
-      if (claims.length > 0 && !workflowClaimCorrectionUsed && steps < MAX_STEPS) {
+      if (claims.length > 0 && !workflowClaimCorrectionUsed && taskBudget.remaining > 0) {
         workflowClaimCorrectionUsed = true
         fullAssistantText = removeUnsupportedWorkflowClaims(fullAssistantText, claims)
         callbacks.onTextReplace?.(fullAssistantText)
@@ -613,13 +624,23 @@ export async function runAgentLoop(
       for (let i = 0; i < jobs.length; i++) messages.push({ role: 'tool', toolCallId: jobs[i].info.id, name: jobs[i].info.toolName, content: observationParts[i] })
       if (parseFeedbackForObservation) messages.push({ role: 'user', content: parseFeedbackForObservation })
     } else messages.push({ role: 'user', content: observation })
+    if (observeProgress(jobs.map(({ info }) => stableExecutionValue({
+      tool: info.toolName, arguments: info.arguments, status: info.status,
+      result: resultKeys.get(info) ?? executionResultKey([info.result, info.error]),
+    })))) break
   }
 
-  // 达到单次轮次的步骤上限
-  if (steps >= MAX_STEPS) {
-    // 文案占位符 {maxSteps}：步数上限的唯一来源是 MAX_STEPS（不在文案里硬编码 8）
-    fullAssistantText += '\n\n⚠️ ' + t('agent.maxStepsReached').replace('{maxSteps}', String(MAX_STEPS))
+  if (abortSignal?.aborted) {
+    finish(fullAssistantText + '\n\n_' + t('agent.stoppedGenerating') + '_', allToolCalls, allArtifacts)
+    return
   }
+  const reason = stopReason === 'no_progress' ? t('agent.noProgressStopped')
+    : t('agent.maxStepsReached').replace('{maxSteps}', String(taskBudget.maxSteps))
+  const summary = t('agent.executionStopSummary')
+    .replace('{steps}', String(taskBudget.used))
+    .replace('{completed}', String(allToolCalls.filter(call => call.status === 'completed').length))
+    .replace('{failed}', String(allToolCalls.filter(call => call.status === 'failed').length))
+  fullAssistantText += `\n\n${reason}\n${summary}`
 
   // 运行后处理管道
   try {
@@ -665,6 +686,8 @@ interface ToolJobOutcome {
   observation: string
   artifacts: ToolArtifact[]
 }
+
+const resultKeys = new WeakMap<ToolCallInfo, string>()
 
 /**
  * 执行单个 tool_call 的完整管线（M1 从原串行 for 循环体抽取）：
@@ -757,6 +780,10 @@ async function executeToolJob(
       turnId: info.turnId!, step: info.step!, callId: info.id, operationId: info.id, scope: deps?.executionScope, toolName: tool.name, conversationId: deps?.conversationId,
     }, tool.timeoutMs ?? TOOL_TIMEOUT_MS)
 
+    resultKeys.set(info, executionResultKey({
+      success: result.success, content: result.content, error: result.error,
+      persistence: result.persistence, executionState: result.executionState, artifacts: result.artifacts,
+    }))
     // 截断过长的结果
     const truncatedContent = truncateResult(result.content, TOOL_RESULT_MAX_TOKENS)
 

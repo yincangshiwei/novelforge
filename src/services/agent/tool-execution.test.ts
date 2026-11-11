@@ -13,6 +13,26 @@ const tool = (execute: () => Promise<ToolResult>) => buildAgentTool({ name: 'p2_
 afterEach(() => vi.useRealTimers())
 
 describe('工具中断与未知写入', () => {
+  it('父task等待审批时暂停超时，恢复后只消耗剩余执行预算', async () => {
+    vi.useFakeTimers()
+    let resume!: () => void
+    let finish!: (result: ToolResult) => void
+    const task = buildAgentTool({ name: 'task', description: '', source: 'builtin',
+      inputSchema: { type: 'object', properties: {} }, requiresConfirmation: false, isReadOnly: true,
+      execute: async (_args, ctx) => {
+        resume = ctx!.pauseExecutionTimeout!()
+        return new Promise<ToolResult>(resolve => { finish = resolve })
+      },
+    })
+    const running = executeTool(task, {}, context(), 100)
+    await vi.advanceTimersByTimeAsync(10000)
+    resume()
+    await vi.advanceTimersByTimeAsync(99)
+    finish({ success: true, content: 'done' })
+    expect((await running).success).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it.each(['运行期中断', '归档恢复'] as const)('%s 核对使用新IPC及取消身份，不重复写入', async mode => {
     const c = context()
     c.scope = crypto.randomUUID()

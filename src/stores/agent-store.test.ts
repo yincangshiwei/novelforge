@@ -1340,13 +1340,29 @@ describe('子 agent 写操作审批（C 档第二轮 T6）', () => {
     await expect(deny).resolves.toBe(false)
   })
 
-  it('超时 → 自动拒绝且卡消失（Review Focus 4：无人场不悬挂）', async () => {
+  it('配置2分钟：超时自动拒绝且卡消失', async () => {
+    configResponse = { attention: { approvalTimeoutMinutes: 2, soundEnabled: false } }
     vi.useFakeTimers()
     const p = ask(call('write_file', { file_path: 'drafts/c30.md' }))
     await Promise.resolve()   // 让决策层的 await 走完（fake timers 不影响 microtask）
     await vi.advanceTimersByTimeAsync(SUBAGENT_CONFIRM_TIMEOUT_MS + 1)
     await expect(p).resolves.toBe(false)
     expect(useAgentStore.getState().pendingSubAgentConfirmation).toBeNull()
+    vi.useRealTimers()
+  })
+
+  it('不限审批等待超过30分钟仍挂起，取消后清理卡片和后台提醒', async () => {
+    configResponse = { attention: { approvalTimeoutMinutes: 0, soundEnabled: true } }
+    vi.useFakeTimers()
+    const ac = new AbortController()
+    const p = ask(call('write_file', { file_path: 'drafts/c30.md' }), ac.signal)
+    await vi.advanceTimersByTimeAsync(1800000)
+    expect(useAgentStore.getState().pendingSubAgentConfirmation).not.toBeNull()
+    expect(mockInvoke.mock.calls.some(call => call[0] === 'attention:register')).toBe(true)
+    ac.abort()
+    await expect(p).resolves.toBe(false)
+    expect(useAgentStore.getState().pendingSubAgentConfirmation).toBeNull()
+    expect(mockInvoke.mock.calls.some(call => call[0] === 'attention:clear')).toBe(true)
     vi.useRealTimers()
   })
 
@@ -2194,6 +2210,19 @@ describe('agentProgress 接线与竞态守卫', () => {
 
   afterEach(() => {
     useAgentStore.getState().cancelGeneration()
+  })
+
+  it('短会话也读取任务预算，启动时冻结预算快照', async () => {
+    configResponse = { agentExecution: { maxTaskSteps: 240 } }
+    useAgentStore.getState().createConversation({ title: 'T' })
+    useLLMStore.setState({ defaultModelId: 'test-model' })
+    void useAgentStore.getState().sendMessage('你好')
+    await vi.waitFor(() => expect(cbSeen.length).toBe(1))
+    const budget = mockRunAgentLoop.mock.calls[0][7]?.taskBudget
+    expect(budget?.maxSteps).toBe(240)
+    expect(budget?.used).toBe(0)
+    configResponse = { agentExecution: { maxTaskSteps: 500 } }
+    expect(budget?.maxSteps).toBe(240)
   })
 
   it('onProgress 写入 agentProgress（此前引擎在发、store 未接）', async () => {

@@ -319,7 +319,11 @@ export default memo(function AgentMessage({ message, onFork, onRewind, rewindDis
           <div role="status" className="mb-2 opacity-70">
             {message.executionOutcome.status === 'unverified' ? '修改完成声明未通过执行核验'
               : message.executionOutcome.status === 'cancelled' ? '任务已停止，不能视为完成'
-              : message.executionOutcome.status === 'exhausted' ? '已达到步骤上限，任务未确认完成' : '部分操作失败，请查看工具结果'}
+              : message.executionOutcome.status === 'exhausted'
+                ? message.executionOutcome.stopReason === 'no_progress' ? t('agent.noProgressStopped')
+                  : message.executionOutcome.stepBudget ? t('agent.maxStepsReached').replace('{maxSteps}', String(message.executionOutcome.stepBudget))
+                    : '已达到历史任务的步骤上限，任务未确认完成'
+                : '部分操作失败，请查看工具结果'}
           </div>
         )}
 

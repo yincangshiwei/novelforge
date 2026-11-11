@@ -16,6 +16,9 @@ export interface ExecutionOutcome {
   turnId: string
   status: 'completed' | 'partial' | 'unverified' | 'exhausted' | 'cancelled'
   receipts: ExecutionReceipt[]
+  stopReason?: 'budget_exhausted' | 'no_progress'
+  stepsUsed?: number
+  stepBudget?: number
 }
 
 const CONFIG_FIELDS: Record<string, string[]> = {

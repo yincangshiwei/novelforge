@@ -1,5 +1,8 @@
 import { create } from 'zustand'
 import { waitForApproval, waitWithAbort } from '../services/agent/abort-wait'
+import { registerUserAttention } from '../services/user-attention'
+import { resolveAttentionPrefs, approvalTimeoutMs } from '../shared/attention-prefs'
+import { useLayoutStore } from './layout-store'
 import { ArchiveQueue } from '../services/agent/archive-queue'
 import { CLOSE_DRAIN_TIMEOUT_MS, waitForCloseResult } from '../shared/close-deadline'
 import { isCloseCoordinating } from '../shared/close-coordinator'
@@ -15,6 +18,7 @@ import { thinkingLevelSpec } from '../shared/thinking-level'
 import { agentModeToTier } from '../services/llm/model-router'
 import { buildAgentSystemPromptAsync } from '../services/agent/context-builder'
 import { runAgentLoop, type ToolCallInfo, type LLMMessage, type AgentEngineDeps } from '../services/agent/agent-engine'
+import { AgentTaskBudget, resolveAgentExecutionPrefs } from '../services/agent/execution-budget'
 import type { AgentProgress } from '../services/agent/progress-tracker'
 import { clearReadState } from '../services/agent/tools/read-file.tool'
 import { registerBuiltinTools } from '../services/agent/tools'
@@ -47,7 +51,7 @@ import { ipc } from '../services/ipc-client'
 import { renderLog } from '../services/render-logger'
 import { useProjectStore } from './project-store'
 import type { SubAgentSession, SubAgentTask } from '../services/agent/subagent/types'
-import { MAX_SUB_SESSIONS, SUBAGENT_CONFIRM_TIMEOUT_MS } from '../services/agent/subagent/types'
+import { MAX_SUB_SESSIONS } from '../services/agent/subagent/types'
 import { computeSubAgentTaskRef, resolveSubAgentTools } from '../services/agent/subagent/taskref'
 import { COMPACTION_HISTORY_MIN_TOKENS, DEFAULT_COMPACTION_PREFS, resolveCompactionPrefs, computeHistoryBudget, type CompactionPrefs } from '../services/agent/compaction-prefs'
 import { resolveContextPolicyFor } from '../services/agent/context-policy'
@@ -236,7 +240,7 @@ interface AgentState {
   cancelGeneration: () => Promise<void>
   /** C 档第二轮：派发子 agent（task 工具入口）——`ok=false` 表示未完成（工具侧据此报失败）；
    *  `artifacts` 供父消息展示子 agent 改过哪些文件（spec §3.6 的产物合并） */
-  runSubAgentTask: (input: { description: string; prompt?: string; tools?: string[]; signal?: AbortSignal }) => Promise<{
+  runSubAgentTask: (input: { description: string; prompt?: string; tools?: string[]; signal?: AbortSignal; pauseExecutionTimeout?: () => () => void }) => Promise<{
     text: string
     ok: boolean
     artifacts?: ToolArtifact[]
@@ -443,6 +447,7 @@ const pendingConfirmations = new Map<string, {
 
 /** 当前活跃的 AbortController（用于取消 ReAct 循环） */
 let activeAbortController: AbortController | null = null
+const taskBudgets = new WeakMap<AbortSignal, AgentTaskBudget>()
 
 /** 当前活跃的流式 LLM 请求 ID（llm:cancel 真正取消底层生成，替代无效的 assistantMsg.id） */
 let activeStreamRequestId: string | null = null
@@ -1339,6 +1344,11 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
         },
       }
 
+      const executionConfig = await ipc.invoke('config:get')
+      if (abortController.signal.aborted || mySeq !== generationSeq || preparingClose) return
+      const taskBudget = new AgentTaskBudget(resolveAgentExecutionPrefs(executionConfig).maxTaskSteps)
+      taskBudgets.set(abortController.signal, taskBudget)
+
       // 启动 ReAct 循环（使用预取增强后的用户消息）
       // 分块缓冲：减少 React re-render 次数
       // 纯时间驱动（间隔硬约束）：流式 chunk 大小不受控（快模型单片可 >200 字符），
@@ -1459,6 +1469,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
             // 规则命中 / 只读：等价用户已批准，直接放行
             if (decision.action === 'allow') return true
 
+            const attentionPrefs = resolveAttentionPrefs(await ipc.invoke('config:get').catch(() => null))
+            if (abortController.signal.aborted || mySeq !== generationSeq) return false
             // 更新 UI 显示确认状态（带上决策：ConfirmCard 展示 risk 与「始终允许」）
             updateAssistantMsg(m => ({
               ...m,
@@ -1467,10 +1479,18 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
               ),
             }))
 
-            // 返回 Promise，等待用户通过 resolveToolConfirmation 响应
+            let clearAttention = () => {}
             return waitForApproval(abortController.signal, resolve => {
               pendingConfirmations.set(toolCall.id, { resolve, decision, projectPath, args })
-            }, () => pendingConfirmations.delete(toolCall.id))
+              clearAttention = registerUserAttention('approval', async () => {
+                if (!pendingConfirmations.has(toolCall.id)) return
+                if (get().activeConversationId !== convId && !await get().openConversation(convId)) return
+                useLayoutStore.getState().openRightPanel('agent')
+              })
+            }, () => {
+              pendingConfirmations.delete(toolCall.id)
+              clearAttention()
+            }, approvalTimeoutMs(attentionPrefs), () => toast.warning(t('attention.approvalExpired')))
           },
           // 进度接线（约束③）：引擎每轮都发 onProgress，此前无人接 → 数据被丢弃。
           // ⚠️ 必须与 onDone 同款 seq 守卫（见 :423 generationSeq 注释）：取消后立即发新消息时，
@@ -1533,6 +1553,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
           maxMessageBudgetTokens: contextPolicy.historyCeilingTokens,
           // W4（批 3）：仅弱档开启未完成自检（每会话至多一次；强/标准档自己做得到）
           unfinishedCheck: contextPolicy.unfinishedCheck,
+          taskBudget,
         },
         agentDeps,
       )
@@ -1675,7 +1696,7 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     await Promise.all(get().conversations.map(c => get().persistCurrent(c.id)))
   },
 
-  runSubAgentTask: async ({ description, prompt, tools, signal }) => {
+  runSubAgentTask: async ({ description, prompt, tools, signal, pauseExecutionTimeout }) => {
     if (signal?.aborted) return { text: '子任务已取消，未启动', ok: false }
     if (preparingClose || isCloseCoordinating()) return { text: '应用正在保存退出，不启动新任务', ok: false }
     const conv = get().getActiveConversation()
@@ -1703,6 +1724,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     const modelId = conv.modelId ?? useLLMStore.getState().defaultModelId ?? undefined
     if (!modelId) return { text: t('subagent.noModel'), ok: false }
 
+    const parentBudget = signal && taskBudgets.get(signal)
+      || (activeAbortController ? taskBudgets.get(activeAbortController.signal) : undefined)
     const task: SubAgentTask = { taskId, description, prompt: prompt || description, allowedTools: allowed, modelId }
     const controller = new AbortController()
     const abortTask = (): void => controller.abort()
@@ -1738,6 +1761,8 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
             onRequestId?.(id)
           }, signal ?? controller.signal),
         buildPrompt: buildSubAgentPrompt,
+        taskBudget: parentBudget || undefined,
+        pauseExecutionTimeout,
         confirm: (tc, signal) => get().requestSubAgentConfirmation(taskId, description, tc, signal ?? controller.signal),
         signal: controller.signal,
         executionScope: conv.projectPath ?? conv.id,
@@ -1827,13 +1852,22 @@ export const useAgentStore = create<AgentState>()((set, get) => ({
     if (decision.action === 'allow') return true
     // 未覆盖的写操作 → 父方审批卡（**无「始终允许」**：委派路径不写 workspace 规则，
     // 否则子 agent 的批准会放大用户的常驻授权；批准只对本次调用有效）
+    const attentionPrefs = resolveAttentionPrefs(await ipc.invoke('config:get').catch(() => null))
+    const conversationId = get().activeConversationId
+    let clearAttention = () => {}
     return waitForApproval(signal ?? new AbortController().signal, resolve => {
       pendingSubAgent.resolve = resolve
       set({ pendingSubAgentConfirmation: { sessionId, description, toolCall } })
+      clearAttention = registerUserAttention('approval', async () => {
+        if (get().pendingSubAgentConfirmation?.toolCall.id !== toolCall.id || !conversationId) return
+        if (get().activeConversationId !== conversationId && !await get().openConversation(conversationId)) return
+        useLayoutStore.getState().openRightPanel('agent')
+      })
     }, () => {
       pendingSubAgent.resolve = null
       set({ pendingSubAgentConfirmation: null })
-    }, SUBAGENT_CONFIRM_TIMEOUT_MS)
+      clearAttention()
+    }, approvalTimeoutMs(attentionPrefs), () => toast.warning(t('attention.approvalExpired')))
   },
 
   resolveSubAgentConfirmation: (allow) => { pendingSubAgent.resolve?.(allow) },

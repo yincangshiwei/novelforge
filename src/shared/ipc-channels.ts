@@ -57,6 +57,8 @@ export interface GlobalConfig {
    * 缺字段 / 旧值（旧六档模式名）由 thinking-store 校验后回退 `DEFAULT_THINKING_LEVEL`。
    */
   thinkingLevel?: ThinkingLevel
+  agentExecution?: { maxTaskSteps?: number }
+  attention?: import('./attention-prefs').AttentionPrefs
   proxy?: {
     enabled: boolean
     type: 'http' | 'socks5'
@@ -1619,8 +1621,16 @@ export interface AgentOperationChannels {
   'agent:operation-list': { args: [scope: string]; return: import('./agent-operation-protocol').AgentOperationRecord[] }
 }
 
-export type AllInvokeChannels = AgentOperationChannels & ConfigChannels & ProjectChannels & FileChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & EmbeddingChannels & ImportChannels & MCPChannels & UpdateChannels & ExportChannels & LogChannels & DevChannels & BrowserChannels & ReportChannels & TemplateChannels & MemoryChannels & StyleChannels & HealthChannels & CredentialChannels
-export type AllEventChannels = LLMStreamEvents & UpdateEvents & ImportEvents & MenuEvents & EmbeddingEvents
+export interface AttentionChannels {
+  'attention:register': { args: [request: import('./attention-prefs').AttentionRequest]; return: { success: boolean } }
+  'attention:clear': { args: [id: string]; return: { success: boolean } }
+}
+export interface AttentionEvents {
+  'attention:activate': { id: string }
+}
+
+export type AllInvokeChannels = AttentionChannels & AgentOperationChannels & ConfigChannels & ProjectChannels & FileChannels & LLMChannels & DatabaseChannels & KnowledgeBaseChannels & EmbeddingChannels & ImportChannels & MCPChannels & UpdateChannels & ExportChannels & LogChannels & DevChannels & BrowserChannels & ReportChannels & TemplateChannels & MemoryChannels & StyleChannels & HealthChannels & CredentialChannels
+export type AllEventChannels = AttentionEvents & LLMStreamEvents & UpdateEvents & ImportEvents & MenuEvents & EmbeddingEvents
 
 /** 提取 invoke 频道名 */
 export type InvokeChannel = keyof AllInvokeChannels

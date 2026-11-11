@@ -38,6 +38,7 @@ import { SegmentedControl } from '../ui/SegmentedControl'
 import { Disclosure } from '../ui/Disclosure'
 import AutomationSection from './AutomationSection'
 import ContextCompactionSection from './ContextCompactionSection'
+import AgentExecutionSection from './AgentExecutionSection'
 import ThemeSection from './ThemeSection'
 import VectorConfigSection from './VectorConfigSection'
 import DeveloperModeSection from './DeveloperModeSection'
@@ -273,6 +274,9 @@ export default function SettingsModal({ open, onClose }: SettingsModalProps) {
                 {/* 上下文与压缩（§7.1-C2）：三个保留旋钮，只影响之后的压缩 */}
                 <div className="mt-6">
                   <ContextCompactionSection />
+                </div>
+                <div className="mt-6">
+                  <AgentExecutionSection />
                 </div>
               </>
             )}

@@ -82,6 +82,7 @@ export interface ToolExecutionContext {
   scope?: string
   toolName?: string
   conversationId?: string
+  pauseExecutionTimeout?: () => () => void
 }
 
 // ===== Tool 定义 =====

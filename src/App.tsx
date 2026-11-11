@@ -17,6 +17,7 @@ import { t } from './shared/locale'
 import { useTranslation } from './hooks/useTranslation'
 import { setWindowTitle } from './lib/window-title'
 import { ipc } from './services/ipc-client'
+import { subscribeUserAttention } from './services/user-attention'
 import StatusBar from './components/layout/StatusBar'
 import LeftToolWindowBar from './components/layout/LeftToolWindowBar'
 import RightToolWindowBar from './components/layout/RightToolWindowBar'
@@ -295,6 +296,7 @@ export default function App() {
     }).catch(e => console.warn('[HubService] 初始化失败:', e))
 
     // C) 工作流完成时弹出 ActionToast 通知（不依赖任何面板状态）+ 线② 2b D5 注入对话内完成回执卡片
+    const unsubAttention = subscribeUserAttention()
     const unsubActionToast = globalEventBus.on('WORKFLOW_COMPLETE', (payload) => {
       const { activeRuns, history } = useWorkflowStore.getState()
       // emit 早于「移入 history」：刚完成的 run 此刻仍在 activeRuns（status=completed/failed）
@@ -329,6 +331,7 @@ export default function App() {
         destroyHub()
       }).catch(() => {})
       unsubActionToast()
+      unsubAttention()
     }
   }, [initTheme, initLLM, loadRecentProjects])
 

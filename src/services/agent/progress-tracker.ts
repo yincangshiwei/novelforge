@@ -109,7 +109,6 @@ export class ProgressTracker {
   /** 完成追踪 */
   complete(): void {
     this.phase = 'done'
-    this.completedSteps = this.totalSteps
     this.description = t('agent.phaseDone')
   }
 

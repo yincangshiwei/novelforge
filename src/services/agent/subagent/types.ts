@@ -34,6 +34,7 @@ export interface SubAgentSession {
   /** 完整结论（未截断；注入父端的版本另经截断，见 runner.formatSubAgentResult） */
   result: string
   error?: string
+  executionOutcome?: import('../execution-evidence').ExecutionOutcome
   startedAt: number
   endedAt?: number
 }

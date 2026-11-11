@@ -67,6 +67,7 @@ export const taskTool = buildAgentTool({
         prompt: (args.prompt as string | undefined)?.trim(),
         tools: tools.length > 0 ? tools : undefined,
         signal: context?.signal,
+        pauseExecutionTimeout: context?.pauseExecutionTimeout,
       })
       // 评审 M4：子会话 failed/cancelled → 工具如实报**失败**（spec §3.6：success:false + 原因）；
       // 结论与回放线索仍在文本里（放 error 位，引擎在失败分支注入 error）

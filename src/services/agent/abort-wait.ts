@@ -16,7 +16,8 @@ export function waitForApproval(
   signal: AbortSignal,
   register: (resolve: (allowed: boolean) => void) => void,
   cleanup: () => void,
-  timeoutMs = 120_000,
+  timeoutMs: number | null = 120_000,
+  onTimeout?: () => void,
 ): Promise<boolean> {
   return new Promise(resolve => {
     let settled = false
@@ -32,7 +33,11 @@ export function waitForApproval(
     const abort = (): void => finish(false)
     if (signal.aborted) { finish(false); return }
     signal.addEventListener('abort', abort, { once: true })
-    timer = setTimeout(abort, timeoutMs)
+    if (timeoutMs !== null) timer = setTimeout(() => {
+      if (settled) return
+      finish(false)
+      onTimeout?.()
+    }, timeoutMs)
     register(finish)
   })
 }

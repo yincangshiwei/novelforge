@@ -6,6 +6,18 @@
  * 分片规则与验收见 .agents/skills/i18n-architecture/SKILL.md §4。
  */
 export const settingsTexts = {
+  'settings.approvalTimeout': { 'zh-CN': '批准等待时间', 'en-US': 'Approval wait timeout', 'ru-RU': 'Время ожидания разрешения' },
+  'settings.approvalMinutes': { 'zh-CN': '{minutes} 分钟', 'en-US': '{minutes} minutes', 'ru-RU': '{minutes} мин.' },
+  'settings.approvalUnlimited': { 'zh-CN': '不限（直到处理或取消）', 'en-US': 'Unlimited (until answered or cancelled)', 'ru-RU': 'Без ограничения (до ответа или отмены)' },
+  'settings.approvalTimeoutDesc': { 'zh-CN': '默认 10 分钟，主、子 Agent 共用。超时不批准；人工等待不占子任务执行时限。修改影响之后出现的请求，不改变正在等待的请求。工作流步进确认仍不限时。', 'en-US': 'Default 10 minutes for main and subagent approvals. Expiry never grants approval; human waits do not consume subtask execution time. Changes apply to new requests. Workflow step confirmations remain unlimited.', 'ru-RU': 'По умолчанию 10 минут для главного Agent и подзадач. Истечение срока не даёт разрешения; ожидание человека не расходует время выполнения. Изменения действуют для новых запросов. Подтверждения шагов процесса не ограничены.' },
+  'settings.attentionSound': { 'zh-CN': '后台提醒提示音', 'en-US': 'Background notification sound', 'ru-RU': 'Звук фоновых уведомлений' },
+  'settings.attentionSoundDesc': { 'zh-CN': '窗口最小化、隐藏或失焦时，待批准和工作流等待会触发系统通知与任务栏闪烁。提示音使用系统通知声音，受系统静音、通知权限和勿扰设置影响。点击仅打开请求，不自动批准。', 'en-US': 'Pending approvals and workflows trigger system notifications and taskbar attention while minimized, hidden or unfocused. Sound uses system notifications and respects mute, permissions and Do Not Disturb. Clicking only opens the request.', 'ru-RU': 'При свёрнутом, скрытом или неактивном окне ожидание вызывает системное уведомление и мигание панели задач. Звук зависит от системных настроек. Нажатие только открывает запрос, не одобряет его.' },
+  'settings.agentExecutionTitle': { 'zh-CN': 'Agent 连续执行', 'en-US': 'Agent continuous execution', 'ru-RU': 'Непрерывное выполнение Agent' },
+  'settings.agentExecutionDesc': { 'zh-CN': '正常任务持续执行，不再每 8 步打断。重复无新结果时先自动提醒调整策略，仍无进展才停止。预算只影响后续任务。', 'en-US': 'Tasks run continuously without interruptions every 8 steps. Repeated unchanged results trigger a strategy reminder, then a stop if still blocked. Budget changes apply to future tasks.', 'ru-RU': 'Задачи выполняются без остановок каждые 8 шагов. При повторении результатов сначала предлагается сменить стратегию, затем цикл останавливается. Изменения бюджета действуют для новых задач.' },
+  'settings.agentExecutionBudget': { 'zh-CN': '任务总请求预算', 'en-US': 'Total task request budget', 'ru-RU': 'Общий бюджет запросов задачи' },
+  'settings.agentExecutionBudgetDesc': { 'zh-CN': '默认 100，范围 {min}–{max}。主 Agent、子 Agent 和恢复重试共享计数；一次请求可包含多个工具调用。', 'en-US': 'Default 100, range {min}–{max}. Main agent, subagents and retries share the counter; one request may contain multiple tool calls.', 'ru-RU': 'По умолчанию 100, диапазон {min}–{max}. Главный Agent, подзадачи и повторы используют общий счётчик; запрос может включать несколько инструментов.' },
+  'settings.agentExecutionSaved': { 'zh-CN': 'Agent 执行与提醒设置已保存', 'en-US': 'Agent execution and notification settings saved', 'ru-RU': 'Настройки выполнения и уведомлений Agent сохранены' },
+  'settings.agentExecutionSaveFailed': { 'zh-CN': 'Agent 执行与提醒设置保存失败：{error}', 'en-US': 'Failed to save agent execution and notification settings: {error}', 'ru-RU': 'Не удалось сохранить настройки Agent: {error}' },
   'vector.clearSelection': { 'zh-CN': '清除选择', 'en-US': 'Clear selection', 'ru-RU': 'Сбросить выбор' },
   'settings.providerOllama': { 'zh-CN': 'Ollama（本地）', 'en-US': 'Ollama (local)', 'ru-RU': 'Ollama (локально)' },
   'settings.providerBigModel': { 'zh-CN': 'BigModel（智谱）', 'en-US': 'BigModel (Zhipu)', 'ru-RU': 'BigModel (Zhipu)' },

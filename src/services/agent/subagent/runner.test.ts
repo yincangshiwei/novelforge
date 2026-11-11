@@ -151,12 +151,8 @@ describe('runSubAgent', () => {
     expect(JSON.stringify(s)).toBe(snapshot)
   })
 
-  it.each(['parent', 'timeout'] as const)('挂起审批 %s 取消：收到 runner signal、不执行工具，晚到批准不污染转录', async (cause) => {
+  it('挂起审批父取消：收到 runner signal、不执行工具，晚到批准不污染转录', async () => {
     const realTimer = globalThis.setTimeout
-    const timer = cause === 'timeout'
-      ? vi.spyOn(globalThis, 'setTimeout').mockImplementation((handler, delay, ...args) =>
-        realTimer(handler, delay === SUBAGENT_MAX_MS ? 20 : delay, ...args))
-      : undefined
     const ac = new AbortController()
     let approvalSignal: AbortSignal | undefined
     let approve!: (value: boolean) => void
@@ -180,10 +176,10 @@ describe('runSubAgent', () => {
       await pending
       expect(approvalSignal).toBeDefined()
       expect(approvalSignal).not.toBe(ac.signal)
-      if (cause === 'parent') ac.abort()
+      ac.abort()
       const s = await running
-      expect(s.status).toBe(cause === 'timeout' ? 'failed' : 'cancelled')
-      expect(s.error).toBe(t(cause === 'timeout' ? 'subagent.timeout' : 'subagent.cancelled'))
+      expect(s.status).toBe('cancelled')
+      expect(s.error).toBe(t('subagent.cancelled'))
       expect(approvalSignal?.aborted).toBe(true)
       expect(s.toolCalls.every(tc => tc.status === 'failed')).toBe(true)
       expect(s.messages.flatMap(m => m.toolCalls ?? []).every(tc => tc.status === 'failed')).toBe(true)
@@ -196,8 +192,30 @@ describe('runSubAgent', () => {
       expect(generate).toHaveBeenCalledTimes(1)
     } finally {
       toolRegistry.unregister(toolName)
-      timer?.mockRestore()
     }
+  })
+
+  it('人工审批超过5分钟不耗执行预算，并暂停和恢复父task计时', async () => {
+    const name = 'runner_long_approval'
+    let clock = 0
+    const resumeParent = vi.fn()
+    const pauseExecutionTimeout = vi.fn(() => resumeParent)
+    toolRegistry.register({ name, description: 'approval', source: 'builtin',
+      inputSchema: { type: 'object', properties: {} }, requiresConfirmation: true, isReadOnly: false,
+      execute: async () => ({ success: true, content: 'written' }),
+    })
+    const generate = vi.fn<LLMGenerateFn>()
+      .mockResolvedValueOnce(`<tool_call>{"name":"${name}","arguments":{}}</tool_call>`)
+      .mockResolvedValueOnce('done')
+    try {
+      const session = await runSubAgent(task({ allowedTools: [name] }), baseDeps({ generate,
+        now: () => clock, pauseExecutionTimeout,
+        confirm: async () => { clock += 1800000; return true },
+      }))
+      expect(session.status).toBe('completed')
+      expect(pauseExecutionTimeout).toHaveBeenCalledOnce()
+      expect(resumeParent).toHaveBeenCalledOnce()
+    } finally { toolRegistry.unregister(name) }
   })
 
   it('墙钟超时 → failed + 超时原因（用注入的 now 驱动，测试不等待真实时间）', async () => {

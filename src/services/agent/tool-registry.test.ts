@@ -96,11 +96,11 @@ describe('F: 工具调用语义 — 一轮多次调用 + 只读并行并发上�
     expect(prompt).not.toContain('не более одного')
   })
 
-  it('agent.maxStepsReached 三语讲「执行步骤」、上限走 {maxSteps} 占位符（不写死 8）', () => {
+  it('任务预算提示三语使用模型请求语义和预算占位符，不要求例行继续', () => {
     const locales = [
-      { locale: 'zh-CN' as const, step: '执行步骤', oldPhrase: '最大工具调用次数' },
-      { locale: 'en-US' as const, step: 'execution step', oldPhrase: 'maximum tool call limit' },
-      { locale: 'ru-RU' as const, step: 'шагов выполнения', oldPhrase: 'лимит вызовов инструментов' },
+      { locale: 'zh-CN' as const, step: '模型请求', oldPhrase: '再发一条消息让我继续' },
+      { locale: 'en-US' as const, step: 'model requests', oldPhrase: 'Send another message' },
+      { locale: 'ru-RU' as const, step: 'запросов модели', oldPhrase: 'Отправьте новое сообщение' },
     ]
     for (const { locale, step, oldPhrase } of locales) {
       setCurrentLocale(locale)

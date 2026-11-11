@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { runAgentLoop, computeMessageBudget, isRecoverableError, type LLMMessage, type AgentEngineDeps, type AgentEngineOptions, type ToolCallInfo } from './agent-engine'
 import { estimateTokens } from './token-budget'
+import { AgentTaskBudget } from './execution-budget'
 import { toolRegistry, buildAgentTool, type AgentTool, type ToolExecutionContext, type ToolResult } from './tool-registry'
 import { t } from '../../shared/locale'
 import { ipc } from '../ipc-client'
@@ -645,10 +646,10 @@ describe('恢复阶梯边界（第 8 轮，final review 回归）', () => {
     const generateFn = vi.fn(async (): Promise<string> => {
       calls++
       if (calls === 8) throw new Error('maximum context length exceeded')
-      return `<tool_call>{"name":"${NOOP_TOOL_NAME}","arguments":{}}</tool_call>`
+      return `<tool_call>{"name":"${NOOP_TOOL_NAME}","arguments":{"index":${calls}}}</tool_call>`
     })
     const callbacks = createCallbacks()
-    await runAgentLoop('system', [], '用户消息', 'test-model', generateFn, callbacks, undefined, { modelContextWindow: 32_000 })
+    await runAgentLoop('system', [], '用户消息', 'test-model', generateFn, callbacks, undefined, { modelContextWindow: 32_000, taskBudget: new AgentTaskBudget(8) })
     expect(generateFn).toHaveBeenCalledTimes(8) // 前 7 步工具循环 + 第 8 步失败调用（不得第 9 次）
     expect(callbacks.onError).toHaveBeenCalledTimes(1)
     expect(callbacks.onDone).not.toHaveBeenCalled() // 错误不得被 maxStepsReached 路径吞掉
